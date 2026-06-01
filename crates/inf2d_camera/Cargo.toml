@@ -1,0 +1,15 @@
+[package]
+name = "inf2d_camera"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Camera rig: pan, zoom, screen->world picking. Free / Follow / Cinematic modes."
+
+[dependencies]
+bevy = { workspace = true }
+inf2d_core = { workspace = true }
+inf2d_input = { workspace = true }
+inf2d_world = { workspace = true }
+serde = { workspace = true }

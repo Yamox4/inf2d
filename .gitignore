@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+.vscode/
+.idea/
+*.iml
+.augmentignore
+.augment/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Tmp
+*.tmp
+*.swp
+*~
+
+# Save files (user data, not source)
+save.ron
+
+# Backup
+*.bak

@@ -1,0 +1,17 @@
+[package]
+name = "inf2d_worldgen"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Deterministic procedural world generation for inf2d."
+
+[dependencies]
+bevy = { workspace = true }
+inf2d_core = { workspace = true }
+inf2d_world = { workspace = true }
+noise = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "inf2d_audio"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Audio mixer + simple SFX/music interface for inf2d."
+
+[dependencies]
+bevy = { workspace = true }
+inf2d_core = { workspace = true }
+serde = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "inf2d_gameplay"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Player entity, click-to-move, follow camera driver — the gameplay loop."
+
+[dependencies]
+bevy = { workspace = true }
+bevy_tweening = { workspace = true }
+avian2d = { workspace = true }
+inf2d_core = { workspace = true }
+inf2d_world = { workspace = true }
+inf2d_input = { workspace = true }
+inf2d_camera = { workspace = true }
+inf2d_pathfinding = { workspace = true }
+inf2d_physics = { workspace = true }
+inf2d_render = { workspace = true }
+rand = { workspace = true }
+rand_xoshiro = { workspace = true }

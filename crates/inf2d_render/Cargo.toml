@@ -1,0 +1,21 @@
+[package]
+name = "inf2d_render"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Procedural atlas + per-chunk bevy_ecs_tilemap renderer."
+
+[dependencies]
+bevy = { workspace = true }
+bevy_ecs_tilemap = { workspace = true }
+inf2d_camera = { workspace = true }
+inf2d_core = { workspace = true }
+inf2d_world = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[features]
+demo_particles = []
