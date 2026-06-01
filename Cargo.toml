@@ -15,6 +15,7 @@ members = [
     "crates/inf2d_ui",
     "crates/inf2d_debug",
     "crates/inf2d_app",
+    "crates/inf3d_proto",
 ]
 
 [workspace.package]
@@ -27,9 +28,12 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 bevy = { version = "0.18", default-features = false, features = [
+    "bevy_animation",
     "bevy_asset",
     "bevy_audio",
     "bevy_camera",
+    "bevy_gltf",
+    "bevy_scene",
     "bevy_color",
     "bevy_core_pipeline",
     "bevy_gizmos",
@@ -38,6 +42,7 @@ bevy = { version = "0.18", default-features = false, features = [
     "bevy_input_focus",
     "bevy_log",
     "bevy_mesh",
+    "bevy_pbr",
     "bevy_picking",
     "bevy_render",
     "bevy_shader",
@@ -55,8 +60,17 @@ bevy = { version = "0.18", default-features = false, features = [
     "tonemapping_luts",
     "vorbis",
     "x11",
+    "zstd_rust",
 ] }
 bevy_ecs_tilemap = "0.18"
+bevy_voxel_world = "0.16"
+# Native (drop the default `webgl2` limiter) + screen-space reflections.
+bevy_water = { version = "0.18", default-features = false, features = [
+    "embed_shaders",
+    "depth_prepass",
+    "ssr",
+    "image_utils",
+] }
 bevy_tweening = "0.15"
 avian2d = { version = "0.6", default-features = false, features = [
     "2d",
