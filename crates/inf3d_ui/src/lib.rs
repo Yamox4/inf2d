@@ -1,10 +1,16 @@
 use bevy::diagnostic::{
-    DiagnosticsStore, EntityCountDiagnosticsPlugin, FrameTimeDiagnosticsPlugin,
+    Diagnostic, DiagnosticPath, Diagnostics, DiagnosticsStore, EntityCountDiagnosticsPlugin,
+    FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin, RegisterDiagnostic,
 };
 use bevy::prelude::*;
 use bevy_voxel_world::prelude::Chunk;
 
 use inf3d_world::MainWorld;
+
+/// Live-monitor metrics, logged each second by `LogDiagnosticsPlugin` alongside
+/// the built-in FPS / frame-time / entity-count diagnostics.
+const DIAG_CHUNKS: DiagnosticPath = DiagnosticPath::const_new("chunks");
+const DIAG_MESHES: DiagnosticPath = DiagnosticPath::const_new("meshes");
 
 pub struct HudPlugin;
 
@@ -13,9 +19,14 @@ impl Plugin for HudPlugin {
         app.add_plugins((
             FrameTimeDiagnosticsPlugin::default(),
             EntityCountDiagnosticsPlugin::default(),
+            // Streams every registered metric to the console each second, so the
+            // whole live game state is visible from logs.
+            LogDiagnosticsPlugin::default(),
         ))
+        .register_diagnostic(Diagnostic::new(DIAG_CHUNKS))
+        .register_diagnostic(Diagnostic::new(DIAG_MESHES))
         .add_systems(Startup, spawn_hud)
-        .add_systems(Update, update_hud);
+        .add_systems(Update, (update_hud, measure_diagnostics));
     }
 }
 
@@ -46,6 +57,17 @@ fn material_name(m: u8) -> &'static str {
         3 => "Water",
         _ => "Solid",
     }
+}
+
+/// Records live chunk + mesh counts each frame so `LogDiagnosticsPlugin` reports
+/// them (the visible-from-logs "monitor").
+fn measure_diagnostics(
+    mut diagnostics: Diagnostics,
+    chunks: Query<(), With<Chunk<MainWorld>>>,
+    meshes: Query<(), With<Mesh3d>>,
+) {
+    diagnostics.add_measurement(&DIAG_CHUNKS, || chunks.iter().count() as f64);
+    diagnostics.add_measurement(&DIAG_MESHES, || meshes.iter().count() as f64);
 }
 
 fn update_hud(

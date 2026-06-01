@@ -17,7 +17,9 @@ struct GrassParams {
     bend_strength: f32,
     _pad: f32,
 }
-@group(2) @binding(0) var<uniform> gp: GrassParams;
+// Material bind group is group 3 in Bevy 0.18 (group 2 is the mesh bindings).
+// Use the shader-def so it tracks the engine's MATERIAL_BIND_GROUP index.
+@group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> gp: GrassParams;
 
 @vertex
 fn vertex(in: Vertex) -> VertexOutput {

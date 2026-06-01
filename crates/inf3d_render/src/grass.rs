@@ -125,10 +125,12 @@ fn setup_grass(
     let mats: Vec<Handle<GrassMaterial>> = shades
         .iter()
         .map(|c| {
-            let l = c.to_linear();
+            // Use the sRGB components directly (our fragment is simple/unlit-ish,
+            // not full PBR) so the green stays bright instead of darkening to grey.
+            let s = c.to_srgba();
             materials.add(GrassMaterial {
                 params: GrassParams {
-                    base_color: Vec4::new(l.red, l.green, l.blue, 1.0),
+                    base_color: Vec4::new(s.red, s.green, s.blue, 1.0),
                     wind_strength: 0.15,
                     bend_radius: 2.5,
                     bend_strength: 0.8,
