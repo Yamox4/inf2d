@@ -1,0 +1,15 @@
+[package]
+name = "inf3d_pathfinding"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bevy = { workspace = true }
+bevy_voxel_world = { workspace = true }
+inf3d_camera = { workspace = true }
+inf3d_world = { workspace = true }
+inf3d_worldgen = { workspace = true }
+inf3d_gameplay = { workspace = true }

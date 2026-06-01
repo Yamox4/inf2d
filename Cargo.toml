@@ -1,29 +1,23 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/inf2d_core",
-    "crates/inf2d_world",
-    "crates/inf2d_worldgen",
-    "crates/inf2d_render",
-    "crates/inf2d_physics",
-    "crates/inf2d_camera",
-    "crates/inf2d_input",
-    "crates/inf2d_pathfinding",
-    "crates/inf2d_gameplay",
-    "crates/inf2d_audio",
-    "crates/inf2d_save",
-    "crates/inf2d_ui",
-    "crates/inf2d_debug",
-    "crates/inf2d_app",
-    "crates/inf3d_proto",
+    "crates/inf3d_core",
+    "crates/inf3d_worldgen",
+    "crates/inf3d_world",
+    "crates/inf3d_camera",
+    "crates/inf3d_render",
+    "crates/inf3d_gameplay",
+    "crates/inf3d_pathfinding",
+    "crates/inf3d_ui",
+    "crates/inf3d_app",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["inf2d"]
+authors = ["inf3d"]
 license = "MIT OR Apache-2.0"
-repository = "https://example.invalid/inf2d"
+repository = "https://example.invalid/inf3d"
 rust-version = "1.85"
 
 [workspace.dependencies]
@@ -62,54 +56,31 @@ bevy = { version = "0.18", default-features = false, features = [
     "x11",
     "zstd_rust",
 ] }
-bevy_ecs_tilemap = "0.18"
 bevy_voxel_world = "0.16"
-# Native (drop the default `webgl2` limiter) + screen-space reflections.
+# Native (drop the default `webgl2` limiter). `depth_prepass` enables the nicer
+# deep/shallow color blend + waves + reflections. No `ssr` (it broke rendering on
+# our prepass-less voxel terrain).
 bevy_water = { version = "0.18", default-features = false, features = [
     "embed_shaders",
     "depth_prepass",
-    "ssr",
     "image_utils",
 ] }
-bevy_tweening = "0.15"
-avian2d = { version = "0.6", default-features = false, features = [
-    "2d",
-    "f32",
-    "parry-f32",
-    "bevy_scene",
-    "parallel",
-    "debug-plugin",
-] }
-bevy_egui = "0.39"
-bevy-inspector-egui = "0.36"
-bevy_asset_loader = "0.26"
 noise = "0.9"
 rand = "0.9"
-rand_xoshiro = "0.7"
-serde = { version = "1", features = ["derive"] }
-ron = "0.10"
-thiserror = "2"
-tracing = "0.1"
 
-inf2d_core = { path = "crates/inf2d_core" }
-inf2d_world = { path = "crates/inf2d_world" }
-inf2d_worldgen = { path = "crates/inf2d_worldgen" }
-inf2d_render = { path = "crates/inf2d_render" }
-inf2d_physics = { path = "crates/inf2d_physics" }
-inf2d_camera = { path = "crates/inf2d_camera" }
-inf2d_input = { path = "crates/inf2d_input" }
-inf2d_pathfinding = { path = "crates/inf2d_pathfinding" }
-inf2d_gameplay = { path = "crates/inf2d_gameplay" }
-inf2d_audio = { path = "crates/inf2d_audio" }
-inf2d_save = { path = "crates/inf2d_save" }
-inf2d_ui = { path = "crates/inf2d_ui" }
-inf2d_debug = { path = "crates/inf2d_debug" }
+inf3d_core = { path = "crates/inf3d_core" }
+inf3d_worldgen = { path = "crates/inf3d_worldgen" }
+inf3d_world = { path = "crates/inf3d_world" }
+inf3d_camera = { path = "crates/inf3d_camera" }
+inf3d_render = { path = "crates/inf3d_render" }
+inf3d_gameplay = { path = "crates/inf3d_gameplay" }
+inf3d_pathfinding = { path = "crates/inf3d_pathfinding" }
+inf3d_ui = { path = "crates/inf3d_ui" }
 
 [profile.dev]
 opt-level = 1
 # Split debug info out of the .exe so the binary stays under Windows's 2 GB PE limit.
-# Without this, debug-build inf2d.exe overflows ~2.1 GB and Windows refuses to launch it
-# ("not a valid application for this OS platform").
+# Without this the debug binary overflows ~2.1 GB and Windows refuses to launch it.
 split-debuginfo = "packed"
 strip = "debuginfo"
 
