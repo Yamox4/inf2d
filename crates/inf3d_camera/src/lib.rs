@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use bevy::render::view::Hdr;
 use bevy_voxel_world::prelude::*;
 
-use inf3d_core::FollowTarget;
+use inf3d_core::{FollowTarget, QualitySettings};
 use inf3d_world::MainWorld;
 
 /// Horizontal (XZ-plane) distance from the player to the camera.
@@ -48,8 +48,10 @@ pub struct IsoCameraPlugin;
 
 impl Plugin for IsoCameraPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_camera)
-            .add_systems(Update, camera_input)
+        // No-op if the app composer already inserted a configured value.
+        app.init_resource::<QualitySettings>()
+            .add_systems(Startup, spawn_camera)
+            .add_systems(Update, (camera_input, apply_quality_to_camera))
             // PostUpdate so the camera reads the player's final position this frame.
             .add_systems(PostUpdate, follow_player);
     }
@@ -60,7 +62,33 @@ fn orbit_offset(yaw: f32) -> Vec3 {
     Vec3::new(yaw.sin() * ORBIT_RADIUS, ORBIT_HEIGHT, yaw.cos() * ORBIT_RADIUS)
 }
 
-fn spawn_camera(mut commands: Commands) {
+/// Bloom config used everywhere it's enabled (Startup + runtime re-apply).
+fn bloom_component() -> Bloom {
+    Bloom {
+        intensity: 0.15,
+        ..default()
+    }
+}
+
+/// VolumetricFog config parameterised on step count.
+fn fog_component(step_count: u32) -> VolumetricFog {
+    VolumetricFog {
+        ambient_intensity: 0.5,
+        step_count,
+        ..default()
+    }
+}
+
+/// Depth-of-field config used everywhere it's enabled.
+fn dof_component() -> DepthOfField {
+    DepthOfField {
+        focal_distance: 55.0,
+        aperture_f_stops: 8.0,
+        ..default()
+    }
+}
+
+fn spawn_camera(mut commands: Commands, quality: Res<QualitySettings>) {
     let yaw = std::f32::consts::FRAC_PI_4; // classic 45° iso
 
     // Orthographic projection gives the flat, parallel-line iso look. FixedVertical
@@ -72,7 +100,7 @@ fn spawn_camera(mut commands: Commands) {
         ..OrthographicProjection::default_3d()
     });
 
-    commands.spawn((
+    let mut entity = commands.spawn((
         Camera3d::default(),
         projection,
         Transform::from_translation(orbit_offset(yaw)).looking_at(Vec3::ZERO, Vec3::Y),
@@ -85,32 +113,94 @@ fn spawn_camera(mut commands: Commands) {
             zoom: ZOOM_DEFAULT,
             zoom_target: ZOOM_DEFAULT,
         },
-    ))
-    // Split into a second tuple: a single spawn tuple can't hold this many.
-    .insert((
+        // HDR is the color pipeline contract regardless of post-FX quality.
         Hdr,
-        Bloom {
-            intensity: 0.15,
-            ..default()
-        },
+    ));
+
+    if quality.bloom_enabled {
+        entity.insert(bloom_component());
+    }
+    if quality.fog_enabled {
         // Volumetric fog renders in its own pass (independent of the voxel
-        // terrain's custom material). Needs a FogVolume (fog.rs) + VolumetricLight (sun).
-        VolumetricFog {
-            ambient_intensity: 0.5,
-            step_count: 48,
-            ..default()
-        },
-        // Depth prepass feeds SSR (water) and DoF.
-        DepthPrepass,
+        // terrain's custom material). Needs a FogVolume + VolumetricLight (sun).
+        entity.insert(fog_component(quality.fog_step_count));
+    }
+    // Depth prepass feeds DoF (and any fog passes that sample depth).
+    if quality.fog_enabled || quality.dof_enabled {
+        entity.insert(DepthPrepass);
+    }
+    if quality.dof_enabled {
         // Subtle depth-of-field (cozy tilt-shift). SSAO + motion blur were dropped:
         // the voxel terrain skips the prepass so they can't shade it, and SSAO
         // forces MSAA off (worse on the blocky terrain).
-        DepthOfField {
-            focal_distance: 55.0,
-            aperture_f_stops: 8.0,
-            ..default()
-        },
-    ));
+        entity.insert(dof_component());
+    }
+}
+
+/// Re-apply the post-FX component set whenever `QualitySettings` changes,
+/// adding or stripping `Bloom`, `VolumetricFog`, `DepthPrepass`, and
+/// `DepthOfField` to match the new preset. Skips re-inserting when the
+/// component is already present with the same value (avoids GPU churn).
+fn apply_quality_to_camera(
+    mut commands: Commands,
+    quality: Res<QualitySettings>,
+    cam_q: Query<
+        (
+            Entity,
+            Has<Bloom>,
+            Option<&VolumetricFog>,
+            Has<DepthPrepass>,
+            Has<DepthOfField>,
+        ),
+        With<IsoCamera>,
+    >,
+) {
+    if !quality.is_changed() {
+        return;
+    }
+    // Empty query is fine — settings may flip before the camera spawns.
+    let Ok((entity, has_bloom, current_fog, has_depth, has_dof)) = cam_q.single() else {
+        return;
+    };
+
+    let mut e = commands.entity(entity);
+
+    if quality.bloom_enabled {
+        if !has_bloom {
+            e.insert(bloom_component());
+        }
+    } else if has_bloom {
+        e.remove::<Bloom>();
+    }
+
+    if quality.fog_enabled {
+        let needs_insert = match current_fog {
+            Some(existing) => existing.step_count != quality.fog_step_count,
+            None => true,
+        };
+        if needs_insert {
+            e.insert(fog_component(quality.fog_step_count));
+        }
+    } else if current_fog.is_some() {
+        e.remove::<VolumetricFog>();
+    }
+
+    let need_depth = quality.fog_enabled || quality.dof_enabled;
+    if need_depth {
+        if !has_depth {
+            e.insert(DepthPrepass);
+        }
+    } else if has_depth {
+        e.remove::<DepthPrepass>();
+    }
+
+    if quality.dof_enabled {
+        if !has_dof {
+            e.insert(dof_component());
+        }
+    } else if has_dof {
+        e.remove::<DepthOfField>();
+    }
 }
 
 /// Scroll wheel zooms; Q/E orbit the view around the player.

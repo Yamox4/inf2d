@@ -30,8 +30,12 @@ const FOG_EXTENT: f32 = 700.0;
 /// Vertical coverage — tall enough to engulf all terrain so there's no visible
 /// height gradient (uniform fog of war, not ground fog).
 const FOG_TALL: f32 = 240.0;
-/// Edge of the density texture. High so the dense rim fully occludes the void.
-const FOG_DENSITY: f32 = 2.5;
+/// Density at the rim. The rim still needs to be opaque to hide the void, but
+/// the previous 2.5 caused the volumetric pass to tint near-camera surfaces
+/// (specifically grass, which writes the depth prepass while the voxel terrain
+/// does not) a heavy grey-blue. The radial falloff (`smoothstep(0.30, 0.95, r)`)
+/// keeps the clear center clear regardless of this max value.
+const FOG_DENSITY: f32 = 0.9;
 /// Side length of the procedural 3D density texture.
 const NOISE_N: usize = 64;
 
@@ -130,8 +134,12 @@ fn build_density_image() -> Image {
                 let r = (dx * dx + dz * dz).sqrt() / half;
                 let falloff = smoothstep(0.30, 0.95, r);
 
+                // Heavily reduce noise contribution: previously 65% of the
+                // density came from FBM noise, which (with low step_count) shows
+                // up as a stippled "dot pattern" projected onto every surface
+                // the fog touches (grass, terrain). Keep just a hint of variation.
                 let noise = fbm(x as f32 * scale, y as f32 * scale, z as f32 * scale);
-                let density = falloff * (0.35 + 0.65 * noise);
+                let density = falloff * (0.92 + 0.08 * noise);
 
                 let idx = (z * n * n) + (y * n) + x;
                 data[idx] = (density.clamp(0.0, 1.0) * 255.0) as u8;

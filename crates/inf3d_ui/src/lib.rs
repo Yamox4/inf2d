@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use bevy::diagnostic::{
     Diagnostic, DiagnosticPath, Diagnostics, DiagnosticsStore, EntityCountDiagnosticsPlugin,
     FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin, RegisterDiagnostic,
@@ -5,12 +7,21 @@ use bevy::diagnostic::{
 use bevy::prelude::*;
 use bevy_voxel_world::prelude::Chunk;
 
+use inf3d_core::{FrameStats, QualitySettings};
 use inf3d_world::MainWorld;
 
 /// Live-monitor metrics, logged each second by `LogDiagnosticsPlugin` alongside
 /// the built-in FPS / frame-time / entity-count diagnostics.
 const DIAG_CHUNKS: DiagnosticPath = DiagnosticPath::const_new("chunks");
 const DIAG_MESHES: DiagnosticPath = DiagnosticPath::const_new("meshes");
+
+/// Width of the rolling frame-time window used to compute the p95 metric.
+/// 120 frames ≈ 2 s at 60 fps — long enough to see hitches, short enough to
+/// react when the engine recovers.
+const FRAME_WINDOW: usize = 120;
+/// Index of the p95 sample inside a sorted FRAME_WINDOW. With 120 samples
+/// sorted ascending, the 95th percentile sits at index 114 (the 6th worst).
+const FRAME_P95_INDEX: usize = 114;
 
 pub struct HudPlugin;
 
@@ -26,7 +37,15 @@ impl Plugin for HudPlugin {
         .register_diagnostic(Diagnostic::new(DIAG_CHUNKS))
         .register_diagnostic(Diagnostic::new(DIAG_MESHES))
         .add_systems(Startup, spawn_hud)
-        .add_systems(Update, (update_hud, measure_diagnostics));
+        .add_systems(
+            Update,
+            (
+                measure_diagnostics,
+                update_frame_stats,
+                cycle_preset_keybinding,
+                update_hud,
+            ),
+        );
     }
 }
 
@@ -70,12 +89,65 @@ fn measure_diagnostics(
     diagnostics.add_measurement(&DIAG_MESHES, || meshes.iter().count() as f64);
 }
 
+/// Pulls per-frame frame-time samples from Bevy's diagnostics, maintains a
+/// rolling window of the last `FRAME_WINDOW` values, and writes p95 to
+/// `FrameStats`. While the window is still filling we report the worst
+/// observed sample, so the HUD has something meaningful from frame one.
+fn update_frame_stats(
+    diagnostics: Res<DiagnosticsStore>,
+    mut window: Local<VecDeque<f32>>,
+    mut stats: ResMut<FrameStats>,
+) {
+    let Some(diag) = diagnostics.get(&FrameTimeDiagnosticsPlugin::FRAME_TIME) else {
+        return;
+    };
+    let Some(value) = diag.value() else {
+        return;
+    };
+    let sample = value as f32;
+
+    if window.len() == FRAME_WINDOW {
+        window.pop_front();
+    }
+    window.push_back(sample);
+
+    let p95 = if window.len() == FRAME_WINDOW {
+        let mut sorted: Vec<f32> = window.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted[FRAME_P95_INDEX]
+    } else {
+        window
+            .iter()
+            .copied()
+            .fold(0.0_f32, |acc, v| if v > acc { v } else { acc })
+    };
+
+    stats.ms_p95 = p95;
+}
+
+/// F2 cycles the active quality preset (Potato → Low → Medium → High → Ultra →
+/// Potato). `QualitySettings` is mutated by-value so other systems can react
+/// via `is_changed()`; render distance specifically is read once at startup
+/// and won't move until the binary restarts.
+fn cycle_preset_keybinding(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut settings: ResMut<QualitySettings>,
+) {
+    if keys.just_pressed(KeyCode::F2) {
+        let next = settings.preset.cycle();
+        *settings = QualitySettings::from_preset(next);
+        info!("Quality preset → {}", settings.preset.name());
+    }
+}
+
 fn update_hud(
     diagnostics: Res<DiagnosticsStore>,
     player_q: Query<(&Transform, &inf3d_gameplay::Player)>,
     chunks: Query<(), With<Chunk<MainWorld>>>,
     hover: Res<inf3d_render::Hover>,
     terrain: Res<inf3d_worldgen::Terrain>,
+    settings: Res<QualitySettings>,
+    frame: Res<FrameStats>,
     mut text_q: Query<&mut Text, With<HudText>>,
 ) {
     let Ok(mut text) = text_q.single_mut() else {
@@ -115,8 +187,24 @@ fn update_hud(
         "Tile: —".to_string()
     };
 
+    let fog_line = if settings.fog_enabled {
+        format!("Fog: on  steps={}", settings.fog_step_count)
+    } else {
+        "Fog: off".to_string()
+    };
+
     text.0 = format!(
-        "FPS: {:.0}  ({:.1} ms)\nEntities: {:.0}   Chunks: {}\nPlayer: ({:.1}, {:.1}, {:.1})  cell=({}, {})\n{}",
-        fps, frame_ms, entities, chunk_count, pos.x, pos.y, pos.z, cell.x, cell.y, hover_line
+        "FPS: {:.0}  ({:.1} ms, p95 {:.1} ms)\nEntities: {:.0}   Chunks: {}\nPlayer: ({:.1}, {:.1}, {:.1})  cell=({}, {})\nQuality: {}  rd={}  [F2]\n{}\n{}",
+        fps,
+        frame_ms,
+        frame.ms_p95,
+        entities,
+        chunk_count,
+        pos.x, pos.y, pos.z,
+        cell.x, cell.y,
+        settings.preset.name(),
+        settings.render_distance_chunks,
+        fog_line,
+        hover_line,
     );
 }

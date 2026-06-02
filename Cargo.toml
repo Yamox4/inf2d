@@ -67,6 +67,8 @@ bevy_water = { version = "0.18", default-features = false, features = [
 ] }
 noise = "0.9"
 rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
 
 inf3d_core = { path = "crates/inf3d_core" }
 inf3d_worldgen = { path = "crates/inf3d_worldgen" }

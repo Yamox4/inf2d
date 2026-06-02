@@ -1,0 +1,334 @@
+//! Custom voxel terrain material that writes the depth + normal prepass.
+//!
+//! ## Why this exists
+//!
+//! `bevy_voxel_world 0.16`'s default material is an
+//! `ExtendedMaterial<StandardMaterial, StandardVoxelMaterial>` (see
+//! `bevy_voxel_world::voxel_material`). Two upstream choices conspire to keep
+//! the voxel terrain out of Bevy's depth + normal prepass textures, which in
+//! turn makes every downstream prepass consumer (`DistanceFog`,
+//! `VolumetricFog`, SSAO, motion blur, water SSR, depth-of-field) treat the
+//! terrain as if it weren't there:
+//!
+//! 1. The shipped `voxel_texture.wgsl` declares a `#ifdef PREPASS_PIPELINE`
+//!    branch that *imports* `prepass_io::{VertexOutput, FragmentOutput}` but
+//!    keeps emitting a custom `CustomVertexOutput` from the vertex stage and
+//!    passing it to `deferred_output(in, pbr_input)` — which expects
+//!    `prepass_io::VertexOutput`. That branch fails to validate as a prepass
+//!    pipeline, so the prepass shader for the voxel material is effectively
+//!    broken.
+//! 2. `impl Material for StandardVoxelMaterial` overrides `enable_prepass()`
+//!    to `false`. When the standalone `Material` impl is used (instead of the
+//!    `ExtendedMaterial` wrapper), the material's instances are never queued
+//!    into the prepass phases regardless of what the shader says.
+//!
+//! ## What this module does
+//!
+//! Ships a parallel material — [`TerrainMaterial`], an
+//! `ExtendedMaterial<StandardMaterial, VoxelTerrainExtension>` — that:
+//!
+//! - Uses our own WGSL ([`terrain_material.wgsl`](./terrain_material.wgsl))
+//!   for the **forward pass only**. The fragment logic is byte-for-byte the
+//!   same as upstream `voxel_texture.wgsl`: sample the texture array based on
+//!   `tex_idx[face]`, multiply by per-vertex AO color, run through
+//!   `apply_pbr_lighting` + `main_pass_post_lighting_processing`.
+//! - Delegates the **prepass** to Bevy's stock `pbr_prepass.wgsl` via
+//!   `ShaderRef::Default` — through `ExtendedMaterial::prepass_*_shader()`
+//!   that delegation chains into `StandardMaterial::prepass_*_shader()`,
+//!   which is itself `ShaderRef::Default`, resolving to the built-in prepass
+//!   shaders. Those shaders only need the standard mesh attributes (POSITION
+//!   at 0, UV_0 at 1, NORMAL at 3, COLOR at 7), all of which the
+//!   `bevy_voxel_world` mesher already produces (see `meshing.rs`). The
+//!   forward-pass `tex_idx` attribute at location 8 is harmlessly ignored by
+//!   the prepass.
+//! - Returns `true` from `MaterialExtension::enable_prepass()`. Because
+//!   `Material for ExtendedMaterial<B, E>` forwards `enable_prepass()` to
+//!   the extension (`E::enable_prepass()`), this is what actually makes our
+//!   instances participate in the prepass render phase.
+//!
+//! ## Wiring (see [`crate::WorldPlugin`])
+//!
+//! Three things have to happen before `bevy_voxel_world` will use this
+//! material for its meshes:
+//!
+//! 1. [`install_terrain_material`] is called during `WorldPlugin::build`,
+//!    which:
+//!    - Registers the WGSL bytes at a stable uuid handle via
+//!      `load_internal_asset!`. That avoids any asset-server round-trip and
+//!      gives us synchronous availability on the very first frame.
+//!    - Adds `MaterialPlugin::<TerrainMaterial>::default()` so Bevy
+//!      compiles the pipeline and runs `specialize_material_meshes` for our
+//!      material. (`bevy_voxel_world` only registers a `MaterialPlugin` for
+//!      its own default material; using `with_material(..)` on its side
+//!      explicitly skips that registration.)
+//!    - Procedurally builds a 4-layer `2d_array` `Image` for the texture
+//!      array binding and returns the assembled material value.
+//! 2. `VoxelWorldPlugin::with_config(main_world).with_material(material)`
+//!    consumes the returned value. With `init_custom_materials() = true`
+//!    (the default), the voxel plugin adds the value to `Assets<M>`, takes
+//!    the resulting handle, and inserts it as
+//!    `VoxelWorldMaterialHandle<TerrainMaterial>`.
+//! 3. The voxel plugin's `Internals::<C>::assign_material::<TerrainMaterial>`
+//!    system finds that resource and attaches the handle to every newly
+//!    meshed chunk via `MeshMaterial3d`.
+//!
+//! ## Why a procedural texture
+//!
+//! `bevy_voxel_world` ships a default PNG (`shaders/default_texture.png`)
+//! that it `include_bytes!`-bakes into its own crate; the bytes are not
+//! re-exported and the asset path is private. Rather than hand-shipping a
+//! duplicate PNG in our crate, we build a 32x32x4 RGBA8 image at startup
+//! with flat tints that match the prior look (earthy palette modulated by
+//! the per-vertex AO color the mesher writes into `Mesh::ATTRIBUTE_COLOR`).
+//! This also dodges any asset-server load races that would otherwise need
+//! `init_custom_materials() = false` plus a manual
+//! `VoxelWorldMaterialHandle` insertion after the texture finishes loading.
+
+use bevy::asset::{load_internal_asset, uuid_handle};
+use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
+use bevy::mesh::{MeshVertexBufferLayoutRef, VertexAttributeDescriptor};
+use bevy::pbr::{
+    ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
+};
+use bevy::prelude::*;
+use bevy::render::render_resource::{
+    AsBindGroup, Extent3d, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+    TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
+};
+use bevy::shader::{ShaderDefVal, ShaderRef};
+use bevy_voxel_world::rendering::vertex_layout;
+
+/// Stable, type-checked handle to the terrain shader. `uuid_handle!` produces
+/// a `Handle::Uuid` whose AssetId is determined entirely by the literal — the
+/// same uuid in `ShaderRef::Handle(_)` resolves to the same `Assets<Shader>`
+/// slot that `load_internal_asset!` writes to.
+const TERRAIN_MATERIAL_SHADER_HANDLE: Handle<Shader> =
+    uuid_handle!("0c4dfc1c-7b39-4f0a-93a3-2b8f6d18a16e");
+
+/// Public type alias for the full material
+/// (`ExtendedMaterial<StandardMaterial, VoxelTerrainExtension>`). Downstream
+/// code shouldn't usually need to name this — the plugin attaches it
+/// automatically — but the type appears in
+/// `MaterialPlugin::<TerrainMaterial>::default()` and the
+/// `VoxelWorldMaterialHandle<TerrainMaterial>` resource, so we expose it.
+pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, VoxelTerrainExtension>;
+
+/// `MaterialExtension` that swaps in our texture-array-sampling forward
+/// shader while leaving the prepass to `StandardMaterial`.
+///
+/// The `#[texture(100, dimension = "2d_array")]` / `#[sampler(101)]` binding
+/// indices match upstream `StandardVoxelMaterial` so the WGSL signature is
+/// byte-for-byte compatible — meaning the voxel mesher's existing per-vertex
+/// `tex_idx` payload still works without touching `meshing.rs`.
+#[derive(Asset, AsBindGroup, Debug, Clone, Default, TypePath)]
+pub struct VoxelTerrainExtension {
+    #[texture(100, dimension = "2d_array")]
+    #[sampler(101)]
+    pub voxels_texture: Handle<Image>,
+}
+
+impl MaterialExtension for VoxelTerrainExtension {
+    fn fragment_shader() -> ShaderRef {
+        ShaderRef::Handle(TERRAIN_MATERIAL_SHADER_HANDLE)
+    }
+
+    fn vertex_shader() -> ShaderRef {
+        ShaderRef::Handle(TERRAIN_MATERIAL_SHADER_HANDLE)
+    }
+
+    /// Explicit. The trait default is also `true`, but stating it here makes
+    /// the contract — "this material participates in the depth + normal
+    /// prepass" — discoverable from the type alone. Combined with
+    /// `Material for ExtendedMaterial<B, E>` delegating `enable_prepass()` to
+    /// `E::enable_prepass()`, this is what makes downstream prepass consumers
+    /// (volumetric fog, SSAO, etc.) see the terrain.
+    fn enable_prepass() -> bool {
+        true
+    }
+
+    /// `ShaderRef::Default` chains through `ExtendedMaterial` into
+    /// `StandardMaterial::prepass_vertex_shader()` — also `ShaderRef::Default`
+    /// — and finally resolves to Bevy's bundled `prepass.wgsl`. That shader
+    /// builds its own vertex layout from POSITION/UV_0/NORMAL/COLOR — all of
+    /// which the voxel mesher produces.
+    fn prepass_vertex_shader() -> ShaderRef {
+        ShaderRef::Default
+    }
+
+    /// Same chain as `prepass_vertex_shader`: delegate to
+    /// `StandardMaterial::prepass_fragment_shader` → `pbr_prepass.wgsl`. That
+    /// shader writes depth, the world-space normal target when
+    /// `NORMAL_PREPASS` is set, and motion vectors — everything any
+    /// downstream consumer of prepass textures could want.
+    fn prepass_fragment_shader() -> ShaderRef {
+        ShaderRef::Default
+    }
+
+    /// Same as upstream `StandardVoxelMaterial::specialize`: install the
+    /// extended vertex layout (with `tex_idx` at shader location 8) on the
+    /// **forward** pipeline only. The prepass pipeline is specialized in
+    /// `bevy_pbr::prepass::PrepassPipeline::specialize` and builds its own
+    /// vertex layout from the standard mesh attributes; the extension's
+    /// `specialize` hook is never reached on that path, but we keep the
+    /// `PREPASS_PIPELINE` early-out as a defensive guard against future
+    /// Bevy refactors.
+    fn specialize(
+        _pipeline: &MaterialExtensionPipeline,
+        descriptor: &mut RenderPipelineDescriptor,
+        layout: &MeshVertexBufferLayoutRef,
+        _key: MaterialExtensionKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        if descriptor
+            .vertex
+            .shader_defs
+            .contains(&ShaderDefVal::Bool("PREPASS_PIPELINE".into(), true))
+        {
+            return Ok(());
+        }
+
+        let layout_with_tex_idx: Vec<VertexAttributeDescriptor> = vertex_layout();
+        let vertex_buffer_layout = layout.0.get_layout(&layout_with_tex_idx)?;
+        descriptor.vertex.buffers = vec![vertex_buffer_layout];
+        Ok(())
+    }
+}
+
+/// Build a 4-layer 32x32 RGBA8 `Image` suitable for use as a
+/// `texture_2d_array` in the terrain shader.
+///
+/// The image is constructed as a vertically-stacked 2D
+/// `(LAYER_SIZE x LAYER_SIZE * LAYERS)` image, then
+/// `reinterpret_stacked_2d_as_array` slices it back into LAYERS layers —
+/// mirroring what `bevy_voxel_world::voxel_material::prepare_voxel_texture`
+/// does internally (which we can't call because it is `pub(crate)`).
+///
+/// Layer order matches the indices used by
+/// [`crate::MainWorld::texture_index_mapper`]:
+///  - 0 → grass (top of voxel)
+///  - 1 → dirt / mid-tone earth
+///  - 2 → stone
+///  - 3 → underground filler (sea floor)
+///
+/// Colors are flat tints rather than detail textures; the per-vertex AO
+/// color the mesher writes into `Mesh::ATTRIBUTE_COLOR` modulates them to
+/// give the characteristic block shading.
+fn build_terrain_texture(images: &mut Assets<Image>) -> Handle<Image> {
+    /// Side length of each layer in pixels. Square and a power of two so
+    /// the stacked-as-array reinterpret has integer math.
+    const LAYER_SIZE: u32 = 32;
+    /// Number of layers. Must match `MainWorld::texture_index_mapper`.
+    const LAYERS: u32 = 4;
+
+    let palette: [[u8; 3]; LAYERS as usize] = [
+        [0x4f, 0x7a, 0x35], // grass top
+        [0x6b, 0x4a, 0x2c], // dirt
+        [0x6e, 0x6f, 0x72], // stone
+        // Seafloor: bevy_water has `clarity: 0.4`, so this color shows through
+        // the water surface. Sandy/tan reads as "shallow beach water"; the old
+        // dark brown made the water look muddy.
+        [0xd4, 0xc1, 0x88], // sandy seafloor
+    ];
+
+    let pixels_per_layer = (LAYER_SIZE * LAYER_SIZE) as usize;
+    let bytes_per_layer = pixels_per_layer * 4;
+    let mut data = Vec::with_capacity(bytes_per_layer * LAYERS as usize);
+
+    for layer in 0..LAYERS as usize {
+        let [r, g, b] = palette[layer];
+        for _ in 0..pixels_per_layer {
+            data.push(r);
+            data.push(g);
+            data.push(b);
+            data.push(0xff);
+        }
+    }
+
+    let sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        address_mode_w: ImageAddressMode::Repeat,
+        ..default()
+    });
+
+    let mut image = Image::new(
+        Extent3d {
+            width: LAYER_SIZE,
+            height: LAYER_SIZE * LAYERS,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        bevy::asset::RenderAssetUsages::default(),
+    );
+    image.sampler = sampler;
+
+    // Re-interpret the stacked 2D bytes as a `2d_array` of LAYERS slices.
+    // If it ever fails the terrain will render with only the first layer
+    // (which the shader would still sample with index 0 from `tex_idx`)
+    // — that's an ugly fallback but a working frame, so we warn rather
+    // than crash.
+    if let Err(err) = image.reinterpret_stacked_2d_as_array(LAYERS) {
+        warn!(
+            "inf3d_world: failed to reinterpret terrain texture as 2d_array \
+             (terrain will render with the first layer only): {err}"
+        );
+    } else {
+        image.texture_view_descriptor = Some(TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D2Array),
+            ..default()
+        });
+    }
+
+    images.add(image)
+}
+
+/// Register the terrain shader and `MaterialPlugin`, build the procedural
+/// texture array, and return the fully-populated [`TerrainMaterial`] value.
+///
+/// The returned value is meant to be threaded into
+/// `VoxelWorldPlugin::with_material(...)` — the voxel plugin will clone it
+/// into `Assets<TerrainMaterial>` itself and own the resulting handle via
+/// `VoxelWorldMaterialHandle<TerrainMaterial>`.
+pub fn install_terrain_material(app: &mut App) -> TerrainMaterial {
+    // Register the WGSL bytes synchronously at a uuid handle. `include_str!`
+    // (inside the macro) is path-relative to this `.rs` file, so the shader
+    // lives at `crates/inf3d_world/src/terrain_material.wgsl`.
+    //
+    // This is the same pattern `bevy_voxel_world` uses for its own
+    // `VOXEL_TEXTURE_SHADER_HANDLE`, so we know it's the supported path for
+    // shipping a shader from inside a library crate without an `assets/`
+    // directory.
+    load_internal_asset!(
+        app,
+        TERRAIN_MATERIAL_SHADER_HANDLE,
+        "terrain_material.wgsl",
+        Shader::from_wgsl
+    );
+
+    // Without this, Bevy never compiles a pipeline for `TerrainMaterial` and
+    // chunks would render either blank or with the wrong material. The voxel
+    // plugin skips this step on the custom-material path (it only adds a
+    // `MaterialPlugin` for its own default `StandardVoxelMaterial`).
+    app.add_plugins(MaterialPlugin::<TerrainMaterial>::default());
+
+    let mut images = app.world_mut().resource_mut::<Assets<Image>>();
+    let texture_handle = build_terrain_texture(&mut images);
+    drop(images);
+
+    ExtendedMaterial {
+        // Same low-reflectance / high-roughness base as the upstream default
+        // plugin uses for `ExtendedMaterial<StandardMaterial,
+        // StandardVoxelMaterial>`. Keeps the lit appearance — under the
+        // existing directional sun + ambient — identical.
+        base: StandardMaterial {
+            reflectance: 0.05,
+            metallic: 0.05,
+            perceptual_roughness: 0.95,
+            ..default()
+        },
+        extension: VoxelTerrainExtension {
+            voxels_texture: texture_handle,
+        },
+    }
+}

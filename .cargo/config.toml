@@ -8,3 +8,11 @@ rustflags = ["-C", "target-cpu=native"]
 
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=native"]
+
+# Force the C compiler back to C11 for all transitive C deps. Bevy's
+# `meshlet_processor` feature pulls in `metis-sys`, whose vendored GKlib has
+# `typedef enum { false, true } bool;` — illegal under C23 (the default of
+# recent MinGW gcc). C11 keeps `false`/`true` as user-defined identifiers.
+[env]
+CFLAGS_x86_64_pc_windows_gnu = "-std=gnu11"
+CFLAGS_x86_64_pc_windows_msvc = "/std:c11"

@@ -30,7 +30,10 @@ pub fn sample_height(noise: &HybridMulti<Perlin>, x: i32, z: i32) -> f64 {
 
 /// Gameplay-side terrain oracle: deterministic surface heights that match the
 /// meshed geometry, available regardless of which chunks are currently loaded.
-#[derive(Resource)]
+///
+/// `Clone` is cheap (just a copy of the noise parameters) so worker threads can
+/// snapshot the oracle and run searches off the main thread.
+#[derive(Resource, Clone)]
 pub struct Terrain {
     noise: HybridMulti<Perlin>,
 }
