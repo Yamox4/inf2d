@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::render::view::{Hdr, Msaa};
 use bevy_voxel_world::prelude::*;
 
-use inf3d_core::{FollowTarget, QualitySettings};
+use inf3d_core::{FollowTarget, GameSet, QualitySettings};
 use inf3d_world::MainWorld;
 
 /// Horizontal (XZ-plane) distance from the player to the camera.
@@ -49,12 +49,19 @@ pub struct IsoCameraPlugin;
 
 impl Plugin for IsoCameraPlugin {
     fn build(&self, app: &mut App) {
-        // No-op if the app composer already inserted a configured value.
-        app.init_resource::<QualitySettings>()
-            .add_systems(Startup, spawn_camera)
-            .add_systems(Update, (camera_input, apply_quality_to_camera))
-            // PostUpdate so the camera reads the player's final position this frame.
-            .add_systems(PostUpdate, follow_player);
+        // `QualitySettings` is a shared resource owned solely by `CorePlugin`; we
+        // only read it here. `camera_input` is raw-input (Input phase);
+        // `apply_quality_to_camera` reconfigures post-FX (Fx phase).
+        app.add_systems(Startup, spawn_camera)
+            .add_systems(Update, camera_input.in_set(GameSet::Input))
+            .add_systems(Update, apply_quality_to_camera.in_set(GameSet::Fx))
+            // Follow in PostUpdate, AFTER avian's `TransformInterpolation` easing
+            // (which runs in `RunFixedMainLoop`, before `Update`) has written the
+            // smoothed player `Transform`, and BEFORE Bevy's transform
+            // propagation so the camera's `GlobalTransform` is up to date this
+            // frame. Reading the interpolated (not mid-step) transform is what
+            // keeps the camera smooth at any zoom.
+            .add_systems(PostUpdate, follow_player.before(TransformSystems::Propagate));
     }
 }
 
@@ -94,11 +101,12 @@ fn ssao_component() -> ScreenSpaceAmbientOcclusion {
 
 /// Motion-blur config used everywhere it's enabled. `MotionBlur`
 /// `#[require(DepthPrepass, MotionVectorPrepass)]`, so both prepasses must also
-/// be on the camera. Defaults are deliberately gentle: a short shutter angle and
-/// a single sample give a subtle AAA smear, not a heavy blur.
+/// be on the camera. Deliberately subtle: a short `shutter_angle` (the smear
+/// length — 0 = off, 1 = a full 360° shutter) plus a single sample give a hint
+/// of AAA smear, not a heavy blur. Lower `shutter_angle` further to soften more.
 fn motion_blur_component() -> MotionBlur {
     MotionBlur {
-        shutter_angle: 0.25,
+        shutter_angle: 0.15,
         samples: 1,
     }
 }
@@ -135,13 +143,12 @@ fn spawn_camera(mut commands: Commands, quality: Res<QualitySettings>) {
     if quality.bloom_enabled {
         entity.insert(bloom_component());
     }
-    // SSAO + motion blur are AAA post-FX gated to the higher-quality presets.
-    // We reuse `bloom_enabled` as the gate (true on Medium/High, false on
-    // Potato/Low) so we don't add a new `QualitySettings` field (core is owned by
-    // another agent). The custom terrain material now writes the depth/normal/
-    // motion-vector prepass, so the voxel terrain finally participates in both.
-    let ssao_enabled = quality.bloom_enabled;
-    let motion_blur_enabled = quality.bloom_enabled;
+    // SSAO + motion blur are AAA post-FX gated to the higher-quality presets via
+    // their own real `QualitySettings` flags (Medium/High on, Potato/Low off).
+    // The custom terrain material writes the depth/normal/motion-vector prepass,
+    // so the voxel terrain participates in both.
+    let ssao_enabled = quality.ssao_enabled;
+    let motion_blur_enabled = quality.motion_blur_enabled;
 
     // DepthPrepass feeds Depth-of-Field, the water's depth-based deep/shallow
     // color blend + shoreline foam (bevy_water samples the depth texture to know
@@ -202,10 +209,10 @@ fn apply_quality_to_camera(
         return;
     };
 
-    // SSAO + motion blur share `bloom_enabled` as their quality gate (see
-    // spawn_camera) so Potato/Low stay cheap.
-    let ssao_enabled = quality.bloom_enabled;
-    let motion_blur_enabled = quality.bloom_enabled;
+    // SSAO + motion blur use their own real quality flags (see spawn_camera) so
+    // Potato/Low stay cheap.
+    let ssao_enabled = quality.ssao_enabled;
+    let motion_blur_enabled = quality.motion_blur_enabled;
 
     let mut e = commands.entity(entity);
 

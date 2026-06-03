@@ -9,6 +9,25 @@
 use bevy::platform::collections::HashSet;
 use bevy::prelude::*;
 
+/// Explicit ordering backbone for the `Update` schedule. Every `Update` system
+/// across the workspace gets `.in_set(GameSet::X)`; `CorePlugin` chains the four
+/// variants once so the phase order is fixed regardless of plugin registration
+/// order. Fixed-step and `PostUpdate` systems keep their avian-relative ordering
+/// (the scheduling spine) instead.
+///
+/// Order is `Input -> Logic -> Streaming -> Fx`:
+/// - [`Input`](GameSet::Input): raw-input reads (camera input, preset cycle, clicks).
+/// - [`Logic`](GameSet::Logic): pathfinding, follow-path, animation, interaction.
+/// - [`Streaming`](GameSet::Streaming): foliage streaming, prop collider builds.
+/// - [`Fx`](GameSet::Fx): dust, highlights, quality application, diagnostics, HUD.
+#[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum GameSet {
+    Input,
+    Logic,
+    Streaming,
+    Fx,
+}
+
 /// Voxel columns `(x, z)` occupied by SOLID props (trees & rocks — never
 /// grass). Populated by the foliage scatter system in `inf3d_render` as props
 /// spawn, and consumed by the A* pathfinder in `inf3d_pathfinding` so routes
@@ -91,9 +110,19 @@ pub struct QualitySettings {
     pub grass_radius_tiles: i32,
     pub grass_density: f32,
     pub grass_lod_enabled: bool,
+    /// World-space radius around the player within which dense grass spawns,
+    /// regardless of camera zoom. Caps the zoom-out cost: sparse trees/rocks
+    /// still fill the iso view to the edges via the foliage ring, but the
+    /// expensive grass carpet is bounded to this circle. `0.0` disables grass.
+    pub grass_radius_world: f32,
     pub foliage_enabled: bool,
     pub dof_enabled: bool,
     pub bloom_enabled: bool,
+    /// Screen-space ambient occlusion. Gated on Medium+ (mirrors the old
+    /// `bloom_enabled` proxy the camera used before real flags existed).
+    pub ssao_enabled: bool,
+    /// Per-object / camera motion blur. Gated on Medium+ alongside SSAO.
+    pub motion_blur_enabled: bool,
     pub water_enabled: bool,
     pub water_amplitude: f32,
     /// Maximum foliage tile-ring radius, in tiles. Clamps the dynamic
@@ -123,9 +152,12 @@ impl QualitySettings {
                 grass_radius_tiles: 0,
                 grass_density: 0.0,
                 grass_lod_enabled: false,
+                grass_radius_world: 0.0,
                 foliage_enabled: false,
                 dof_enabled: false,
                 bloom_enabled: false,
+                ssao_enabled: false,
+                motion_blur_enabled: false,
                 water_enabled: false,
                 water_amplitude: 0.0,
                 foliage_ring_max: 2,
@@ -139,9 +171,12 @@ impl QualitySettings {
                 grass_radius_tiles: 2,
                 grass_density: 0.22,
                 grass_lod_enabled: true,
+                grass_radius_world: 28.0,
                 foliage_enabled: true,
                 dof_enabled: false,
                 bloom_enabled: false,
+                ssao_enabled: false,
+                motion_blur_enabled: false,
                 water_enabled: true,
                 water_amplitude: 0.20,
                 foliage_ring_max: 3,
@@ -155,9 +190,12 @@ impl QualitySettings {
                 grass_radius_tiles: 3,
                 grass_density: 0.35,
                 grass_lod_enabled: true,
+                grass_radius_world: 44.0,
                 foliage_enabled: true,
                 dof_enabled: false,
                 bloom_enabled: true,
+                ssao_enabled: true,
+                motion_blur_enabled: true,
                 water_enabled: true,
                 water_amplitude: 0.35,
                 foliage_ring_max: 4,
@@ -171,9 +209,12 @@ impl QualitySettings {
                 grass_radius_tiles: 4,
                 grass_density: 0.5,
                 grass_lod_enabled: true,
+                grass_radius_world: 60.0,
                 foliage_enabled: true,
                 dof_enabled: true,
                 bloom_enabled: true,
+                ssao_enabled: true,
+                motion_blur_enabled: true,
                 water_enabled: true,
                 water_amplitude: 0.45,
                 foliage_ring_max: 6,
@@ -214,11 +255,21 @@ pub struct CorePlugin;
 
 impl Plugin for CorePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<QualitySettings>()
-            .init_resource::<GrassStats>()
-            .init_resource::<FrameStats>()
-            .init_resource::<BlockedCells>()
-            .init_resource::<PathTarget>();
+        app.configure_sets(
+            Update,
+            (
+                GameSet::Input,
+                GameSet::Logic,
+                GameSet::Streaming,
+                GameSet::Fx,
+            )
+                .chain(),
+        )
+        .init_resource::<QualitySettings>()
+        .init_resource::<GrassStats>()
+        .init_resource::<FrameStats>()
+        .init_resource::<BlockedCells>()
+        .init_resource::<PathTarget>();
     }
 }
 
@@ -307,6 +358,33 @@ mod tests {
                 w[0] <= w[1],
                 "terrain_lod_distance must not decrease: {:?}",
                 terrain_lod
+            );
+        }
+
+        let grass_radius: Vec<f32> = settings.iter().map(|s| s.grass_radius_world).collect();
+        for w in grass_radius.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "grass_radius_world must not decrease: {:?}",
+                grass_radius
+            );
+        }
+    }
+
+    #[test]
+    fn ssao_and_motion_blur_gated_on_medium_and_high() {
+        for (p, on) in [
+            (QualityPreset::Potato, false),
+            (QualityPreset::Low, false),
+            (QualityPreset::Medium, true),
+            (QualityPreset::High, true),
+        ] {
+            let s = QualitySettings::from_preset(p);
+            assert_eq!(s.ssao_enabled, on, "ssao gate wrong for {:?}", p);
+            assert_eq!(
+                s.motion_blur_enabled, on,
+                "motion blur gate wrong for {:?}",
+                p
             );
         }
     }

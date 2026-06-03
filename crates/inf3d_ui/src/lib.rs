@@ -7,8 +7,8 @@ use bevy::diagnostic::{
 use bevy::prelude::*;
 use bevy_voxel_world::prelude::Chunk;
 
-use inf3d_core::{FrameStats, QualitySettings};
-use inf3d_world::MainWorld;
+use inf3d_core::{FrameStats, GameSet, QualitySettings};
+use inf3d_world::{MainWorld, TerrainMaterialId};
 
 /// Live-monitor metrics, logged each second by `LogDiagnosticsPlugin` alongside
 /// the built-in FPS / frame-time / entity-count diagnostics.
@@ -52,14 +52,12 @@ impl Plugin for HudPlugin {
         .register_diagnostic(Diagnostic::new(DIAG_MESHES))
         .init_resource::<HudStats>()
         .add_systems(Startup, spawn_hud)
+        // F2 is raw input, so it cycles in `Input`; everything else is read-only
+        // diagnostics/presentation and belongs in `Fx` (end of the frame).
+        .add_systems(Update, cycle_preset_keybinding.in_set(GameSet::Input))
         .add_systems(
             Update,
-            (
-                measure_diagnostics,
-                update_frame_stats,
-                cycle_preset_keybinding,
-                update_hud,
-            ),
+            (measure_diagnostics, update_frame_stats, update_hud).in_set(GameSet::Fx),
         );
     }
 }
@@ -85,11 +83,16 @@ fn spawn_hud(mut commands: Commands) {
     ));
 }
 
+/// Human-readable name for a terrain material index. Derived from the single
+/// `TerrainMaterialId` enum in `inf3d_world` (the source of truth for both the
+/// index meanings and the player-facing labels) so the HUD can't desync if the
+/// enum's discriminants or meanings change. `inf3d_ui` already depends on
+/// `inf3d_world` and `inf3d_world` does not depend on `inf3d_ui`, so this adds
+/// no dependency edge. Indices outside the palette fall back to "Solid".
 fn material_name(m: u8) -> &'static str {
-    match m {
-        0 => "Ground/Grass",
-        3 => "Water",
-        _ => "Solid",
+    match TerrainMaterialId::from_index(m) {
+        Some(id) => id.label(),
+        None => "Solid",
     }
 }
 
@@ -219,8 +222,10 @@ fn update_hud(
         "Tile: —".to_string()
     };
 
+    let on_off = |b: bool| if b { "on" } else { "off" };
+
     text.0 = format!(
-        "FPS: {:.0}  ({:.1} ms, p95 {:.1} ms)\nEntities: {:.0}   Chunks: {}\nPlayer: ({:.1}, {:.1}, {:.1})  cell=({}, {})\nQuality: {}  rd={}  [F2]\n{}",
+        "FPS: {:.0}  ({:.1} ms, p95 {:.1} ms)\nEntities: {:.0}   Chunks: {}\nPlayer: ({:.1}, {:.1}, {:.1})  cell=({}, {})\nQuality: {}  rd={}  SSAO {}  MB {}  [F2]\n{}",
         fps,
         frame_ms,
         frame.ms_p95,
@@ -230,6 +235,8 @@ fn update_hud(
         cell.x, cell.y,
         settings.preset.name(),
         settings.render_distance_chunks,
+        on_off(settings.ssao_enabled),
+        on_off(settings.motion_blur_enabled),
         hover_line,
     );
 }

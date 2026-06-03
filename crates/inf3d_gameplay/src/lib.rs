@@ -10,10 +10,8 @@ use std::collections::VecDeque;
 use avian3d::prelude::*;
 use bevy::prelude::*;
 
-use inf3d_core::{FollowTarget, PathTarget};
-use inf3d_physics::{
-    CharacterController, DesiredMove, GameLayer, PLAYER_HALF_HEIGHT, PLAYER_RADIUS,
-};
+use inf3d_core::{FollowTarget, GameSet, PathTarget};
+use inf3d_physics::{CharacterController, DesiredMove, GameLayer, PLAYER_DIMS};
 use inf3d_worldgen::Terrain;
 
 /// The controllable player. `cell` is the current voxel column `(x, z)` the
@@ -55,9 +53,11 @@ enum Part {
 #[derive(Component)]
 struct RestPos(Vec3);
 
-/// Half the capsule height: the parent origin sits 1.0 above the feet, so the
-/// character visual root puts the feet at local Y = -1.0.
-const CAPSULE_HALF_HEIGHT: f32 = 1.0;
+/// Distance from the player entity origin (capsule center) down to the feet.
+/// Derived from the single [`PLAYER_DIMS`] source of truth so the visual figure
+/// always stands on the capsule's feet — no hand-kept literal. The character
+/// visual root is placed at local Y = `-VISUAL_ROOT_OFFSET`.
+const VISUAL_ROOT_OFFSET: f32 = PLAYER_DIMS.visual_root_offset;
 
 // Walk-animation tuning.
 const HOP_RATE: f32 = 4.5; // hops per second while moving
@@ -72,9 +72,13 @@ pub struct PlayerPlugin;
 
 impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<PathTarget>()
-            .add_systems(Startup, spawn_player)
-            .add_systems(Update, (follow_path, animate_player).chain());
+        // `PathTarget` is a shared resource owned solely by `CorePlugin`; we only
+        // read/clear it here. `follow_path` sets the movement intent and
+        // `animate_player` reads it — both are per-frame game logic.
+        app.add_systems(Startup, spawn_player).add_systems(
+            Update,
+            (follow_path, animate_player).chain().in_set(GameSet::Logic),
+        );
     }
 }
 
@@ -88,7 +92,7 @@ fn spawn_player(
 ) {
     // Spawn on the nearest land so the player never starts submerged in water.
     let spawn = terrain.nearest_land(IVec2::ZERO);
-    let center = terrain.stand_pos(spawn.x, spawn.y) + Vec3::Y * CAPSULE_HALF_HEIGHT;
+    let center = terrain.stand_pos(spawn.x, spawn.y) + Vec3::Y * VISUAL_ROOT_OFFSET;
 
     // Smooth meshes. Bevy's Sphere/Cone are already smooth-shaded.
     let body_mesh = meshes.add(Cone {
@@ -141,16 +145,20 @@ fn spawn_player(
             FollowTarget,
             // Kinematic character controller: avian moves it only via our
             // `move_and_slide` in `inf3d_physics`, never auto-integrated. The
-            // capsule matches the visual figure's ~1.0 half-height. The Player
-            // layer collides with Terrain + Solid props (set on the collider).
+            // capsule is built from the single `PLAYER_DIMS` source of truth. The
+            // Player layer collides with Solid props only — the ground is derived
+            // analytically from the Terrain heightfield, so there is no terrain
+            // collider/layer to hit.
             RigidBody::Kinematic,
-            Collider::capsule(PLAYER_RADIUS, PLAYER_HALF_HEIGHT * 2.0),
-            CollisionLayers::new(
-                GameLayer::Player,
-                [GameLayer::Terrain, GameLayer::Solid],
-            ),
+            Collider::capsule(PLAYER_DIMS.radius, PLAYER_DIMS.half_height * 2.0),
+            CollisionLayers::new(GameLayer::Player, [GameLayer::Solid]),
             CharacterController::default(),
             DesiredMove::default(),
+            // The controller writes this `Transform` in `FixedPostUpdate`;
+            // avian's `TransformInterpolation` eases it between fixed ticks (right
+            // after `FixedMain`, before `Update`) so the rendered figure — and
+            // the camera following it — stay smooth at any frame rate / zoom.
+            TransformInterpolation,
         ))
         .with_children(|parent| {
             parent
@@ -284,7 +292,7 @@ fn animate_player(
     };
     let dt = time.delta_secs();
     let moving = !move_path.waypoints.is_empty();
-    let feet = p_tf.translation - Vec3::Y * CAPSULE_HALF_HEIGHT;
+    let feet = p_tf.translation - Vec3::Y * VISUAL_ROOT_OFFSET;
 
     // Face travel direction (yaw only, no tilt).
     root.rotation = root

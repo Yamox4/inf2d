@@ -34,9 +34,16 @@ fn main() {
         // CorePlugin must come first: it installs QualitySettings / GrassStats /
         // FrameStats so every downstream plugin can read them at build time.
         .add_plugins(CorePlugin)
-        // avian3d ECS physics: steps the sim in its own schedule. We disable its
-        // built-in gravity (our kinematic controller applies its own) — kinematic
-        // bodies ignore global gravity anyway, but this keeps intent explicit.
+        // avian3d ECS physics at its DEFAULT fixed timestep (`FixedPostUpdate`).
+        // The kinematic character controller now also runs in `FixedPostUpdate`
+        // (after avian's `Writeback`) using the *fixed* delta, and the player
+        // carries avian's `TransformInterpolation` so the rendered transform is
+        // smoothly eased between fixed ticks (right after `FixedMain`, before
+        // `Update`) — that decouples the sim rate from the frame rate, killing
+        // the zoom-out jitter the old variable-timestep `PostUpdate` hack tried
+        // (and failed) to paper over. `PhysicsInterpolationPlugin` ships inside
+        // `PhysicsPlugins` by default, so no extra plugin is needed here. Gravity
+        // stays off (the controller applies its own only while airborne).
         .add_plugins(PhysicsPlugins::default())
         .insert_resource(Gravity(Vec3::ZERO))
         .add_plugins(WorldPlugin)

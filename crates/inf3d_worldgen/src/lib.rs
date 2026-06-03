@@ -43,6 +43,53 @@ pub fn sample_height(noise: &HybridMulti<Perlin>, x: i32, z: i32) -> f64 {
     noise.get([x as f64 / 1000.0, z as f64 / 1000.0]) * 50.0
 }
 
+/// Resolved classification of a single terrain column. The single source of
+/// truth for the land/water/seafloor split: both the [`Terrain`] gameplay
+/// oracle and `inf3d_world::get_voxel_fn` (the meshing delegate on worker
+/// threads) derive their answers from [`column_kind`], so the surface a player
+/// stands/pathfinds on can never desync from the meshed geometry or the
+/// material picked for a voxel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ColumnKind {
+    /// Y index of the topmost solid voxel in the column (>= 0).
+    pub surface_y: i32,
+    /// Whether the column's standing height sits below [`WATER_HEIGHT`], i.e.
+    /// it is submerged seafloor (unwalkable) rather than dry land.
+    pub is_water: bool,
+}
+
+impl ColumnKind {
+    /// World Y an entity standing on this column rests its feet at: the top
+    /// face of the topmost solid voxel.
+    pub fn stand_y(self) -> i32 {
+        self.surface_y + 1
+    }
+
+    /// Classify a column from an already-sampled raw height (voxel units). The
+    /// pure core of the land/water split, factored out so the meshing closure
+    /// — which memoizes the raw `sample_height` per worker — can reuse its
+    /// cached value instead of re-sampling the noise, while still going through
+    /// the *exact* same logic as [`column_kind`].
+    pub fn from_height(height: f64) -> Self {
+        let surface_y = (height.floor() as i32).max(0);
+        // Standing height = top face of the topmost solid voxel. A column is
+        // water when an entity standing there would be at or below the water
+        // line. LOD-independent (it only depends on the standing height vs
+        // `WATER_HEIGHT`) so coastlines stay put across LODs.
+        let is_water = (surface_y + 1) as f32 <= WATER_HEIGHT;
+        Self { surface_y, is_water }
+    }
+}
+
+/// Classify a single column. The `noise` is the only per-call input so callers
+/// can pass an LOD-reduced noise (meshing worker) or the canonical LOD-0 noise
+/// (gameplay oracle) and still get a split that agrees on coastlines. Thin
+/// wrapper over [`ColumnKind::from_height`] for callers that haven't already
+/// sampled the height.
+pub fn column_kind(noise: &HybridMulti<Perlin>, x: i32, z: i32) -> ColumnKind {
+    ColumnKind::from_height(sample_height(noise, x, z))
+}
+
 /// Gameplay-side terrain oracle: deterministic surface heights that match the
 /// meshed geometry, available regardless of which chunks are currently loaded.
 ///
@@ -61,22 +108,30 @@ impl Terrain {
         }
     }
 
+    /// Classify the column at `(x, z)` from the oracle's (LOD-0) noise. The one
+    /// helper that all the public accessors below delegate to, so the oracle
+    /// and the meshing closure (which calls [`column_kind`] directly) can never
+    /// disagree about land/water/seafloor.
+    fn column(&self, x: i32, z: i32) -> ColumnKind {
+        column_kind(&self.noise, x, z)
+    }
+
     /// Y index of the topmost solid voxel in column `(x, z)`.
     pub fn surface_y(&self, x: i32, z: i32) -> i32 {
-        (sample_height(&self.noise, x, z).floor() as i32).max(0)
+        self.column(x, z).surface_y
     }
 
     /// World-space point at the center-top of column `(x, z)` — where an entity
     /// standing on the surface should rest its feet.
     pub fn stand_pos(&self, x: i32, z: i32) -> Vec3 {
-        let top = self.surface_y(x, z);
-        Vec3::new(x as f32 + 0.5, (top + 1) as f32, z as f32 + 0.5)
+        let kind = self.column(x, z);
+        Vec3::new(x as f32 + 0.5, kind.stand_y() as f32, z as f32 + 0.5)
     }
 
     /// Whether a column is walkable land (its surface stands above the water
     /// line). Seafloor flats sit under the water and are not walkable.
     pub fn is_land(&self, x: i32, z: i32) -> bool {
-        self.stand_pos(x, z).y > WATER_HEIGHT
+        !self.column(x, z).is_water
     }
 
     /// Nearest land column to `start` (spiral ring search), so entities never

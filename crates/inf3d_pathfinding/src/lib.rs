@@ -17,7 +17,7 @@ use bevy::{
 use bevy_voxel_world::prelude::*;
 
 use inf3d_camera::IsoCamera;
-use inf3d_core::{BlockedCells, PathTarget};
+use inf3d_core::{BlockedCells, GameSet, PathTarget};
 use inf3d_gameplay::{MovePath, Player};
 use inf3d_world::MainWorld;
 use inf3d_worldgen::Terrain;
@@ -35,17 +35,16 @@ impl Plugin for PathfindPlugin {
             .add_message::<PathFound>()
             .init_resource::<ActivePathTask>()
             .init_resource::<PathTiming>()
-            .init_resource::<BlockedCells>()
-            .init_resource::<PathTarget>()
+            // Click is raw input; the dispatch/poll/consume trio is logic. The
+            // set tags place input ahead of all logic globally (Input runs before
+            // Logic), and `.chain()` preserves the exact per-frame data flow:
+            // read click → dispatch → poll → consume.
+            .add_systems(Update, handle_click.in_set(GameSet::Input))
             .add_systems(
                 Update,
-                (
-                    handle_click,
-                    dispatch_path_task,
-                    poll_path_task,
-                    consume_path_found,
-                )
-                    .chain(),
+                (dispatch_path_task, poll_path_task, consume_path_found)
+                    .chain()
+                    .in_set(GameSet::Logic),
             );
     }
 }

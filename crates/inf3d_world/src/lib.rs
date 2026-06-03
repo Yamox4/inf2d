@@ -10,11 +10,78 @@ use bevy::{
 };
 use bevy_voxel_world::prelude::*;
 use inf3d_core::QualitySettings;
-use inf3d_worldgen::{build_noise_lod, sample_height, Terrain, WATER_HEIGHT};
+use inf3d_worldgen::{build_noise_lod, sample_height, ColumnKind, Terrain};
 
 pub mod terrain_material;
 
 use terrain_material::install_terrain_material;
+
+/// Canonical voxel material palette. The single source of truth for what each
+/// `MainWorld::MaterialIndex` (`u8`) value means; consumed by [`get_voxel_fn`]
+/// (which voxel value to emit), [`MainWorld::texture_index_mapper`] (which
+/// texture-array layers to sample per face), the texture palette order in
+/// [`terrain_material::install_terrain_material`]'s `build_terrain_texture`,
+/// and `inf3d_ui::material_name` (which must align its labels to these values).
+///
+/// The discriminants double as both the meshing material index *and* the
+/// texture-array layer index for a single-texture (all-face) material, so the
+/// numeric order here is also the layer order in the procedural texture array.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum TerrainMaterialId {
+    /// Dry-land surface. Top face shows grass; exposed sides show dirt and the
+    /// bottom shows stone (see [`MainWorld::texture_index_mapper`]).
+    Grass = 0,
+    /// Earthy mid-tone. Used on the exposed *sides* of land voxels.
+    Dirt = 1,
+    /// Grey rock. Used on the *bottom* faces of land voxels (and reads as the
+    /// underground filler beneath the surface layer).
+    Stone = 2,
+    /// Sandy seafloor for submerged columns. All faces sample this single
+    /// layer; it shows through the translucent water plane.
+    Seafloor = 3,
+}
+
+impl TerrainMaterialId {
+    /// Texture-array layer index for a uniform (all-face) material — equal to
+    /// the discriminant. Per-face mixing for land happens in
+    /// [`MainWorld::texture_index_mapper`].
+    const fn layer(self) -> u32 {
+        self as u32
+    }
+
+    /// Canonical player-facing label for this material, shown in the HUD's
+    /// hovered-tile readout (`inf3d_ui::material_name`). The single source of
+    /// truth for these strings: keeping them here means a discriminant or
+    /// meaning change to the enum can't silently desync the HUD labels.
+    ///
+    /// Note `Seafloor` reads as "Water" to the player: it's the voxel under a
+    /// submerged column, i.e. what the cursor lands on over the (unwalkable)
+    /// water plane, so the gameplay-relevant name is "Water".
+    pub const fn label(self) -> &'static str {
+        match self {
+            TerrainMaterialId::Grass => "Grass",
+            TerrainMaterialId::Dirt => "Dirt",
+            TerrainMaterialId::Stone => "Stone",
+            TerrainMaterialId::Seafloor => "Water",
+        }
+    }
+
+    /// Map a raw `MainWorld::MaterialIndex` (`u8`) back to its
+    /// `TerrainMaterialId`, returning `None` for indices outside the palette.
+    /// Lets consumers (e.g. the HUD) recover the canonical variant — and its
+    /// [`label`](Self::label) — without hand-keeping a parallel match on the
+    /// discriminants.
+    pub const fn from_index(index: u8) -> Option<Self> {
+        match index {
+            x if x == TerrainMaterialId::Grass as u8 => Some(TerrainMaterialId::Grass),
+            x if x == TerrainMaterialId::Dirt as u8 => Some(TerrainMaterialId::Dirt),
+            x if x == TerrainMaterialId::Stone as u8 => Some(TerrainMaterialId::Stone),
+            x if x == TerrainMaterialId::Seafloor as u8 => Some(TerrainMaterialId::Seafloor),
+            _ => None,
+        }
+    }
+}
 
 /// Default chunk radius streamed around the camera when no `QualitySettings`
 /// resource is present. Used only as a fallback — in practice `CorePlugin`
@@ -186,12 +253,19 @@ impl VoxelWorldConfig for MainWorld {
     }
 
     fn texture_index_mapper(&self) -> Arc<dyn Fn(Self::MaterialIndex) -> [u32; 3] + Send + Sync> {
+        use TerrainMaterialId::*;
+        // The returned `[u32; 3]` is `[top, side, bottom]` — the shader samples
+        // `tex_idx[tex_face]` where `tex_face` is 0/1/2 for top/side/bottom (it
+        // is picked per-vertex from the axis-aligned face normal). Land voxels
+        // get the classic block look — grass cap, dirt sides, stone underneath
+        // — so every texture-array layer is wired in. Seafloor is uniform: all
+        // faces show the sandy layer that reads through the water.
         Arc::new(|mat| match mat {
-            0 => [0, 0, 0],
-            1 => [1, 1, 1],
-            2 => [2, 2, 2],
-            3 => [3, 3, 3],
-            _ => [0, 0, 0],
+            m if m == Grass as u8 => [Grass.layer(), Dirt.layer(), Stone.layer()],
+            m if m == Seafloor as u8 => [Seafloor.layer(); 3],
+            // Unknown index: fall back to the all-grass land cap rather than a
+            // blank layer, so a stray material still reads as terrain.
+            _ => [Grass.layer(), Dirt.layer(), Stone.layer()],
         })
     }
 }
@@ -277,8 +351,10 @@ fn setup_lighting(mut commands: Commands) {
     });
 }
 
-/// Per-chunk voxel lookup closure (runs on worker threads). Must stay in sync
-/// with [`sample_height`]: solid where `y < sample`, with a sea floor below 1.
+/// Per-chunk voxel lookup closure (runs on worker threads). Solidity and the
+/// land/water split both derive from the shared [`inf3d_worldgen`] column
+/// helpers, so the meshed geometry and material choice can never desync from
+/// the [`Terrain`] oracle that pathfinding/standing read.
 ///
 /// `lod` selects how many noise octaves feed the height field: coarser (higher)
 /// LODs drop high-frequency octaves, which is cheaper and avoids baking detail
@@ -315,15 +391,16 @@ fn get_voxel_fn(lod: u8) -> Box<dyn FnMut(IVec3, Option<WorldVoxel>) -> WorldVox
         // SEA_FLOOR_MIN so columns don't generate endlessly far down.
         let solid_top = surface.max(SEA_FLOOR_MIN);
         if (pos.y as f64) < solid_top {
-            // Sandy seafloor (3) for underwater columns, land (0) otherwise —
-            // matches the Terrain oracle's land/water split (standing height vs
-            // WATER_HEIGHT) so coastlines stay consistent with pathfinding.
-            let stand_y = surface.floor().max(0.0) + 1.0;
-            if stand_y <= WATER_HEIGHT as f64 {
-                WorldVoxel::Solid(3)
+            // Classify via the same helper the `Terrain` oracle uses (off the
+            // cached raw height, so no extra noise sample) — seafloor for
+            // submerged columns, land otherwise — so coastlines stay consistent
+            // with pathfinding. Emit the canonical material indices.
+            let mat = if ColumnKind::from_height(surface).is_water {
+                TerrainMaterialId::Seafloor
             } else {
-                WorldVoxel::Solid(0)
-            }
+                TerrainMaterialId::Grass
+            };
+            WorldVoxel::Solid(mat as u8)
         } else {
             WorldVoxel::Air
         }

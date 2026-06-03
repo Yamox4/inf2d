@@ -5,6 +5,8 @@
 
 use bevy::prelude::*;
 
+use inf3d_core::GameSet;
+
 /// Request a puff of `amount` dust particles at `pos`, flung outward at `speed`.
 #[derive(Message)]
 pub struct DustBurst {
@@ -23,7 +25,7 @@ impl Plugin for DustPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<DustBurst>()
             .add_systems(Startup, init_dust_assets)
-            .add_systems(Update, (emit_dust, update_dust));
+            .add_systems(Update, (emit_dust, update_dust).in_set(GameSet::Fx));
     }
 }
 

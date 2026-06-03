@@ -26,9 +26,11 @@ const ROCK_DENSITY: f32 = 0.002;
 /// Determinism: the RNG is seeded purely from the tile coordinate and consumed
 /// in a fixed scan order, so the same tile always produces the same scatter.
 ///
-/// `cheap_lod` (the tile is past `foliage_lod_distance`): skip grass entirely.
-/// Grass is the densest, collider-free category, so dropping it for far tiles
-/// is the cheap LOD — far tiles keep only their sparse solid props.
+/// `cheap_lod`: skip grass entirely. A tile is cheap-LOD when it is past the
+/// camera-relative `foliage_lod_distance` OR outside the player-relative
+/// `grass_radius_world` (see [`super::stream`]). Grass is the densest,
+/// collider-free category, so dropping it is the cheap LOD — those tiles keep
+/// only their sparse solid props (trees/rocks still stream to the iso edges).
 ///
 /// The returned vec is sorted by (category, variant) so the main thread spawns
 /// all instances of one variant contiguously. Bevy auto-batches instances that

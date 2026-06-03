@@ -49,7 +49,7 @@ use std::collections::HashMap;
 use bevy::prelude::*;
 use bevy::tasks::Task;
 
-use inf3d_core::{BlockedCells, QualitySettings};
+use inf3d_core::GameSet;
 
 mod scatter;
 mod spawn;
@@ -139,8 +139,9 @@ struct TileScatterTask {
 /// `Pending` (scatter task in flight) → `Live` (entities spawned, parent held).
 ///
 /// `Live` also carries the voxel cells its SOLID props occupy, so that when the
-/// tile despawns we can remove exactly those cells from [`BlockedCells`] (the
-/// shared resource the pathfinder reads). Grass cells are never recorded.
+/// tile despawns we can remove exactly those cells from
+/// [`BlockedCells`](inf3d_core::BlockedCells) (the shared resource the
+/// pathfinder reads). Grass cells are never recorded.
 enum TileState {
     Pending(TileScatterTask),
     Live(Entity, Vec<IVec2>),
@@ -163,11 +164,11 @@ pub struct FoliagePlugin;
 
 impl Plugin for FoliagePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<QualitySettings>()
-            .init_resource::<FoliageField>()
-            .init_resource::<BlockedCells>()
+        // `QualitySettings` and `BlockedCells` are owned (init) by `CorePlugin`;
+        // foliage only reads them. `FoliageField` is foliage's own state.
+        app.init_resource::<FoliageField>()
             .add_systems(Startup, setup_foliage)
-            .add_systems(Update, stream::stream_foliage);
+            .add_systems(Update, stream::stream_foliage.in_set(GameSet::Streaming));
     }
 }
 

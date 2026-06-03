@@ -210,12 +210,13 @@ impl MaterialExtension for VoxelTerrainExtension {
 /// mirroring what `bevy_voxel_world::voxel_material::prepare_voxel_texture`
 /// does internally (which we can't call because it is `pub(crate)`).
 ///
-/// Layer order matches the indices used by
-/// [`crate::MainWorld::texture_index_mapper`]:
-///  - 0 → grass (top of voxel)
-///  - 1 → dirt / mid-tone earth
-///  - 2 → stone
-///  - 3 → underground filler (sea floor)
+/// Layer order is the discriminant order of
+/// [`crate::TerrainMaterialId`] — the single source of truth that
+/// [`crate::MainWorld::texture_index_mapper`] also indexes into:
+///  - 0 → `Grass`    (top face of land voxels)
+///  - 1 → `Dirt`     (side faces of land voxels)
+///  - 2 → `Stone`    (bottom faces of land voxels)
+///  - 3 → `Seafloor` (all faces of submerged columns)
 ///
 /// Colors are flat tints rather than detail textures; the per-vertex AO
 /// color the mesher writes into `Mesh::ATTRIBUTE_COLOR` modulates them to
@@ -224,17 +225,18 @@ fn build_terrain_texture(images: &mut Assets<Image>) -> Handle<Image> {
     /// Side length of each layer in pixels. Square and a power of two so
     /// the stacked-as-array reinterpret has integer math.
     const LAYER_SIZE: u32 = 32;
-    /// Number of layers. Must match `MainWorld::texture_index_mapper`.
+    /// Number of layers. One per `TerrainMaterialId` variant; the mapper in
+    /// `MainWorld::texture_index_mapper` indexes into these by discriminant.
     const LAYERS: u32 = 4;
 
     let palette: [[u8; 3]; LAYERS as usize] = [
-        [0x4f, 0x7a, 0x35], // grass top
-        [0x6b, 0x4a, 0x2c], // dirt
-        [0x6e, 0x6f, 0x72], // stone
+        [0x4f, 0x7a, 0x35], // 0 Grass — land top face
+        [0x6b, 0x4a, 0x2c], // 1 Dirt  — land side faces
+        [0x6e, 0x6f, 0x72], // 2 Stone — land bottom faces
         // Seafloor: bevy_water has `clarity: 0.4`, so this color shows through
         // the water surface. Sandy/tan reads as "shallow beach water"; the old
         // dark brown made the water look muddy.
-        [0xd4, 0xc1, 0x88], // sandy seafloor
+        [0xd4, 0xc1, 0x88], // 3 Seafloor — submerged columns (shows through water)
     ];
 
     let pixels_per_layer = (LAYER_SIZE * LAYER_SIZE) as usize;

@@ -7,7 +7,7 @@ use bevy::{prelude::*, window::PrimaryWindow};
 use bevy_voxel_world::prelude::*;
 
 use inf3d_camera::IsoCamera;
-use inf3d_core::PathTarget;
+use inf3d_core::{GameSet, PathTarget};
 use inf3d_world::MainWorld;
 use inf3d_worldgen::Terrain;
 
@@ -35,9 +35,11 @@ pub struct HighlightPlugin;
 impl Plugin for HighlightPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Hover>()
-            .init_resource::<PathTarget>()
             .add_systems(Startup, (spawn_highlight, spawn_target_highlight))
-            .add_systems(Update, (update_highlight, update_target_highlight));
+            .add_systems(
+                Update,
+                (update_highlight, update_target_highlight).in_set(GameSet::Fx),
+            );
     }
 }
 

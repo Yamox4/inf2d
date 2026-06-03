@@ -25,22 +25,19 @@
 use bevy::prelude::*;
 use bevy_water::{WaterPlugin as BevyWaterPlugin, WaterSettings};
 
-use inf3d_core::QualitySettings;
+use inf3d_core::{GameSet, QualitySettings};
 use inf3d_worldgen::WATER_HEIGHT;
 
 pub struct WaterPlugin;
 
 impl Plugin for WaterPlugin {
     fn build(&self, app: &mut App) {
-        // Defensively ensure QualitySettings exists; another plugin may have
-        // inserted it with non-default values before us, in which case
-        // `init_resource` is a no-op.
-        app.init_resource::<QualitySettings>();
-
         // Snapshot the (possibly-overridden) settings at build time to decide
-        // whether to register `BevyWaterPlugin`. Plugin registration can't be
-        // toggled after the fact, so this is the one chance to honour
-        // `water_enabled = false` (Potato preset).
+        // whether to register `BevyWaterPlugin`. `QualitySettings` is owned by
+        // `CorePlugin`; if `CorePlugin` built first the resource is present, and
+        // `unwrap_or_default()` covers the case where it hasn't yet. Plugin
+        // registration can't be toggled after the fact, so this is the one
+        // chance to honour `water_enabled = false` (Potato preset).
         let settings = app
             .world()
             .get_resource::<QualitySettings>()
@@ -51,7 +48,7 @@ impl Plugin for WaterPlugin {
 
         if settings.water_enabled {
             app.add_plugins(BevyWaterPlugin)
-                .add_systems(Update, apply_water_quality);
+                .add_systems(Update, apply_water_quality.in_set(GameSet::Fx));
         }
     }
 }
