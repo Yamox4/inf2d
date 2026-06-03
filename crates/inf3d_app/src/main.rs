@@ -9,7 +9,9 @@ use inf3d_core::CorePlugin;
 use inf3d_gameplay::PlayerPlugin;
 use inf3d_pathfinding::PathfindPlugin;
 use inf3d_physics::PhysicsGamePlugin;
-use inf3d_render::{DustPlugin, FogPlugin, FoliagePlugin, HighlightPlugin, WaterPlugin};
+use inf3d_render::{
+    CursorPlugin, DustPlugin, FogPlugin, FoliagePlugin, HighlightPlugin, WaterPlugin,
+};
 use inf3d_ui::HudPlugin;
 use inf3d_world::WorldPlugin;
 
@@ -55,6 +57,7 @@ fn main() {
         .add_plugins(IsoCameraPlugin)
         .add_plugins(PathfindPlugin)
         .add_plugins(HighlightPlugin)
+        .add_plugins(CursorPlugin)
         .add_plugins(DustPlugin)
         .add_plugins(FogPlugin)
         .add_plugins(HudPlugin)
