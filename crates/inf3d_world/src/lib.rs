@@ -181,6 +181,27 @@ impl VoxelWorldConfig for MainWorld {
         16
     }
 
+    fn max_spawn_per_frame(&self) -> usize {
+        // STUTTER FIX: telemetry showed per-frame chunk spawn/despawn BURSTS up
+        // to chunk+1143 in a single frame (the catastrophic initial-fill /
+        // fast-travel backlog dumped at once) — the hard hitch. The library
+        // default is 10000 (effectively unbounded), so it drains the whole
+        // backlog in one frame. We cap it to just above the cost of ONE normal
+        // chunk-boundary crossing so ordinary walking never clamps (and never
+        // spills fill into following frames), while the initial fill / teleport
+        // bursts still spread over several frames.
+        //
+        // PRESET-SCALED: render distance is preset-driven (Potato 4 … High 10),
+        // and a boundary crossing reveals a perpendicular FACE of the spawned
+        // disc — there is no vertical (Y) clamp, so the worst case is the full
+        // square face `(2*R+1)^2` (e.g. 21x21 = 441 on High, not the Medium
+        // 17x17 = 289 a fixed constant assumed). Derive the cap from the active
+        // `render_distance_chunks` plus a small margin so the "normal walking
+        // never clamps" guarantee holds on every preset, not just Medium.
+        let span = 2 * self.render_distance_chunks as usize + 1;
+        span * span + 32
+    }
+
     /// Select a voxel LOD from the chunk's distance to the camera. Band width
     /// is `terrain_lod_distance`; `previous_lod` gives us hysteresis so a
     /// chunk hovering on a boundary doesn't thrash between two LODs (and remesh

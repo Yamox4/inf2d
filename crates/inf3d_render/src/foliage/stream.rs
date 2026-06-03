@@ -1,12 +1,14 @@
 //! The streaming system: ring foliage tiles in/out as the player moves.
 //!
-//! [`stream_foliage`] runs every frame and orchestrates four steps, each a
+//! [`stream_foliage`] runs every frame and orchestrates five steps, each a
 //! focused helper below:
 //!
 //! 1. [`clear_all_tiles`] — bail out + unload everything when foliage is off.
 //! 2. [`poll_finished_tasks`] — spawn entities for any scatter task that resolved.
 //! 3. [`despawn_out_of_band`] — unload tiles outside the (wider) despawn ring.
-//! 4. [`start_missing_tasks`] — start up to [`MAX_TILE_TASKS_PER_FRAME`] new
+//! 4. [`restream_changed_tiles`] — re-scatter the few Live tiles whose grass
+//!    eligibility crossed the radius since they streamed (the grass-cap fix).
+//! 5. [`start_missing_tasks`] — start up to [`MAX_TILE_TASKS_PER_FRAME`] new
 //!    scatter tasks for the nearest missing tiles inside the spawn ring.
 //!
 //! The despawn ring is a **hysteresis band** wider than the spawn ring
@@ -58,6 +60,14 @@ const MAX_TILE_TASKS_PER_FRAME: usize = 3;
 /// Out-of-band tiles already sit well outside the view (hysteresis margin), so
 /// letting a few linger an extra frame or two is invisible.
 const MAX_TILE_DESPAWNS_PER_FRAME: usize = 4;
+/// Maximum number of Live tiles RE-STREAMED per frame because their grass
+/// eligibility changed (player crossed the grass radius). Grass eligibility is
+/// fixed at scatter time, so a tile streamed grass-free at the (zoom-enlarged)
+/// ring edge would stay bald as the player walks onto it unless we re-scatter it.
+/// Re-streaming despawns + re-queues the tile, so doing the whole ring at once is
+/// exactly the spawn/despawn burst that hitches the walk — we budget it small and
+/// prefer tiles GAINING grass (player approaching) over those shedding it.
+const MAX_TILE_RESTREAMS_PER_FRAME: usize = 2;
 
 /// Stream foliage tiles in/out as the player moves. See the module doc for the
 /// per-frame phase breakdown.
@@ -93,6 +103,14 @@ pub(super) fn stream_foliage(
 
     poll_finished_tasks(&mut commands, &assets, &mut field, &mut blocked);
     despawn_out_of_band(&mut commands, &mut field, &mut blocked, center, despawn_ring);
+    restream_changed_tiles(
+        &mut commands,
+        &mut field,
+        &mut blocked,
+        &settings,
+        cam_pos,
+        player.translation,
+    );
     start_missing_tasks(
         &assets,
         &terrain,
@@ -112,7 +130,7 @@ fn clear_all_tiles(commands: &mut Commands, field: &mut FoliageField, blocked: &
         return;
     }
     for (_, state) in field.tiles.drain() {
-        if let TileState::Live(entity, cells) = state {
+        if let TileState::Live { entity, cells, .. } = state {
             commands.entity(entity).despawn();
             for cell in cells {
                 blocked.0.remove(&cell);
@@ -130,15 +148,15 @@ fn poll_finished_tasks(
     field: &mut FoliageField,
     blocked: &mut BlockedCells,
 ) {
-    let mut ready: Vec<(IVec2, Vec<ScatterItem>)> = Vec::new();
+    let mut ready: Vec<(IVec2, Vec<ScatterItem>, bool)> = Vec::new();
     for (tile, state) in field.tiles.iter_mut() {
         if let TileState::Pending(pending) = state {
             if let Some(items) = block_on(poll_once(&mut pending.task)) {
-                ready.push((*tile, items));
+                ready.push((*tile, items, pending.with_grass));
             }
         }
     }
-    for (tile, items) in ready {
+    for (tile, items, with_grass) in ready {
         let entity = spawn_tile_entities(commands, assets, tile, &items);
         let mut cells: Vec<IVec2> = Vec::new();
         for item in &items {
@@ -149,7 +167,14 @@ fn poll_finished_tasks(
                 }
             }
         }
-        field.tiles.insert(tile, TileState::Live(entity, cells));
+        field.tiles.insert(
+            tile,
+            TileState::Live {
+                entity,
+                cells,
+                with_grass,
+            },
+        );
     }
 }
 
@@ -188,7 +213,7 @@ fn despawn_out_of_band(
     for tile in out_of_band.into_iter().take(MAX_TILE_DESPAWNS_PER_FRAME) {
         // Pending tasks just drop (the future is abandoned); Live tiles despawn
         // and surrender their blocked cells.
-        if let Some(TileState::Live(entity, cells)) = field.tiles.remove(&tile) {
+        if let Some(TileState::Live { entity, cells, .. }) = field.tiles.remove(&tile) {
             commands.entity(entity).despawn();
             for cell in cells {
                 blocked.0.remove(&cell);
@@ -197,7 +222,80 @@ fn despawn_out_of_band(
     }
 }
 
-/// Phase 3: start up to [`MAX_TILE_TASKS_PER_FRAME`] new scatter tasks for the
+/// Current grass eligibility of a tile: `true` when it sits inside BOTH the
+/// camera-relative `foliage_lod_distance` AND the player-relative
+/// `grass_radius_world`, i.e. it should carry grass right now. This is exactly the
+/// `!cheap_lod` condition [`start_missing_tasks`] uses at scatter time; sharing it
+/// keeps the re-stream test and the initial scatter in lockstep.
+fn tile_should_have_grass(
+    tile: IVec2,
+    settings: &QualitySettings,
+    cam_pos: Option<Vec3>,
+    player_pos: Vec3,
+) -> bool {
+    !(tile_is_far(tile, cam_pos, settings.foliage_lod_distance)
+        || tile_outside_grass_radius(tile, player_pos, settings.grass_radius_world))
+}
+
+/// Phase 3 (grass-cap coverage fix): re-stream the few Live tiles whose grass
+/// eligibility has drifted from how they were scattered.
+///
+/// Grass eligibility is frozen at scatter time, but the zoom-driven spawn ring can
+/// be much larger than `grass_radius_world`, so tiles stream grass-free at the
+/// ring edge and — without this — would stay bald forever as the player walks onto
+/// them. Here we compare each Live tile's stored `with_grass` against its CURRENT
+/// eligibility ([`tile_should_have_grass`]) and, for any mismatch, despawn the
+/// tile and re-queue it as `Pending` so the next `start_missing_tasks` re-scatters
+/// it with the correct grass. The re-scatter is the SAME seeded scatter (seed
+/// derives purely from the tile coord), so trees/rocks land identically —
+/// determinism holds; only the grass layer appears/disappears.
+///
+/// This is budgeted to [`MAX_TILE_RESTREAMS_PER_FRAME`] and PREFERS tiles GAINING
+/// grass (player approaching): a despawn + re-spawn is the per-frame burst we
+/// diagnosed as the walk hitch, so we never re-stream the whole ring at once, and
+/// we spend the small budget where it's visible (grass appearing ahead of the
+/// player) before reclaiming grass behind them.
+fn restream_changed_tiles(
+    commands: &mut Commands,
+    field: &mut FoliageField,
+    blocked: &mut BlockedCells,
+    settings: &QualitySettings,
+    cam_pos: Option<Vec3>,
+    player_pos: Vec3,
+) {
+    // Collect Live tiles whose current eligibility differs from how they streamed.
+    // `gaining` (false → true) is preferred over `shedding` (true → false).
+    let mut changed: Vec<(IVec2, bool)> = Vec::new();
+    for (tile, state) in field.tiles.iter() {
+        if let TileState::Live { with_grass, .. } = state {
+            let want = tile_should_have_grass(*tile, settings, cam_pos, player_pos);
+            if want != *with_grass {
+                changed.push((*tile, want));
+            }
+        }
+    }
+    if changed.is_empty() {
+        return;
+    }
+    // Prefer tiles GAINING grass (want == true) first; this puts the visible work
+    // (grass appearing as the player approaches) ahead of reclaiming grass behind.
+    changed.sort_by_key(|(_, want)| Reverse(*want));
+
+    for (tile, _) in changed.into_iter().take(MAX_TILE_RESTREAMS_PER_FRAME) {
+        // Despawn the stale Live tile and release its blocked cells; the next
+        // `start_missing_tasks` sees it missing and re-scatters it with the
+        // correct grass eligibility. Re-queuing via removal (rather than spawning a
+        // task here) keeps task-start budgeting in one place.
+        if let Some(TileState::Live { entity, cells, .. }) = field.tiles.remove(&tile) {
+            commands.entity(entity).despawn();
+            for cell in cells {
+                blocked.0.remove(&cell);
+            }
+        }
+    }
+}
+
+/// Phase 4: start up to [`MAX_TILE_TASKS_PER_FRAME`] new scatter tasks for the
 /// nearest missing tiles in the spawn ring (nearest-to-center first).
 fn start_missing_tasks(
     assets: &FoliageAssets,
@@ -251,9 +349,15 @@ fn start_missing_tasks(
         let sizes_snapshot = sizes.clone();
         let task =
             pool.spawn(async move { scatter_tile(&terrain_snapshot, tile, &sizes_snapshot, cheap_lod) });
-        field
-            .tiles
-            .insert(tile, TileState::Pending(TileScatterTask { task }));
+        // Record the grass eligibility this task was started with so the streamer
+        // can later detect a Live tile whose eligibility changed (grass-cap fix).
+        field.tiles.insert(
+            tile,
+            TileState::Pending(TileScatterTask {
+                task,
+                with_grass: !cheap_lod,
+            }),
+        );
     }
 }
 

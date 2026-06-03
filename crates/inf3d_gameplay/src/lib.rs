@@ -75,10 +75,19 @@ impl Plugin for PlayerPlugin {
         // `PathTarget` is a shared resource owned solely by `CorePlugin`; we only
         // read/clear it here. `follow_path` sets the movement intent and
         // `animate_player` reads it — both are per-frame game logic.
-        app.add_systems(Startup, spawn_player).add_systems(
-            Update,
-            (follow_path, animate_player).chain().in_set(GameSet::Logic),
-        );
+        app.add_systems(Startup, spawn_player)
+            // `follow_path` drives the movement INTENT and must run at the FIXED
+            // rate, in lockstep with the `inf3d_physics` character controller
+            // (`FixedPostUpdate`). At low fps the fixed loop runs several steps
+            // per frame; running `follow_path` only once per frame let the
+            // controller take ALL of those steps on a single stale direction,
+            // overshooting waypoints — the path-follow jitter. In `FixedUpdate`
+            // it re-aims and pops a waypoint every physics step. It only *reads*
+            // `Transform`, so it cannot corrupt the interpolated physics state.
+            .add_systems(FixedUpdate, follow_path)
+            // `animate_player` is per-frame VISUAL only (hop/feet/dust; reads the
+            // interpolated transform), so it stays in the render-rate Logic set.
+            .add_systems(Update, animate_player.in_set(GameSet::Logic));
     }
 }
 
@@ -225,10 +234,12 @@ fn spawn_player(
 
 /// Drive the player along its `MovePath` by writing a desired **horizontal**
 /// velocity into [`DesiredMove`]; the physics character controller in
-/// `inf3d_physics` consumes it (PostUpdate), runs it through `move_and_slide`
-/// against terrain + solid props, and handles gravity / ground-snap. This keeps
-/// the original click-to-move feel while making solid props actually block the
-/// player. Waypoints pop on **horizontal** arrival (the controller owns Y).
+/// `inf3d_physics` consumes it in the SAME fixed step (`FixedPostUpdate`), runs
+/// it through `move_and_slide` against solid props, and handles gravity /
+/// ground-snap. Runs in `FixedUpdate` so it re-aims and pops waypoints once per
+/// physics step (not once per render frame), which avoids overshooting waypoints
+/// when the fixed loop runs multiple steps in a slow frame. Waypoints pop on
+/// **horizontal** arrival (the controller owns Y).
 fn follow_path(
     mut query: Query<(&Transform, &mut Player, &mut MovePath, &mut DesiredMove)>,
     mut target: ResMut<PathTarget>,

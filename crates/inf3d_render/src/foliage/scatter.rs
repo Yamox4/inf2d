@@ -26,11 +26,14 @@ const ROCK_DENSITY: f32 = 0.002;
 /// Determinism: the RNG is seeded purely from the tile coordinate and consumed
 /// in a fixed scan order, so the same tile always produces the same scatter.
 ///
-/// `cheap_lod`: skip grass entirely. A tile is cheap-LOD when it is past the
-/// camera-relative `foliage_lod_distance` OR outside the player-relative
+/// `cheap_lod`: drop grass from the output. A tile is cheap-LOD when it is past
+/// the camera-relative `foliage_lod_distance` OR outside the player-relative
 /// `grass_radius_world` (see [`super::stream`]). Grass is the densest,
 /// collider-free category, so dropping it is the cheap LOD — those tiles keep
 /// only their sparse solid props (trees/rocks still stream to the iso edges).
+/// Crucially `cheap_lod` only suppresses *emitting* grass items; the grass RNG
+/// draws still happen, so the stream stays bit-identical to a grassy scatter and
+/// trees/rocks land in exactly the same places either way.
 ///
 /// The returned vec is sorted by (category, variant) so the main thread spawns
 /// all instances of one variant contiguously. Bevy auto-batches instances that
@@ -94,14 +97,27 @@ pub(super) fn scatter_tile(
                 }
                 continue;
             }
-            if !cheap_lod && !sizes.grass.is_empty() && rng.random::<f32>() < GRASS_DENSITY {
-                let variant = rng.random_range(0..sizes.grass.len());
-                items.push(ScatterItem {
-                    category: ScatterCategory::Grass,
-                    variant,
-                    pos,
-                    yaw,
-                });
+            // Grass draws are consumed UNCONDITIONALLY (independent of
+            // `cheap_lod`) so the RNG stream advances identically for a grassy
+            // and a cheap-LOD scatter of the same tile. Only the *push* is
+            // suppressed for cheap LOD. If `cheap_lod` instead skipped the draw,
+            // it would shift every downstream column's tree/rock/yaw stream, and
+            // re-streaming a tile across the grass radius (see
+            // `stream::restream_changed_tiles`) would visibly RELOCATE solid
+            // props — breaking the determinism that path's doc relies on.
+            if !sizes.grass.is_empty() {
+                let roll = rng.random::<f32>();
+                if roll < GRASS_DENSITY {
+                    let variant = rng.random_range(0..sizes.grass.len());
+                    if !cheap_lod {
+                        items.push(ScatterItem {
+                            category: ScatterCategory::Grass,
+                            variant,
+                            pos,
+                            yaw,
+                        });
+                    }
+                }
             }
         }
     }
@@ -144,6 +160,68 @@ fn snap_yaw(rng: &mut StdRng) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a `VariantSizes` with a few small footprints per category so the
+    /// scatter has every category enabled (the determinism guarantee only holds
+    /// when grass draws actually happen).
+    fn test_sizes() -> VariantSizes {
+        let s = Vec3::new(0.5, 1.0, 0.5);
+        VariantSizes {
+            trees: vec![s, s],
+            rocks: vec![s, s],
+            grass: vec![s, s, s],
+        }
+    }
+
+    /// Extract just the solid (tree/rock) placements, the props whose positions
+    /// must NOT move between a grassy and a cheap-LOD scatter of the same tile.
+    fn solids(items: &[ScatterItem]) -> Vec<(u8, usize, [i32; 3], i32)> {
+        items
+            .iter()
+            .filter(|it| matches!(it.category, ScatterCategory::Tree | ScatterCategory::Rock))
+            .map(|it| {
+                (
+                    category_rank(it.category),
+                    it.variant,
+                    [
+                        it.pos.x.to_bits() as i32,
+                        it.pos.y.to_bits() as i32,
+                        it.pos.z.to_bits() as i32,
+                    ],
+                    it.yaw.to_bits() as i32,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cheap_lod_does_not_move_solid_props() {
+        // The core determinism guarantee `stream::restream_changed_tiles` relies
+        // on: toggling grass (cheap_lod) for a tile must leave every tree/rock in
+        // exactly the same place — only the grass layer may appear/disappear.
+        let terrain = Terrain::new();
+        let sizes = test_sizes();
+        // Sweep a spread of tiles so we exercise many distinct RNG streams.
+        for tx in -3..=3 {
+            for tz in -3..=3 {
+                let tile = IVec2::new(tx, tz);
+                let grassy = scatter_tile(&terrain, tile, &sizes, false);
+                let cheap = scatter_tile(&terrain, tile, &sizes, true);
+                assert_eq!(
+                    solids(&grassy),
+                    solids(&cheap),
+                    "solid props moved between grassy and cheap-LOD scatter of {tile:?}"
+                );
+                // Sanity: cheap-LOD must emit no grass; grassy may emit some.
+                assert!(
+                    cheap
+                        .iter()
+                        .all(|it| !matches!(it.category, ScatterCategory::Grass)),
+                    "cheap-LOD scatter of {tile:?} emitted grass"
+                );
+            }
+        }
+    }
 
     #[test]
     fn snap_yaw_returns_cardinal_only() {

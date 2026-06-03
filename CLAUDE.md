@@ -1,6 +1,9 @@
 # inf3d — Project Guide for the Next Claude Agent
 
-Handover doc. Read it before touching code.
+Handover doc. Read it before touching code. For the *detailed* rework spec
+(scheduling spine, single-owner resources, single-source-of-truth invariants,
+the task/file-ownership table), read **`REWORK.md`** — this file is the high-level
+map, `REWORK.md` is the contract.
 
 ---
 
@@ -10,11 +13,14 @@ A **3D voxel open-world game** in Rust + **Bevy 0.18**. Procedural infinite voxe
 terrain (via `bevy_voxel_world`) with a **custom terrain material** that writes
 the depth/normal/motion prepass, an **orthographic isometric** follow camera
 (Diablo-style 3/4 view), click-to-move **A\*** pathfinding over the voxel surface,
-**avian3d** physics (kinematic character controller + prop colliders), a
-procedural multi-part **player character**, animated **water** (`bevy_water`),
-**`.vox` foliage** (trees / rocks / grass from MagicaVoxel models, streamed in a
-tile ring), **dust** particles, post-FX (Bloom + Depth of Field + **SSAO** +
-**motion blur**), and a debug **HUD** with runtime quality presets (F2).
+**avian3d** physics at a **fixed timestep** with a kinematic character controller
+(ground derived **analytically** from terrain) + prop colliders, a procedural
+multi-part **player character**, animated **water** (`bevy_water`), **`.vox`
+foliage** (trees / rocks / grass from MagicaVoxel models, streamed in a tile ring
+with a player-centered grass radius cap), **dust** particles, post-FX (Bloom +
+Depth of Field + **SSAO** + **motion blur**), a debug **HUD** with runtime quality
+presets (F2), and a read-only **telemetry recorder** (`inf3d_monitor`) that writes
+`inf3d-monitor.log` each run.
 
 It grew out of a single-crate prototype (`inf3d_proto`, now removed) and was
 migrated into the proper multi-crate workspace below. The old 2.5D `inf2d_*`
@@ -49,40 +55,53 @@ debug binary stays under Windows's 2 GB PE limit. **Don't remove those.**
 | F2 | Cycle quality preset (Potato → Low → Medium → High) |
 
 `INF3D_UNCAP_FPS=1` switches the window from `AutoVsync` to `Immediate` for
-benchmarking.
+benchmarking. `INF3D_NO_MONITOR=1` disables the telemetry recorder
+(`inf3d-monitor.log`).
 
 ---
 
-## 3. Crate layout (10 crates, acyclic)
+## 3. Crate layout (11 crates, acyclic)
 
 ```
 inf3d_app          binary `inf3d`; plugin composition only
-inf3d_core         shared data: FollowTarget, BlockedCells, PathTarget, Tree/Rock
-                   markers, QualitySettings + presets, GrassStats/FrameStats
+inf3d_core         shared data + the GameSet ordering backbone; CorePlugin is the
+                   SOLE owner/initializer of the shared resources (QualitySettings
+                   + presets, BlockedCells, PathTarget, GrassStats, FrameStats).
+                   Also: FollowTarget, Tree/Rock markers, QualityPreset.
 inf3d_worldgen     terrain noise + Terrain oracle (surface_y/stand_pos/is_land/
-                   nearest_land), build_noise_lod, WATER_HEIGHT
+                   nearest_land), build_noise_lod, WATER_HEIGHT, and the single
+                   ColumnKind / column_kind() land-water helper (shared with world)
 inf3d_world        MainWorld voxel config + LOD, WorldPlugin, lighting,
-                   get_voxel_fn, custom TerrainMaterial (writes the prepass)
+                   get_voxel_fn, the single TerrainMaterialId palette enum, and a
+                   custom TerrainMaterial (writes the prepass)
 inf3d_camera       IsoCameraPlugin (ortho follow, zoom, orbit) + post-FX
                    (Bloom/DoF/SSAO/motion blur) wiring
-inf3d_physics      avian3d: GameLayer, solid voxel-ground collider, kinematic
-                   CharacterController, SolidPropCollider, InteractionTarget
+inf3d_physics      avian3d: GameLayer, single PlayerDims source of truth, kinematic
+                   CharacterController (analytic terrain ground), DesiredMove,
+                   SolidPropCollider, InteractionTarget
 inf3d_render       water, fog (clear color), dust, hover/destination highlight,
                    foliage/ module (.vox load + scatter + stream + spawn)
 inf3d_gameplay     PlayerPlugin (spawn, path-follow → DesiredMove, animation)
 inf3d_pathfinding  PathfindPlugin (click → voxel raycast → async A* over surface)
 inf3d_ui           HudPlugin (FPS/frame-ms/entities/chunks/pos/tile/quality)
+inf3d_monitor      MonitorPlugin — read-only "flight recorder". Queries ECS state
+                   + frame-over-frame count deltas and writes inf3d-monitor.log
+                   each run (overwritten per run): periodic SUMMARY lines, a SPIKE
+                   line tagged with the likely cause on every frame hitch, and
+                   EVENT lines on move start/stop + preset change. Pure downstream
+                   sink — instruments nothing, adds no coupling (like the HUD).
 ```
 
 ### Dependency direction (one-way; verified acyclic)
 - `core` ← everyone.
-- `worldgen` ← world, physics, render, gameplay, pathfinding, ui.
-- `world` ← camera, physics, render, pathfinding, ui.
-- `camera` ← physics, render, pathfinding.
-- `physics` ← render, gameplay.
+- `worldgen` ← world, physics, render, gameplay, pathfinding, ui, monitor.
+- `world` ← camera, physics, render, pathfinding, ui, monitor.
+- `camera` ← physics, render, pathfinding, monitor.
+- `physics` ← render, gameplay, monitor.
 - `render` ← gameplay, ui.
-- `gameplay` ← pathfinding, ui.
-- `app` ← all.
+- `gameplay` ← pathfinding, ui, monitor.
+- `app` ← all. `monitor` is a downstream-only sink (depends on many crates, is
+  depended on by none but `app`).
 
 ### The cycle-break (IMPORTANT)
 Camera, foliage, and physics-ground all need to **follow the player**, but
@@ -100,28 +119,73 @@ downstream crates query *those*:
 **Don't reintroduce a `Player`/gameplay dependency in camera/physics/render —
 use the shared markers above.**
 
+### The scheduling backbone (`inf3d_core::GameSet`)
+Every `Update` system across the workspace is tagged `.in_set(GameSet::X)`, and
+`CorePlugin` chains the four phases **once** so the order is fixed regardless of
+plugin registration order:
+
+```
+Input -> Logic -> Streaming -> Fx
+```
+
+- `Input`: raw-input reads (camera input, F2 preset cycle, click handling).
+- `Logic`: pathfinding dispatch/poll/consume, follow_path, player animation,
+  interaction-target pick.
+- `Streaming`: foliage streaming, prop-collider builds.
+- `Fx`: dust, highlights, quality application, water quality, diagnostics, HUD.
+
+Fixed-step and `PostUpdate` systems keep their **avian-relative** ordering (the
+physics spine, §5.8) instead of a `GameSet`. Intra-plugin `.chain()` stays — it's
+an order *within* a set. Adding a system therefore can't perturb unrelated ones.
+
+### Single resource owner (IMPORTANT)
+`CorePlugin` is the **sole** `init_resource` for `QualitySettings`, `BlockedCells`,
+`PathTarget`, `GrassStats`, and `FrameStats`. Never `init_resource` any of these
+elsewhere. Resources owned by exactly one crate stay there (e.g. `Hover` in
+highlight, `InteractionTarget` in physics, `ActivePathTask`/`PathTiming` in
+pathfinding, `Terrain` in world, `WaterSettings` in water).
+
 ---
 
 ## 4. Key conventions
 
 - **Voxels are 1×1×1 world units**; chunks are 32³ (`bevy_voxel_world`).
+- **Single land/water source of truth.** `inf3d_worldgen::column_kind()` (and the
+  `ColumnKind { surface_y, is_water }` it returns) is the *one* helper that
+  classifies a column. Both `Terrain` (the gameplay oracle) and
+  `inf3d_world::get_voxel_fn` (the meshing delegate on worker threads) go through
+  it, so the surface a player stands/pathfinds on can never desync from the meshed
+  geometry. `Terrain`'s public methods (`surface_y`/`stand_pos`/`is_land`/
+  `nearest_land`) keep their signatures — physics + pathfinding depend on them.
 - `inf3d_worldgen::Terrain` is the deterministic height oracle (always LOD 0)
-  shared by meshing (worker threads), pathfinding, physics ground, and foliage.
-  It mirrors `get_voxel_fn`. Cheap to `clone()` — workers snapshot it.
-- `WATER_HEIGHT = 1.6`: seafloor (material 3) stands at y=1, land at y≥2. A column
-  is "water" (unwalkable) when its standing height < `WATER_HEIGHT`. Players spawn
-  on `nearest_land`.
+  shared by meshing, pathfinding, physics ground, and foliage. Cheap to `clone()`
+  — workers snapshot it.
+- **Single material palette.** `inf3d_world::TerrainMaterialId` (`Grass=0`,
+  `Dirt=1`, `Stone=2`, `Seafloor=3`) is the one enum used by `get_voxel_fn`,
+  `texture_index_mapper`, the procedural texture-array layer order, and the HUD's
+  tile label (`TerrainMaterialId::label`). All four materials are wired in (land
+  top = grass, sides = dirt, bottom = stone; submerged columns = seafloor) — no
+  dead/unused texture layers.
+- `WATER_HEIGHT = 1.6`: seafloor stands at y=1, land at y≥2. A column is "water"
+  (unwalkable) when its standing height ≤ `WATER_HEIGHT`. Players spawn on
+  `nearest_land`.
 - **Render distance is per-preset** (`QualitySettings::render_distance_chunks`,
   5/8/12/16 for Potato/Low/Medium/High) and read **once** at `WorldPlugin::build`
-  — `bevy_voxel_world` can't re-register, so changing it needs a restart. Terrain
-  **LOD** (octave reduction + coarser meshing past `terrain_lod_distance`) keeps
-  far chunks cheap, so the distance can be modest. This is still the dominant perf
-  cost; lower the preset if it hitches.
+  — `bevy_voxel_world` can't re-register, so changing it needs a restart. It is
+  modest **on purpose**: the orthographic iso view is shallow (at max zoom-out it
+  spans only ~3 chunks), so a large radius is wasted. Terrain **LOD** (octave
+  reduction + coarser meshing past `terrain_lod_distance`) keeps the far ring
+  cheap. This is still the dominant perf cost; lower the preset if it hitches.
+- **Player body dims live in one place:** `inf3d_physics::PLAYER_DIMS`
+  (`radius`/`half_height`/`visual_root_offset`). Gameplay derives its character
+  visual-root offset from it — no hand-kept `1.0` literal.
 - Camera/foliage follow `FollowTarget`, physics follows `CharacterController`
   (see §3).
 - `QualitySettings` (in `core`, installed first by `CorePlugin`) is the single
-  knob bundle; most fields apply live via `is_changed()`. SSAO + motion blur are
-  currently gated on `bloom_enabled` (no dedicated field — see §6).
+  knob bundle; most fields apply live via `is_changed()`. SSAO and motion blur now
+  have **real dedicated fields** (`ssao_enabled` / `motion_blur_enabled`, gated on
+  Medium+), and dense grass is bounded to `grass_radius_world` around the player
+  (see §6).
 
 ---
 
@@ -153,31 +217,51 @@ use the shared markers above.**
    `image_utils`. It loads WGSL from `crates/inf3d_app/assets/shaders/` — without
    those files water is invisible. The depth-based deep/shallow blend now works
    because the terrain writes depth (gotcha #5).
-8. **avian3d 0.6.1** targets bevy ^0.18. Global gravity is set to zero in `main`;
-   the kinematic controller applies its own. Features pinned in the workspace dep
-   (`3d`, `f32`, `parry-f32`, `collider-from-mesh`, `parallel`, `bevy_scene`).
-9. **GNU toolchain pinned** (`rust-toolchain.toml`); **2 GB PE limit** profile
-   settings; both must stay.
+8. **avian3d 0.6.1 at a FIXED timestep.** `main` adds `PhysicsPlugins::default()`
+   (default fixed schedule, `FixedPostUpdate`) — **not** `PhysicsPlugins::new(
+   PostUpdate)`. The kinematic `player_controller` runs in `FixedPostUpdate`
+   `.after(PhysicsSystems::Writeback)` using the *fixed* delta, and the player
+   carries avian's **`TransformInterpolation`** so the rendered transform is eased
+   smoothly between fixed ticks (this killed the zoom-out jitter the old
+   variable-timestep `PostUpdate` hack fought). `PhysicsInterpolationPlugin` ships
+   inside `PhysicsPlugins` — no extra plugin. Global gravity is zero
+   (`insert_resource(Gravity(Vec3::ZERO))`); the controller applies its own only
+   while airborne. **There is NO terrain collider:** the terrain is a pure
+   heightfield, so the controller reads ground **analytically** from
+   `Terrain::surface_y` (top face = `surface_y + 1`) for the column under the
+   player. The old solid voxel-ground collider (`VoxelGround` + spawn/recenter
+   systems) was **deleted** — don't reintroduce it. `move_and_slide` still resolves
+   horizontal blocking against **Solid props** only.
+9. **Chunk streaming is distance-only (no frustum culling).** `bevy_voxel_world`
+   spawns a **3D sphere of chunk entities** within `spawning_distance`
+   (`FarAway` despawn + `Close` flood-fill spawn, so the iso view never reveals an
+   unspawned hole at the screen edge). Two consequences: (a) we cap
+   `max_spawn_per_frame` (currently 320) so the initial-fill / fast-travel backlog
+   spreads over frames instead of dumping a 1000+-chunk spawn burst in one hitch;
+   (b) **known limitation** — bevy_voxel_world 0.16 has no *vertical* clamp, so the
+   sphere also spawns empty chunks above/below the thin playable band. The
+   `inf3d-monitor.log` SPIKE lines tag chunk-burst hitches so you can see this.
+10. **GNU toolchain pinned** (`rust-toolchain.toml`); **2 GB PE limit** profile
+    settings; both must stay.
 
 ---
 
 ## 6. What's NOT done / next steps
 
 - **Foliage is `.vox` models** (MagicaVoxel via `dot_vox`), streamed in a tile
-  ring with async scatter, per-prop colliders, and a far-distance LOD that drops
-  grass. It lives in the `inf3d_render::foliage` module (`mod.rs`/`vox_mesh.rs`/
+  ring with async scatter and per-prop colliders. **Dense grass is capped to
+  `QualitySettings::grass_radius_world`** around the player so zooming out doesn't
+  blow up the grass carpet — sparse trees/rocks still fill the iso view to the
+  edges via the ring; only the expensive grass is bounded to the player-centered
+  circle. It lives in the `inf3d_render::foliage` module (`mod.rs`/`vox_mesh.rs`/
   `scatter.rs`/`stream.rs`/`spawn.rs`). A vertex-shader **wind** + **player-shove**
   is still unbuilt.
-- **Redundant voxel-ground collider.** `inf3d_physics` builds a ~49×49×3 solid
-  `Collider::voxels` patch (rebuilt on recenter) whose *only* consumer is the
-  controller's downward ground ray. The terrain is a pure heightfield, so that ray
-  could be answered analytically from the `Terrain` oracle — letting you delete
-  `VoxelGround` + `spawn_voxel_ground` + `recenter_voxel_ground` entirely.
-- **SSAO + motion blur share `bloom_enabled` as their quality gate** (no dedicated
-  `QualitySettings` fields yet). `MotionBlur.samples == 1` is nearly invisible;
-  bump it if you want a real smear.
+- **`max_spawn_per_frame` is a blunt cap, not a vertical clamp.** bevy_voxel_world
+  0.16 still spawns the full chunk sphere (§5.9); a real fix would clamp the spawn
+  set to the thin playable Y band, which needs upstream support or a fork.
 - **Optimization pass** (draw-call batching, further LOD tuning) is deferred. The
-  HUD shows entity/chunk counts + frame-ms p95 to guide it.
+  HUD shows entity/chunk counts + frame-ms p95; `inf3d-monitor.log` correlates each
+  hitch with its cause to guide it.
 - No audio, save/load, combat, mobs, inventory, or items yet. `Tree`/`Rock`
   markers + `InteractionTarget` exist as hooks for harvesting.
 
@@ -196,3 +280,12 @@ use the shared markers above.**
   stores its logical `cell`.
 - Don't move the player by mutating its `Transform` from gameplay — write
   `DesiredMove` and let `inf3d_physics::player_controller` resolve it.
+- Don't reintroduce a terrain collider (`VoxelGround` and friends were deleted) —
+  the controller reads ground analytically from `Terrain::surface_y`.
+- Don't run physics in `PostUpdate` or at a variable timestep — keep avian's
+  default fixed schedule + the player's `TransformInterpolation` (it's what makes
+  walking smooth at every zoom).
+- Don't `init_resource` any of the shared resources (`QualitySettings`,
+  `BlockedCells`, `PathTarget`, `GrassStats`, `FrameStats`) outside `CorePlugin`,
+  and don't add an `Update` system without an `.in_set(GameSet::…)` tag.
+- Don't make any crate depend on `inf3d_monitor` — it's a downstream-only sink.

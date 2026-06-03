@@ -106,7 +106,7 @@ fn ssao_component() -> ScreenSpaceAmbientOcclusion {
 /// of AAA smear, not a heavy blur. Lower `shutter_angle` further to soften more.
 fn motion_blur_component() -> MotionBlur {
     MotionBlur {
-        shutter_angle: 0.15,
+        shutter_angle: 0.05,
         samples: 1,
     }
 }

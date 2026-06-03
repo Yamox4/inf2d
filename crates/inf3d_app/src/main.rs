@@ -7,6 +7,7 @@ use bevy::window::{PresentMode, Window, WindowPlugin};
 use inf3d_camera::IsoCameraPlugin;
 use inf3d_core::CorePlugin;
 use inf3d_gameplay::PlayerPlugin;
+use inf3d_monitor::MonitorPlugin;
 use inf3d_pathfinding::PathfindPlugin;
 use inf3d_physics::PhysicsGamePlugin;
 use inf3d_render::{DustPlugin, FogPlugin, FoliagePlugin, HighlightPlugin, WaterPlugin};
@@ -59,5 +60,9 @@ fn main() {
         .add_plugins(HudPlugin)
         .add_plugins(WaterPlugin)
         .add_plugins(FoliagePlugin)
+        // Read-only telemetry recorder — writes `inf3d-monitor.log` each run.
+        // Added last so it observes every other plugin's state. Disable with
+        // `INF3D_NO_MONITOR=1`.
+        .add_plugins(MonitorPlugin)
         .run();
 }

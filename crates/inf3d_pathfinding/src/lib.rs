@@ -101,7 +101,7 @@ fn handle_click(
     window: Query<&Window, With<PrimaryWindow>>,
     cam: Query<(&Camera, &GlobalTransform), With<IsoCamera>>,
     voxel_world: VoxelWorld<MainWorld>,
-    query: Query<&Player>,
+    query: Query<&Transform, With<Player>>,
     mut requests: MessageWriter<PathRequest>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) {
@@ -126,14 +126,12 @@ fn handle_click(
     };
     let goal = IVec2::new(hit.position.x.floor() as i32, hit.position.z.floor() as i32);
 
-    let Ok(player) = query.single() else {
+    let Ok(t) = query.single() else {
         return;
     };
+    let start = IVec2::new(t.translation.x.floor() as i32, t.translation.z.floor() as i32);
 
-    requests.write(PathRequest {
-        start: player.cell,
-        goal,
-    });
+    requests.write(PathRequest { start, goal });
 }
 
 /// Spawn an A* worker for the most recent [`PathRequest`] this frame, cancelling

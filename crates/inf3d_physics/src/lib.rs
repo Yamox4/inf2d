@@ -4,9 +4,8 @@
 //! This crate owns:
 //!
 //! * The [`GameLayer`] collision layers that separate **solid** props (which
-//!   block the player) from **grass** (which the player walks through — grass
-//!   simply gets *no collider*; the [`GameLayer::Grass`] membership only
-//!   documents that intent).
+//!   block the player) from grass (which the player walks through — grass
+//!   simply gets *no collider* and no layer at all).
 //! * The single [`PlayerDims`] source of truth for the player's capsule radius,
 //!   half-height, and the visual-root offset (gameplay derives its character
 //!   root offset from this — no hand-kept literal).
@@ -51,9 +50,6 @@ pub enum GameLayer {
     Solid,
     /// The player's character-controller capsule.
     Player,
-    /// Grass tufts. **No collider is ever attached to grass** — this layer only
-    /// documents the "grass is non-colliding" decision.
-    Grass,
 }
 
 /// Marker the foliage crate attaches to a solid prop entity to request a static

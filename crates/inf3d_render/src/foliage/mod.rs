@@ -133,6 +133,13 @@ struct VariantSizes {
 /// entities.
 struct TileScatterTask {
     task: Task<Vec<ScatterItem>>,
+    /// The scatter-time grass eligibility this task was started with: `true` when
+    /// the tile was NOT cheap-LOD (inside both `foliage_lod_distance` and
+    /// `grass_radius_world`), so the worker scattered grass. Carried through to
+    /// [`TileState::Live`] so the streamer can later detect when a Live tile's
+    /// CURRENT eligibility has changed and needs re-streaming (the grass-cap
+    /// coverage fix).
+    with_grass: bool,
 }
 
 /// State a tile occupies in the streaming field. Tiles flow
@@ -142,9 +149,21 @@ struct TileScatterTask {
 /// tile despawns we can remove exactly those cells from
 /// [`BlockedCells`](inf3d_core::BlockedCells) (the shared resource the
 /// pathfinder reads). Grass cells are never recorded.
+///
+/// `Live` additionally records the grass eligibility it was streamed with
+/// (`with_grass`). Grass eligibility is decided at scatter time, but a tile that
+/// streamed grass-free at the (zoom-driven) ring edge must GAIN grass as the
+/// player walks toward it — and a tile that streamed with grass must shed it when
+/// the player walks away. The streamer compares this stored flag against the
+/// tile's CURRENT eligibility each frame and re-streams the few tiles that crossed
+/// the boundary (see [`stream`]).
 enum TileState {
     Pending(TileScatterTask),
-    Live(Entity, Vec<IVec2>),
+    Live {
+        entity: Entity,
+        cells: Vec<IVec2>,
+        with_grass: bool,
+    },
 }
 
 #[derive(Resource, Default)]

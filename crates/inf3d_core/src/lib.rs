@@ -143,11 +143,20 @@ pub struct QualitySettings {
 impl QualitySettings {
     /// Canonical mapping from preset → concrete settings. Keep this in sync
     /// with the unit test's round-trip assertion.
+    ///
+    /// STUTTER FIX — render distances lowered (Potato 5→4, Low 8→6, Medium
+    /// 12→8, High 16→10): `bevy_voxel_world` spawns a full 3D SPHERE of chunk
+    /// entities around the camera, but the orthographic iso camera can only see
+    /// ~3 chunks even at max zoom-out. At the old 12–16 chunk radius this
+    /// resided ~7000 mostly-empty (87% air) chunk entities for no visible
+    /// benefit, and the per-frame fill bursts were the diagnosed hitch source.
+    /// Even 8 chunks = 256 world units still vastly exceeds the visible area.
+    /// Values stay monotonic non-decreasing with tier (unit test still holds).
     pub fn from_preset(p: QualityPreset) -> Self {
         match p {
             QualityPreset::Potato => Self {
                 preset: p,
-                render_distance_chunks: 5,
+                render_distance_chunks: 4,
                 grass_enabled: false,
                 grass_radius_tiles: 0,
                 grass_density: 0.0,
@@ -166,7 +175,7 @@ impl QualitySettings {
             },
             QualityPreset::Low => Self {
                 preset: p,
-                render_distance_chunks: 8,
+                render_distance_chunks: 6,
                 grass_enabled: true,
                 grass_radius_tiles: 2,
                 grass_density: 0.22,
@@ -185,7 +194,7 @@ impl QualitySettings {
             },
             QualityPreset::Medium => Self {
                 preset: p,
-                render_distance_chunks: 12,
+                render_distance_chunks: 8,
                 grass_enabled: true,
                 grass_radius_tiles: 3,
                 grass_density: 0.35,
@@ -204,7 +213,7 @@ impl QualitySettings {
             },
             QualityPreset::High => Self {
                 preset: p,
-                render_distance_chunks: 16,
+                render_distance_chunks: 10,
                 grass_enabled: true,
                 grass_radius_tiles: 4,
                 grass_density: 0.5,
