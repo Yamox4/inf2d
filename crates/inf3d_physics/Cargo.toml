@@ -1,24 +1,16 @@
 [package]
-name = "inf3d_app"
+name = "inf3d_physics"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "inf3d"
-path = "src/main.rs"
-
 [dependencies]
 bevy = { workspace = true }
 avian3d = { workspace = true }
+bevy_voxel_world = { workspace = true }
 inf3d_core = { workspace = true }
-inf3d_physics = { workspace = true }
-inf3d_worldgen = { workspace = true }
 inf3d_world = { workspace = true }
+inf3d_worldgen = { workspace = true }
 inf3d_camera = { workspace = true }
-inf3d_render = { workspace = true }
-inf3d_gameplay = { workspace = true }
-inf3d_pathfinding = { workspace = true }
-inf3d_ui = { workspace = true }

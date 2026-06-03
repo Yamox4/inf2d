@@ -25,6 +25,20 @@ const FRAME_P95_INDEX: usize = 114;
 
 pub struct HudPlugin;
 
+/// Per-frame HUD bookkeeping that we'd otherwise recompute redundantly:
+/// the live chunk/mesh entity counts (measured once in `measure_diagnostics`
+/// and read by `update_hud` instead of re-scanning every entity), plus a
+/// reused scratch buffer for the p95 percentile selection so we don't
+/// allocate a fresh `Vec` every frame.
+#[derive(Resource, Default)]
+struct HudStats {
+    chunk_count: usize,
+    mesh_count: usize,
+    /// Reused scratch for the p95 partial-selection; never reallocated once
+    /// it has grown to `FRAME_WINDOW`.
+    p95_scratch: Vec<f32>,
+}
+
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
@@ -36,6 +50,7 @@ impl Plugin for HudPlugin {
         ))
         .register_diagnostic(Diagnostic::new(DIAG_CHUNKS))
         .register_diagnostic(Diagnostic::new(DIAG_MESHES))
+        .init_resource::<HudStats>()
         .add_systems(Startup, spawn_hud)
         .add_systems(
             Update,
@@ -84,9 +99,16 @@ fn measure_diagnostics(
     mut diagnostics: Diagnostics,
     chunks: Query<(), With<Chunk<MainWorld>>>,
     meshes: Query<(), With<Mesh3d>>,
+    mut stats: ResMut<HudStats>,
 ) {
-    diagnostics.add_measurement(&DIAG_CHUNKS, || chunks.iter().count() as f64);
-    diagnostics.add_measurement(&DIAG_MESHES, || meshes.iter().count() as f64);
+    // Scan each entity set exactly once per frame and cache the counts so
+    // `update_hud` can read them instead of re-iterating every `Mesh3d`.
+    let chunk_count = chunks.iter().count();
+    let mesh_count = meshes.iter().count();
+    stats.chunk_count = chunk_count;
+    stats.mesh_count = mesh_count;
+    diagnostics.add_measurement(&DIAG_CHUNKS, || chunk_count as f64);
+    diagnostics.add_measurement(&DIAG_MESHES, || mesh_count as f64);
 }
 
 /// Pulls per-frame frame-time samples from Bevy's diagnostics, maintains a
@@ -97,6 +119,7 @@ fn update_frame_stats(
     diagnostics: Res<DiagnosticsStore>,
     mut window: Local<VecDeque<f32>>,
     mut stats: ResMut<FrameStats>,
+    mut hud: ResMut<HudStats>,
 ) {
     let Some(diag) = diagnostics.get(&FrameTimeDiagnosticsPlugin::FRAME_TIME) else {
         return;
@@ -112,9 +135,16 @@ fn update_frame_stats(
     window.push_back(sample);
 
     let p95 = if window.len() == FRAME_WINDOW {
-        let mut sorted: Vec<f32> = window.iter().copied().collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        sorted[FRAME_P95_INDEX]
+        // Reuse a scratch buffer and do a partial selection (no full sort): we
+        // only need the element that would land at FRAME_P95_INDEX once sorted.
+        // `select_nth_unstable_by` is O(n) and places that element correctly.
+        let scratch = &mut hud.p95_scratch;
+        scratch.clear();
+        scratch.extend(window.iter().copied());
+        let (_, nth, _) = scratch.select_nth_unstable_by(FRAME_P95_INDEX, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        *nth
     } else {
         window
             .iter()
@@ -143,11 +173,11 @@ fn cycle_preset_keybinding(
 fn update_hud(
     diagnostics: Res<DiagnosticsStore>,
     player_q: Query<(&Transform, &inf3d_gameplay::Player)>,
-    chunks: Query<(), With<Chunk<MainWorld>>>,
     hover: Res<inf3d_render::Hover>,
     terrain: Res<inf3d_worldgen::Terrain>,
     settings: Res<QualitySettings>,
     frame: Res<FrameStats>,
+    hud: Res<HudStats>,
     mut text_q: Query<&mut Text, With<HudText>>,
 ) {
     let Ok(mut text) = text_q.single_mut() else {
@@ -166,7 +196,9 @@ fn update_hud(
         .get(&EntityCountDiagnosticsPlugin::ENTITY_COUNT)
         .and_then(|d| d.value())
         .unwrap_or(0.0);
-    let chunk_count = chunks.iter().count();
+    // Read the count measured this frame in `measure_diagnostics` instead of
+    // re-scanning every chunk entity here.
+    let chunk_count = hud.chunk_count;
 
     let (pos, cell) = match player_q.single() {
         Ok((transform, player)) => (transform.translation, player.cell),

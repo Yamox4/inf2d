@@ -6,7 +6,26 @@
 //! quality / stats resources; register it **first** in the app so subsequent
 //! plugins observe non-default `QualitySettings` at their own `build` time.
 
+use bevy::platform::collections::HashSet;
 use bevy::prelude::*;
+
+/// Voxel columns `(x, z)` occupied by SOLID props (trees & rocks — never
+/// grass). Populated by the foliage scatter system in `inf3d_render` as props
+/// spawn, and consumed by the A* pathfinder in `inf3d_pathfinding` so routes
+/// detour around props instead of walking into their physics colliders.
+///
+/// Lives in `inf3d_core` because pathfinding is *upstream* of render and so
+/// cannot depend on it — the data crosses the dependency direction through this
+/// shared resource (the same pattern as [`FollowTarget`]).
+#[derive(Resource, Default)]
+pub struct BlockedCells(pub HashSet<IVec2>);
+
+/// The current click-to-move destination cell `(x, z)`, or `None` when the
+/// player is idle / has arrived. Set by `inf3d_pathfinding` when a click
+/// produces a path, cleared by `inf3d_gameplay` when the player reaches it, and
+/// read by `inf3d_render` to draw a persistent destination highlight.
+#[derive(Resource, Default)]
+pub struct PathTarget(pub Option<IVec2>);
 
 /// Marks the entity that camera, fog, and grass should follow/center on (the
 /// player). Lives in `inf3d_core` so render/camera can depend on it without
@@ -34,19 +53,17 @@ pub enum QualityPreset {
     Low,
     Medium,
     High,
-    Ultra,
 }
 
 impl QualityPreset {
     /// Cycles forward through the presets: Potato → Low → Medium → High →
-    /// Ultra → Potato. Used by the F2 keybinding in the HUD plugin.
+    /// Potato. Used by the F2 keybinding in the HUD plugin.
     pub fn cycle(self) -> Self {
         match self {
             QualityPreset::Potato => QualityPreset::Low,
             QualityPreset::Low => QualityPreset::Medium,
             QualityPreset::Medium => QualityPreset::High,
-            QualityPreset::High => QualityPreset::Ultra,
-            QualityPreset::Ultra => QualityPreset::Potato,
+            QualityPreset::High => QualityPreset::Potato,
         }
     }
 
@@ -57,7 +74,6 @@ impl QualityPreset {
             QualityPreset::Low => "Low",
             QualityPreset::Medium => "Medium",
             QualityPreset::High => "High",
-            QualityPreset::Ultra => "Ultra",
         }
     }
 }
@@ -89,8 +105,11 @@ pub struct QualitySettings {
     /// detail (meshlet pipelines pick coarser clusters; non-meshlet meshes
     /// can swap to a cheaper representation if available).
     pub foliage_lod_distance: f32,
-    /// World-space distance past which voxel terrain chunks use a coarser
-    /// LOD. Consumed by `inf3d_world` (other agent owns the consumer).
+    /// World-space distance (in voxels/world units) that sets the width of
+    /// each terrain LOD band. Chunk LOD level `n` begins at
+    /// `n * terrain_lod_distance` from the camera. Consumed by `inf3d_world`'s
+    /// `MainWorld::chunk_lod`, which feeds `chunk_data_shape`/`chunk_meshing_shape`
+    /// (coarser voxels) and the octave count in the voxel lookup delegate.
     pub terrain_lod_distance: f32,
 }
 
@@ -101,7 +120,7 @@ impl QualitySettings {
         match p {
             QualityPreset::Potato => Self {
                 preset: p,
-                render_distance_chunks: 6,
+                render_distance_chunks: 5,
                 grass_enabled: false,
                 grass_radius_tiles: 0,
                 grass_density: 0.0,
@@ -114,12 +133,12 @@ impl QualitySettings {
                 water_enabled: false,
                 water_amplitude: 0.0,
                 foliage_ring_max: 2,
-                foliage_lod_distance: 12.0,
-                terrain_lod_distance: 20.0,
+                foliage_lod_distance: 40.0,
+                terrain_lod_distance: 150.0,
             },
             QualityPreset::Low => Self {
                 preset: p,
-                render_distance_chunks: 10,
+                render_distance_chunks: 8,
                 grass_enabled: true,
                 grass_radius_tiles: 2,
                 grass_density: 0.22,
@@ -130,14 +149,14 @@ impl QualitySettings {
                 dof_enabled: false,
                 bloom_enabled: false,
                 water_enabled: true,
-                water_amplitude: 0.06,
+                water_amplitude: 0.20,
                 foliage_ring_max: 3,
-                foliage_lod_distance: 20.0,
-                terrain_lod_distance: 40.0,
+                foliage_lod_distance: 70.0,
+                terrain_lod_distance: 220.0,
             },
             QualityPreset::Medium => Self {
                 preset: p,
-                render_distance_chunks: 14,
+                render_distance_chunks: 12,
                 grass_enabled: true,
                 grass_radius_tiles: 3,
                 grass_density: 0.35,
@@ -148,14 +167,14 @@ impl QualitySettings {
                 dof_enabled: false,
                 bloom_enabled: true,
                 water_enabled: true,
-                water_amplitude: 0.10,
+                water_amplitude: 0.35,
                 foliage_ring_max: 4,
-                foliage_lod_distance: 35.0,
-                terrain_lod_distance: 70.0,
+                foliage_lod_distance: 100.0,
+                terrain_lod_distance: 300.0,
             },
             QualityPreset::High => Self {
                 preset: p,
-                render_distance_chunks: 20,
+                render_distance_chunks: 16,
                 grass_enabled: true,
                 grass_radius_tiles: 4,
                 grass_density: 0.5,
@@ -166,28 +185,10 @@ impl QualitySettings {
                 dof_enabled: true,
                 bloom_enabled: true,
                 water_enabled: true,
-                water_amplitude: 0.12,
+                water_amplitude: 0.45,
                 foliage_ring_max: 6,
-                foliage_lod_distance: 60.0,
-                terrain_lod_distance: 120.0,
-            },
-            QualityPreset::Ultra => Self {
-                preset: p,
-                render_distance_chunks: 28,
-                grass_enabled: true,
-                grass_radius_tiles: 5,
-                grass_density: 0.65,
-                grass_lod_enabled: false,
-                foliage_enabled: true,
-                fog_enabled: true,
-                fog_step_count: 32,
-                dof_enabled: true,
-                bloom_enabled: true,
-                water_enabled: true,
-                water_amplitude: 0.15,
-                foliage_ring_max: 8,
-                foliage_lod_distance: 100.0,
-                terrain_lod_distance: 240.0,
+                foliage_lod_distance: 160.0,
+                terrain_lod_distance: 450.0,
             },
         }
     }
@@ -225,7 +226,9 @@ impl Plugin for CorePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<QualitySettings>()
             .init_resource::<GrassStats>()
-            .init_resource::<FrameStats>();
+            .init_resource::<FrameStats>()
+            .init_resource::<BlockedCells>()
+            .init_resource::<PathTarget>();
     }
 }
 
@@ -238,7 +241,7 @@ mod tests {
         let start = QualityPreset::Potato;
         let mut p = start;
         let mut seen = vec![p];
-        for _ in 0..4 {
+        for _ in 0..3 {
             p = p.cycle();
             seen.push(p);
         }
@@ -249,7 +252,6 @@ mod tests {
                 QualityPreset::Low,
                 QualityPreset::Medium,
                 QualityPreset::High,
-                QualityPreset::Ultra,
             ]
         );
         assert_eq!(p.cycle(), start);
@@ -262,7 +264,6 @@ mod tests {
             QualityPreset::Low,
             QualityPreset::Medium,
             QualityPreset::High,
-            QualityPreset::Ultra,
         ] {
             let s = QualitySettings::from_preset(p);
             assert_eq!(s.preset, p, "preset field must echo input");
@@ -281,7 +282,6 @@ mod tests {
             QualityPreset::Low,
             QualityPreset::Medium,
             QualityPreset::High,
-            QualityPreset::Ultra,
         ];
         let settings: Vec<QualitySettings> = order
             .iter()

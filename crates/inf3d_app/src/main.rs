@@ -1,5 +1,6 @@
 //! inf3d — 3D voxel game. Plugin composition / binary entry point.
 
+use avian3d::prelude::*;
 use bevy::prelude::*;
 use bevy::window::{PresentMode, Window, WindowPlugin};
 
@@ -7,17 +8,25 @@ use inf3d_camera::IsoCameraPlugin;
 use inf3d_core::CorePlugin;
 use inf3d_gameplay::PlayerPlugin;
 use inf3d_pathfinding::PathfindPlugin;
+use inf3d_physics::PhysicsGamePlugin;
 use inf3d_render::{DustPlugin, FogPlugin, FoliagePlugin, HighlightPlugin, WaterPlugin};
 use inf3d_ui::HudPlugin;
 use inf3d_world::WorldPlugin;
 
 fn main() {
     App::new()
-        // Vsync OFF (`PresentMode::Immediate`) — required to exceed monitor
-        // refresh. Trades a tiny chance of tearing for an uncapped FPS readout.
+        // AutoVsync for normal play: caps FPS at the monitor refresh so the
+        // engine idles between frames instead of pinning CPU+GPU at 100% (which
+        // magnifies every other cost and causes thermal throttling). Set
+        // `INF3D_UNCAP_FPS=1` to switch to `Immediate` (vsync off, uncapped) for
+        // benchmarking the FPS readout.
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                present_mode: PresentMode::Immediate,
+                present_mode: if std::env::var("INF3D_UNCAP_FPS").is_ok() {
+                    PresentMode::Immediate
+                } else {
+                    PresentMode::AutoVsync
+                },
                 ..default()
             }),
             ..default()
@@ -25,8 +34,16 @@ fn main() {
         // CorePlugin must come first: it installs QualitySettings / GrassStats /
         // FrameStats so every downstream plugin can read them at build time.
         .add_plugins(CorePlugin)
+        // avian3d ECS physics: steps the sim in its own schedule. We disable its
+        // built-in gravity (our kinematic controller applies its own) — kinematic
+        // bodies ignore global gravity anyway, but this keeps intent explicit.
+        .add_plugins(PhysicsPlugins::default())
+        .insert_resource(Gravity(Vec3::ZERO))
         .add_plugins(WorldPlugin)
         .add_plugins(PlayerPlugin)
+        // Game-specific physics wiring (colliders, character controller,
+        // interaction raycast). After PlayerPlugin so the player exists.
+        .add_plugins(PhysicsGamePlugin)
         .add_plugins(IsoCameraPlugin)
         .add_plugins(PathfindPlugin)
         .add_plugins(HighlightPlugin)

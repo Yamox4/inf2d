@@ -1,17 +1,26 @@
 //! Voxel hover highlight: a translucent cube that snaps to the voxel under the
-//! cursor each frame, hidden when the cursor isn't over any voxel.
+//! cursor each frame, hidden when the cursor isn't over any voxel. Plus a
+//! distinct persistent **destination** marker that sits on the clicked
+//! click-to-move target cell until the player arrives there.
 
 use bevy::{prelude::*, window::PrimaryWindow};
 use bevy_voxel_world::prelude::*;
 
 use inf3d_camera::IsoCamera;
+use inf3d_core::PathTarget;
 use inf3d_world::MainWorld;
+use inf3d_worldgen::Terrain;
 
 /// Slightly larger than a unit voxel so the overlay doesn't z-fight the surface.
 const HIGHLIGHT_SCALE: f32 = 1.04;
 
 #[derive(Component)]
 struct VoxelHighlight;
+
+/// The persistent destination marker shown on the active click-to-move target
+/// cell. Distinct (cyan/green) from the yellow hover [`VoxelHighlight`].
+#[derive(Component)]
+struct TargetHighlight;
 
 /// Hovered voxel exposed for the HUD: the integer voxel position and its
 /// material id (if the hovered voxel is solid).
@@ -26,8 +35,9 @@ pub struct HighlightPlugin;
 impl Plugin for HighlightPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Hover>()
-            .add_systems(Startup, spawn_highlight)
-            .add_systems(Update, update_highlight);
+            .init_resource::<PathTarget>()
+            .add_systems(Startup, (spawn_highlight, spawn_target_highlight))
+            .add_systems(Update, (update_highlight, update_target_highlight));
     }
 }
 

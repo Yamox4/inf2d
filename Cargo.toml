@@ -5,6 +5,7 @@ members = [
     "crates/inf3d_worldgen",
     "crates/inf3d_world",
     "crates/inf3d_camera",
+    "crates/inf3d_physics",
     "crates/inf3d_render",
     "crates/inf3d_gameplay",
     "crates/inf3d_pathfinding",
@@ -57,6 +58,19 @@ bevy = { version = "0.18", default-features = false, features = [
     "zstd_rust",
 ] }
 bevy_voxel_world = "0.16"
+# ECS-native physics for Bevy. avian3d 0.6.1 targets bevy ^0.18 (verified
+# against its Cargo.toml). Default features include `3d`, `f32`, `parry-f32`,
+# `collider-from-mesh` (TrimeshFromMesh constructor) and the
+# `character_controller` module (MoveAndSlide). We disable `debug-plugin` and
+# `diagnostic_ui` to keep the build lean; everything we use is still on.
+avian3d = { version = "0.6.1", default-features = false, features = [
+    "3d",
+    "f32",
+    "parry-f32",
+    "collider-from-mesh",
+    "parallel",
+    "bevy_scene",
+] }
 # Native (drop the default `webgl2` limiter). `depth_prepass` enables the nicer
 # deep/shallow color blend + waves + reflections. No `ssr` (it broke rendering on
 # our prepass-less voxel terrain).
@@ -74,6 +88,7 @@ inf3d_core = { path = "crates/inf3d_core" }
 inf3d_worldgen = { path = "crates/inf3d_worldgen" }
 inf3d_world = { path = "crates/inf3d_world" }
 inf3d_camera = { path = "crates/inf3d_camera" }
+inf3d_physics = { path = "crates/inf3d_physics" }
 inf3d_render = { path = "crates/inf3d_render" }
 inf3d_gameplay = { path = "crates/inf3d_gameplay" }
 inf3d_pathfinding = { path = "crates/inf3d_pathfinding" }

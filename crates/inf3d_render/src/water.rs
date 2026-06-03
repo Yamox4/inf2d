@@ -7,11 +7,12 @@
 //! crate's `assets/`). Without those files the water silently fails to render.
 //!
 //! `bevy_water` provides moving Gerstner waves, normal-based lighting/specular
-//! (sun glints), and built-in environment (sky) reflections; the water also
-//! receives directional-light shadows via the `bevy_pbr` import. True
-//! screen-space reflections of the *player/terrain* are NOT available because
-//! the voxel terrain opts out of the depth prepass (the `ssr` feature broke
-//! rendering), so we rely on the built-in reflections + specular instead.
+//! (sun glints), built-in environment (sky) reflections, and — now that the
+//! custom terrain material writes the depth prepass and the camera carries
+//! `DepthPrepass` whenever water is enabled — a depth-based deep/shallow color
+//! blend with shoreline foam. Full screen-space reflections (the `ssr` feature)
+//! are still off: bevy_water's SSR uses the deferred render path, which the
+//! forward-only voxel terrain material doesn't feed.
 //!
 //! Wave `amplitude` is driven by `inf3d_core::QualitySettings`. Visual colors
 //! and direction stay hard-coded — they tune the look, not the perf cost.
@@ -66,12 +67,23 @@ fn init_water_settings(mut commands: Commands, quality: Res<QualitySettings>) {
         // bevy_water amplitude of 1.0 is huge — presets keep it in the
         // 0.06..0.15 range.
         amplitude: quality.water_amplitude,
-        clarity: 0.4,
-        deep_color: Color::srgba(0.02, 0.12, 0.22, 1.0),
-        shallow_color: Color::srgba(0.10, 0.42, 0.55, 1.0),
-        edge_color: Color::srgba(0.85, 0.95, 1.0, 1.0),
-        edge_scale: 0.25,
+        // BRIGHT base tint so the water always reads "lit up" rather than going
+        // dark at angles where the sun glint doesn't hit — the user wants the
+        // bright, reflective look from every viewing angle. The wave specular
+        // (sun glint) then just adds extra shimmer on top of this bright base.
+        base_color: Color::srgba(0.32, 0.58, 0.70, 1.0),
+        // LOW clarity so the water's own (bright) color dominates over the bottom.
+        clarity: 0.18,
+        // Brightened deep/shallow so even un-glinted water stays a bright blue
+        // instead of dark navy. Raise these further for an even more luminous look.
+        deep_color: Color::srgba(0.18, 0.45, 0.60, 1.0),
+        shallow_color: Color::srgba(0.40, 0.70, 0.78, 1.0),
+        // Bright, wide shoreline foam where the water meets land (depth-driven).
+        edge_color: Color::srgba(0.95, 1.0, 1.0, 1.0),
+        edge_scale: 0.4,
         wave_direction: Vec2::new(1.0, 0.6),
+        // `water_quality` defaults to `WaterQuality::Ultra` (max wave/normal
+        // detail) and `spawn_tiles` to a large grid — both kept via `..default()`.
         ..default()
     });
 }

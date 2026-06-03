@@ -7,10 +7,14 @@
 
 use std::collections::VecDeque;
 
+use avian3d::prelude::*;
 use bevy::prelude::*;
 
+use inf3d_core::{FollowTarget, PathTarget};
+use inf3d_physics::{
+    CharacterController, DesiredMove, GameLayer, PLAYER_HALF_HEIGHT, PLAYER_RADIUS,
+};
 use inf3d_worldgen::Terrain;
-use inf3d_core::FollowTarget;
 
 /// The controllable player. `cell` is the current voxel column `(x, z)` the
 /// player occupies — pathfinding uses it as the A* start.
@@ -68,7 +72,8 @@ pub struct PlayerPlugin;
 
 impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_player)
+        app.init_resource::<PathTarget>()
+            .add_systems(Startup, spawn_player)
             .add_systems(Update, (follow_path, animate_player).chain());
     }
 }
@@ -134,6 +139,18 @@ fn spawn_player(
             },
             MovePath::default(),
             FollowTarget,
+            // Kinematic character controller: avian moves it only via our
+            // `move_and_slide` in `inf3d_physics`, never auto-integrated. The
+            // capsule matches the visual figure's ~1.0 half-height. The Player
+            // layer collides with Terrain + Solid props (set on the collider).
+            RigidBody::Kinematic,
+            Collider::capsule(PLAYER_RADIUS, PLAYER_HALF_HEIGHT * 2.0),
+            CollisionLayers::new(
+                GameLayer::Player,
+                [GameLayer::Terrain, GameLayer::Solid],
+            ),
+            CharacterController::default(),
+            DesiredMove::default(),
         ))
         .with_children(|parent| {
             parent
@@ -198,41 +215,51 @@ fn spawn_player(
         });
 }
 
-/// Step the player along its `MovePath`, popping waypoints as they're reached,
-/// and track travel facing for the animation system.
-fn follow_path(time: Res<Time>, mut query: Query<(&mut Transform, &mut Player, &mut MovePath)>) {
-    let Ok((mut transform, mut player, mut move_path)) = query.single_mut() else {
+/// Drive the player along its `MovePath` by writing a desired **horizontal**
+/// velocity into [`DesiredMove`]; the physics character controller in
+/// `inf3d_physics` consumes it (PostUpdate), runs it through `move_and_slide`
+/// against terrain + solid props, and handles gravity / ground-snap. This keeps
+/// the original click-to-move feel while making solid props actually block the
+/// player. Waypoints pop on **horizontal** arrival (the controller owns Y).
+fn follow_path(
+    mut query: Query<(&Transform, &mut Player, &mut MovePath, &mut DesiredMove)>,
+    mut target: ResMut<PathTarget>,
+) {
+    let Ok((transform, mut player, mut move_path, mut desired)) = query.single_mut() else {
         return;
     };
-    let dt = time.delta_secs();
-
-    let Some(&waypoint) = move_path.waypoints.front() else {
-        // Idle: keep `cell` consistent.
-        player.cell = cell_of(transform.translation);
-        return;
-    };
-
-    // Waypoints are feet points; the parent transform sits at the capsule center.
-    let target = waypoint + Vec3::Y * CAPSULE_HALF_HEIGHT;
-    let to_target = target - transform.translation;
-    let distance = to_target.length();
-    let step = player.speed * dt;
-
-    // Derive facing from the horizontal component of travel.
-    let flat = Vec3::new(to_target.x, 0.0, to_target.z);
-    let horizontal = flat.length();
-    if horizontal > 1e-4 {
-        player.facing = flat.x.atan2(flat.z);
-    }
-
-    if distance <= step.max(0.05) {
-        transform.translation = target;
-        move_path.waypoints.pop_front();
-    } else {
-        transform.translation += (to_target / distance) * step;
-    }
 
     player.cell = cell_of(transform.translation);
+
+    let Some(&waypoint) = move_path.waypoints.front() else {
+        // Idle: no horizontal intent (controller keeps applying gravity/snap).
+        desired.velocity = Vec3::ZERO;
+        // Arrived (or never moving): clear the destination highlight. Only
+        // touches change-detection when it was actually set.
+        if target.0.is_some() {
+            target.0 = None;
+        }
+        return;
+    };
+
+    // Compare in the XZ plane only — the controller decides our height.
+    let here = Vec2::new(transform.translation.x, transform.translation.z);
+    let goal = Vec2::new(waypoint.x, waypoint.z);
+    let to_target = goal - here;
+    let distance = to_target.length();
+
+    if distance > 1e-4 {
+        player.facing = to_target.x.atan2(to_target.y);
+    }
+
+    // Arrival threshold scales with speed so we never overshoot in one frame.
+    if distance <= 0.1 {
+        move_path.waypoints.pop_front();
+        desired.velocity = Vec3::ZERO;
+    } else {
+        let dir = to_target / distance;
+        desired.velocity = Vec3::new(dir.x * player.speed, 0.0, dir.y * player.speed);
+    }
 }
 
 /// Animate the character: the root hops in a smooth arc while walking, the feet

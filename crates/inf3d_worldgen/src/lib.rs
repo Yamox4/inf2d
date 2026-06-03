@@ -11,11 +11,26 @@ use noise::{HybridMulti, NoiseFn, Perlin};
 /// is below this. Single source of truth shared with `water.rs` + pathfinding.
 pub const WATER_HEIGHT: f32 = 1.6;
 
+/// Canonical octave count at full (LOD 0) detail.
+pub const TERRAIN_OCTAVES: usize = 5;
+
 /// Build the terrain noise with the canonical parameters. Used in two places:
 /// the meshing delegate (per worker thread) and the [`Terrain`] gameplay oracle.
 pub fn build_noise() -> HybridMulti<Perlin> {
+    build_noise_lod(0)
+}
+
+/// Build the terrain noise with an octave count reduced for the given voxel
+/// LOD level. Coarser LODs (larger `lod`) sample fewer octaves, which both
+/// cheapens generation on the worker threads and avoids encoding
+/// high-frequency surface detail that a downsampled (coarse) chunk mesh can't
+/// represent anyway. The gameplay oracle ([`Terrain`]) always uses LOD 0 so
+/// pathfinding/standing stay consistent with the finest visible geometry.
+///
+/// At least two octaves are always kept so the broad landmass shape survives.
+pub fn build_noise_lod(lod: u8) -> HybridMulti<Perlin> {
     let mut noise = HybridMulti::<Perlin>::new(1234);
-    noise.octaves = 5;
+    noise.octaves = TERRAIN_OCTAVES.saturating_sub(lod as usize).max(2);
     noise.frequency = 1.1;
     noise.lacunarity = 2.8;
     noise.persistence = 0.4;
@@ -71,15 +86,28 @@ impl Terrain {
             return start;
         }
         for r in 1..256i32 {
+            // Walk only the perimeter of the radius-`r` square (O(perimeter),
+            // not O((2r+1)^2)). We preserve the original visit order — outer
+            // loop over `dx` ascending, inner over `dz` ascending — so ties
+            // (equidistant land cells) resolve to the same cell as before:
+            //   * on the left/right edge columns (|dx| == r) every dz is on the
+            //     ring, so we scan the full -r..=r column;
+            //   * on interior columns (|dx| < r) only dz == -r and dz == r lie
+            //     on the ring.
             for dx in -r..=r {
-                for dz in -r..=r {
-                    // Only the outer ring at radius r (avoids re-checking inner cells).
-                    if dx.abs() != r && dz.abs() != r {
-                        continue;
+                if dx.abs() == r {
+                    for dz in -r..=r {
+                        let c = IVec2::new(start.x + dx, start.y + dz);
+                        if self.is_land(c.x, c.y) {
+                            return c;
+                        }
                     }
-                    let c = IVec2::new(start.x + dx, start.y + dz);
-                    if self.is_land(c.x, c.y) {
-                        return c;
+                } else {
+                    for dz in [-r, r] {
+                        let c = IVec2::new(start.x + dx, start.y + dz);
+                        if self.is_land(c.x, c.y) {
+                            return c;
+                        }
                     }
                 }
             }

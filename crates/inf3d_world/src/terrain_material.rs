@@ -120,11 +120,19 @@ pub type TerrainMaterial = ExtendedMaterial<StandardMaterial, VoxelTerrainExtens
 /// indices match upstream `StandardVoxelMaterial` so the WGSL signature is
 /// byte-for-byte compatible — meaning the voxel mesher's existing per-vertex
 /// `tex_idx` payload still works without touching `meshing.rs`.
-#[derive(Asset, AsBindGroup, Debug, Clone, Default, TypePath)]
+#[derive(Asset, AsBindGroup, Debug, Clone, TypePath)]
 pub struct VoxelTerrainExtension {
     #[texture(100, dimension = "2d_array")]
     #[sampler(101)]
     pub voxels_texture: Handle<Image>,
+}
+
+impl Default for VoxelTerrainExtension {
+    fn default() -> Self {
+        Self {
+            voxels_texture: Handle::default(),
+        }
+    }
 }
 
 impl MaterialExtension for VoxelTerrainExtension {
@@ -332,3 +340,4 @@ pub fn install_terrain_material(app: &mut App) -> TerrainMaterial {
         },
     }
 }
+

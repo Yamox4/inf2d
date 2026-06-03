@@ -2,13 +2,14 @@
 //! follow, scroll-wheel zoom, and Q/E orbit.
 
 use bevy::camera::{OrthographicProjection, Projection, ScalingMode};
-use bevy::core_pipeline::prepass::DepthPrepass;
+use bevy::core_pipeline::prepass::{DepthPrepass, MotionVectorPrepass, NormalPrepass};
 use bevy::input::mouse::{MouseMotion, MouseWheel};
-use bevy::light::VolumetricFog;
+use bevy::pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceAmbientOcclusionQualityLevel};
 use bevy::post_process::bloom::Bloom;
 use bevy::post_process::dof::DepthOfField;
+use bevy::post_process::motion_blur::MotionBlur;
 use bevy::prelude::*;
-use bevy::render::view::Hdr;
+use bevy::render::view::{Hdr, Msaa};
 use bevy_voxel_world::prelude::*;
 
 use inf3d_core::{FollowTarget, QualitySettings};
@@ -70,21 +71,35 @@ fn bloom_component() -> Bloom {
     }
 }
 
-/// VolumetricFog config parameterised on step count.
-fn fog_component(step_count: u32) -> VolumetricFog {
-    VolumetricFog {
-        ambient_intensity: 0.5,
-        step_count,
-        ..default()
-    }
-}
-
 /// Depth-of-field config used everywhere it's enabled.
 fn dof_component() -> DepthOfField {
     DepthOfField {
         focal_distance: 55.0,
         aperture_f_stops: 8.0,
         ..default()
+    }
+}
+
+/// SSAO config used everywhere it's enabled. `ScreenSpaceAmbientOcclusion`
+/// `#[require(DepthPrepass, NormalPrepass)]`, so both prepasses must also be on
+/// the camera, and Bevy enforces `Msaa::Off` for SSAO (it logs an error and
+/// skips otherwise — see bevy_pbr ssao/mod.rs). `Medium` is a sensible
+/// quality/perf trade for the blocky terrain (High/Ultra cost more GPU).
+fn ssao_component() -> ScreenSpaceAmbientOcclusion {
+    ScreenSpaceAmbientOcclusion {
+        quality_level: ScreenSpaceAmbientOcclusionQualityLevel::Medium,
+        ..default()
+    }
+}
+
+/// Motion-blur config used everywhere it's enabled. `MotionBlur`
+/// `#[require(DepthPrepass, MotionVectorPrepass)]`, so both prepasses must also
+/// be on the camera. Defaults are deliberately gentle: a short shutter angle and
+/// a single sample give a subtle AAA smear, not a heavy blur.
+fn motion_blur_component() -> MotionBlur {
+    MotionBlur {
+        shutter_angle: 0.25,
+        samples: 1,
     }
 }
 
@@ -120,27 +135,46 @@ fn spawn_camera(mut commands: Commands, quality: Res<QualitySettings>) {
     if quality.bloom_enabled {
         entity.insert(bloom_component());
     }
-    if quality.fog_enabled {
-        // Volumetric fog renders in its own pass (independent of the voxel
-        // terrain's custom material). Needs a FogVolume + VolumetricLight (sun).
-        entity.insert(fog_component(quality.fog_step_count));
-    }
-    // Depth prepass feeds DoF (and any fog passes that sample depth).
-    if quality.fog_enabled || quality.dof_enabled {
+    // SSAO + motion blur are AAA post-FX gated to the higher-quality presets.
+    // We reuse `bloom_enabled` as the gate (true on Medium/High, false on
+    // Potato/Low) so we don't add a new `QualitySettings` field (core is owned by
+    // another agent). The custom terrain material now writes the depth/normal/
+    // motion-vector prepass, so the voxel terrain finally participates in both.
+    let ssao_enabled = quality.bloom_enabled;
+    let motion_blur_enabled = quality.bloom_enabled;
+
+    // DepthPrepass feeds Depth-of-Field, the water's depth-based deep/shallow
+    // color blend + shoreline foam (bevy_water samples the depth texture to know
+    // how deep the water is at each pixel), AND SSAO + motion blur. The custom
+    // terrain material writes the prepass, so the voxel terrain participates —
+    // enable it whenever ANY of those features wants it (OR of all consumers, so
+    // it's never missing while one still needs it).
+    if quality.dof_enabled || quality.water_enabled || ssao_enabled || motion_blur_enabled {
         entity.insert(DepthPrepass);
     }
     if quality.dof_enabled {
-        // Subtle depth-of-field (cozy tilt-shift). SSAO + motion blur were dropped:
-        // the voxel terrain skips the prepass so they can't shade it, and SSAO
-        // forces MSAA off (worse on the blocky terrain).
+        // Subtle depth-of-field (cozy tilt-shift).
         entity.insert(dof_component());
+    }
+    if ssao_enabled {
+        // SSAO additionally needs the normal prepass, and Bevy requires MSAA off
+        // for SSAO (it errors and skips the effect otherwise). We add both here.
+        // (`ScreenSpaceAmbientOcclusion` also `#[require]`s these, but we insert
+        // them explicitly so `apply_quality_to_camera` can track/remove them.)
+        entity.insert((ssao_component(), NormalPrepass, Msaa::Off));
+    }
+    if motion_blur_enabled {
+        // Motion blur additionally needs the motion-vector prepass.
+        entity.insert((motion_blur_component(), MotionVectorPrepass));
     }
 }
 
 /// Re-apply the post-FX component set whenever `QualitySettings` changes,
-/// adding or stripping `Bloom`, `VolumetricFog`, `DepthPrepass`, and
-/// `DepthOfField` to match the new preset. Skips re-inserting when the
-/// component is already present with the same value (avoids GPU churn).
+/// adding or stripping `Bloom`, `DepthPrepass`, `DepthOfField`, SSAO (+ its
+/// `NormalPrepass`/`Msaa::Off`), and motion blur (+ its `MotionVectorPrepass`)
+/// to match the new preset. Skips re-inserting when the component is already
+/// present (avoids GPU churn). Fog is a screen-space UI overlay now (see
+/// inf3d_render::fog) and is no longer a camera component.
 fn apply_quality_to_camera(
     mut commands: Commands,
     quality: Res<QualitySettings>,
@@ -148,9 +182,12 @@ fn apply_quality_to_camera(
         (
             Entity,
             Has<Bloom>,
-            Option<&VolumetricFog>,
             Has<DepthPrepass>,
             Has<DepthOfField>,
+            Has<ScreenSpaceAmbientOcclusion>,
+            Has<NormalPrepass>,
+            Has<MotionBlur>,
+            Has<MotionVectorPrepass>,
         ),
         With<IsoCamera>,
     >,
@@ -159,9 +196,16 @@ fn apply_quality_to_camera(
         return;
     }
     // Empty query is fine — settings may flip before the camera spawns.
-    let Ok((entity, has_bloom, current_fog, has_depth, has_dof)) = cam_q.single() else {
+    let Ok((entity, has_bloom, has_depth, has_dof, has_ssao, has_normal, has_mb, has_motion_vec)) =
+        cam_q.single()
+    else {
         return;
     };
+
+    // SSAO + motion blur share `bloom_enabled` as their quality gate (see
+    // spawn_camera) so Potato/Low stay cheap.
+    let ssao_enabled = quality.bloom_enabled;
+    let motion_blur_enabled = quality.bloom_enabled;
 
     let mut e = commands.entity(entity);
 
@@ -173,19 +217,12 @@ fn apply_quality_to_camera(
         e.remove::<Bloom>();
     }
 
-    if quality.fog_enabled {
-        let needs_insert = match current_fog {
-            Some(existing) => existing.step_count != quality.fog_step_count,
-            None => true,
-        };
-        if needs_insert {
-            e.insert(fog_component(quality.fog_step_count));
-        }
-    } else if current_fog.is_some() {
-        e.remove::<VolumetricFog>();
-    }
-
-    let need_depth = quality.fog_enabled || quality.dof_enabled;
+    // DepthPrepass is shared by Depth-of-Field, the water's depth-based color
+    // blend + shoreline foam, SSAO, and motion blur (the terrain writes the
+    // prepass now). Compute "needs depth" as the OR of every consumer so we
+    // never strip it while one of them still needs it.
+    let need_depth =
+        quality.dof_enabled || quality.water_enabled || ssao_enabled || motion_blur_enabled;
     if need_depth {
         if !has_depth {
             e.insert(DepthPrepass);
@@ -200,6 +237,50 @@ fn apply_quality_to_camera(
         }
     } else if has_dof {
         e.remove::<DepthOfField>();
+    }
+
+    // SSAO: needs NormalPrepass + Msaa::Off. We track NormalPrepass separately so
+    // it's only stripped when SSAO is off (nothing else here uses it). For MSAA,
+    // the simplest correct approach is to flip the camera's `Msaa` component to
+    // match SSAO: `Off` while SSAO is on (Bevy requires it), and back to the
+    // default (Sample4) when SSAO is off so we regain antialiasing. Tradeoff:
+    // toggling presets re-creates MSAA targets, but only on the F2 change, not
+    // per frame.
+    if ssao_enabled {
+        if !has_ssao {
+            e.insert(ssao_component());
+        }
+        if !has_normal {
+            e.insert(NormalPrepass);
+        }
+        e.insert(Msaa::Off);
+    } else {
+        if has_ssao {
+            e.remove::<ScreenSpaceAmbientOcclusion>();
+        }
+        if has_normal {
+            e.remove::<NormalPrepass>();
+        }
+        // Restore antialiasing now that SSAO no longer forbids MSAA.
+        e.insert(Msaa::default());
+    }
+
+    // Motion blur: needs MotionVectorPrepass. Track it separately so it's only
+    // stripped when motion blur is off (nothing else here uses it).
+    if motion_blur_enabled {
+        if !has_mb {
+            e.insert(motion_blur_component());
+        }
+        if !has_motion_vec {
+            e.insert(MotionVectorPrepass);
+        }
+    } else {
+        if has_mb {
+            e.remove::<MotionBlur>();
+        }
+        if has_motion_vec {
+            e.remove::<MotionVectorPrepass>();
+        }
     }
 }
 

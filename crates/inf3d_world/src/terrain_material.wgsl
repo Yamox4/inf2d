@@ -80,6 +80,12 @@ struct CustomVertexOutput {
     @location(6) @interpolate(flat) instance_index: u32,
 #endif
 
+    // Texture-face index (0 = top, 1 = side, 2 = bottom) selected per-vertex
+    // from the axis-aligned face normal and flat-interpolated. Computing this
+    // in the vertex stage avoids a fragile per-fragment float-equality test on
+    // the interpolated normal (a near-horizontal face could drift off 0.0).
+    @location(7) @interpolate(flat) tex_face: u32,
+
     @location(8) tex_idx: vec3<u32>,
 }
 
@@ -118,6 +124,18 @@ fn vertex(vertex: Vertex) -> CustomVertexOutput {
 
     out.tex_idx = vertex.tex_idx;
 
+    // Select the texture face from the (axis-aligned) world normal once per
+    // vertex. Voxel faces are axis-aligned, so a 0.5 threshold on the Y
+    // component cleanly separates top / side / bottom without relying on an
+    // exact == 0.0 compare.
+    if out.world_normal.y > 0.5 {
+        out.tex_face = 0u; // top
+    } else if out.world_normal.y < -0.5 {
+        out.tex_face = 2u; // bottom
+    } else {
+        out.tex_face = 1u; // side
+    }
+
     return out;
 }
 
@@ -141,14 +159,10 @@ fn fragment(
 #endif
     var pbr_input = pbr_input_from_standard_material(standard_in, is_front);
 
-    var tex_face = 0;
-
-    // determine texture index based on normal
-    if in.world_normal.y == 0.0 {
-        tex_face = 1;
-    } else if in.world_normal.y < 0.0 {
-        tex_face = 2;
-    }
+    // `tex_face` (0 = top, 1 = side, 2 = bottom) was chosen per-vertex in the
+    // vertex stage from the axis-aligned normal and flat-interpolated, so the
+    // fragment stage no longer does a fragile float-equality test.
+    let tex_face = in.tex_face;
 
 #ifdef VERTEX_UVS
     pbr_input.material.base_color = textureSample(mat_array_texture, mat_array_texture_sampler, in.uv, in.tex_idx[tex_face]);

@@ -6,7 +6,7 @@
 //! is in flight at a time; a fresh click supersedes any pending task.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::Instant;
 
 use bevy::{
@@ -17,6 +17,7 @@ use bevy::{
 use bevy_voxel_world::prelude::*;
 
 use inf3d_camera::IsoCamera;
+use inf3d_core::{BlockedCells, PathTarget};
 use inf3d_gameplay::{MovePath, Player};
 use inf3d_world::MainWorld;
 use inf3d_worldgen::Terrain;
@@ -34,6 +35,8 @@ impl Plugin for PathfindPlugin {
             .add_message::<PathFound>()
             .init_resource::<ActivePathTask>()
             .init_resource::<PathTiming>()
+            .init_resource::<BlockedCells>()
+            .init_resource::<PathTarget>()
             .add_systems(
                 Update,
                 (
@@ -80,6 +83,10 @@ pub struct PathTiming {
 #[derive(Clone)]
 struct PathSearchResult {
     cells: Option<Vec<IVec2>>,
+    /// The goal cell this search targeted; published to [`PathTarget`] on the
+    /// main thread when the search yields a real route so the destination stays
+    /// highlighted until the player arrives.
+    goal: IVec2,
     expansions: usize,
     elapsed_ms: f32,
     /// Snapshot of the terrain the worker used; reused on the main thread to
@@ -135,6 +142,7 @@ fn handle_click(
 fn dispatch_path_task(
     mut requests: MessageReader<PathRequest>,
     terrain: Res<Terrain>,
+    blocked: Res<BlockedCells>,
     mut active: ResMut<ActivePathTask>,
 ) {
     // Coalesce: only the newest request in the queue matters — older ones are
@@ -145,13 +153,19 @@ fn dispatch_path_task(
 
     // Cheap snapshot — `Terrain` is just noise parameters; no heap allocations.
     let terrain_snapshot: Terrain = terrain.clone();
+    // Snapshot the prop-blocked cells so the worker (which touches no ECS) can
+    // treat them as impassable. The resident set is bounded by the foliage ring,
+    // so this clone is small.
+    let blocked_snapshot: HashSet<IVec2> = blocked.0.iter().copied().collect();
     let pool = AsyncComputeTaskPool::get();
     let task = pool.spawn(async move {
         let started = Instant::now();
-        let (cells, expansions) = astar(&terrain_snapshot, req.start, req.goal);
+        let (cells, expansions) =
+            astar(&terrain_snapshot, req.start, req.goal, &blocked_snapshot);
         let elapsed_ms = started.elapsed().as_secs_f32() * 1000.0;
         PathSearchResult {
             cells,
+            goal: req.goal,
             expansions,
             elapsed_ms,
             terrain: terrain_snapshot,
@@ -169,6 +183,7 @@ fn poll_path_task(
     mut active: ResMut<ActivePathTask>,
     mut path_found: MessageWriter<PathFound>,
     mut timing: ResMut<PathTiming>,
+    mut target: ResMut<PathTarget>,
 ) {
     let Some(task) = active.0.as_mut() else {
         return;
@@ -205,6 +220,10 @@ fn poll_path_task(
         return;
     }
 
+    // A real route exists: highlight the destination until the player arrives
+    // (gameplay clears `PathTarget` once `MovePath` empties).
+    target.0 = Some(result.goal);
+
     path_found.write(PathFound { waypoints });
 }
 
@@ -221,16 +240,13 @@ fn consume_path_found(
     let Ok(mut move_path) = query.single_mut() else {
         return;
     };
-    move_path.waypoints.clear();
-    for wp in &latest.waypoints {
-        move_path.waypoints.push_back(*wp);
-    }
+    move_path.waypoints = latest.waypoints.iter().copied().collect();
 }
 
 /// Total-orderable wrapper around an A* f-score. `f32` is only `PartialOrd`, so
 /// we implement `Ord`/`Eq` via [`f32::total_cmp`] to use it as a [`BinaryHeap`]
 /// key (paired with [`Reverse`] for a min-heap).
-#[derive(Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, PartialEq)]
 struct OrderedF32(f32);
 
 impl Eq for OrderedF32 {}
@@ -238,6 +254,15 @@ impl Eq for OrderedF32 {}
 impl Ord for OrderedF32 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.0.total_cmp(&other.0)
+    }
+}
+
+impl PartialOrd for OrderedF32 {
+    // Defer to `Ord` (total_cmp) so `PartialOrd` and `Ord` never disagree —
+    // the derived `f32` partial order is NaN-unsafe and would violate the
+    // Ord/PartialOrd contract.
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -282,7 +307,9 @@ impl SurfaceOracle for Terrain {
 /// 8-connected A* over the terrain surface grid.
 ///
 /// Cells are `(x, z)` columns; heights come from [`SurfaceOracle::surface_y`].
-/// An edge `a → b` is walkable iff `|surface_y(a) - surface_y(b)| <= MAX_STEP`.
+/// An edge `a → b` is walkable iff `|surface_y(a) - surface_y(b)| <= MAX_STEP`
+/// and `b` is not in `blocked` (solid-prop cells), unless `b` is the `start` or
+/// `goal` cell (the escape hatch that keeps the player from being trapped).
 /// Step cost is `1.0` orthogonal / `SQRT_2` diagonal plus a height penalty of
 /// `0.5 * |Δheight|`. Returns `(cells, expansions)` where `cells` is the
 /// inclusive `start..=goal` path, or `None` if `goal == start`, no path exists,
@@ -292,6 +319,7 @@ fn astar<O: SurfaceOracle>(
     terrain: &O,
     start: IVec2,
     goal: IVec2,
+    blocked: &HashSet<IVec2>,
 ) -> (Option<Vec<IVec2>>, usize) {
     if goal == start {
         return (None, 0);
@@ -326,6 +354,14 @@ fn astar<O: SurfaceOracle>(
             let next = current + offset;
             // Water (seafloor flats below the water line) is not walkable.
             if !terrain.is_land(next.x, next.y) {
+                continue;
+            }
+            // Solid props (trees/rocks) block their cell. Escape hatch: the
+            // start and goal cells are always allowed even if blocked, so the
+            // player is never trapped under a prop and can still path to a cell
+            // a prop happens to sit on (the goal). Any other blocked cell is
+            // impassable, forcing the route to detour around props.
+            if blocked.contains(&next) && next != start && next != goal {
                 continue;
             }
             let h_next = terrain.surface_y(next.x, next.y);
@@ -370,6 +406,11 @@ fn reconstruct(came_from: &HashMap<IVec2, IVec2>, goal: IVec2) -> Vec<IVec2> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty blocked-cell set for tests that don't exercise prop avoidance.
+    fn no_blocked() -> HashSet<IVec2> {
+        HashSet::new()
+    }
 
     /// Flat synthetic terrain: every column has the same surface height and is
     /// land. Useful for verifying A* on an open grid without the noise crate.
@@ -457,7 +498,7 @@ mod tests {
     #[test]
     fn astar_returns_none_when_start_equals_goal() {
         let terrain = FlatLand { height: 5 };
-        let (path, expansions) = astar(&terrain, IVec2::ZERO, IVec2::ZERO);
+        let (path, expansions) = astar(&terrain, IVec2::ZERO, IVec2::ZERO, &no_blocked());
         assert!(path.is_none());
         assert_eq!(expansions, 0);
     }
@@ -467,7 +508,7 @@ mod tests {
         let terrain = FlatLand { height: 5 };
         let start = IVec2::new(0, 0);
         let goal = IVec2::new(4, 0);
-        let (path, _expansions) = astar(&terrain, start, goal);
+        let (path, _expansions) = astar(&terrain, start, goal, &no_blocked());
         let path = path.expect("flat land must always be reachable");
         // Inclusive of start and goal.
         assert_eq!(path.first().copied(), Some(start));
@@ -496,7 +537,7 @@ mod tests {
         };
         let start = IVec2::new(0, 0);
         let goal = IVec2::new(4, 0);
-        let (path, _expansions) = astar(&terrain, start, goal);
+        let (path, _expansions) = astar(&terrain, start, goal, &no_blocked());
         let path = path.expect("there is a route around the wall");
         // The path must never set foot on the walled cells.
         for cell in &path {
@@ -516,11 +557,53 @@ mod tests {
     #[test]
     fn astar_gives_up_when_goal_is_unreachable() {
         let terrain = Island;
-        let (path, expansions) = astar(&terrain, IVec2::new(0, 0), IVec2::new(10, 10));
+        let (path, expansions) =
+            astar(&terrain, IVec2::new(0, 0), IVec2::new(10, 10), &no_blocked());
         assert!(path.is_none());
         // Island has no walkable neighbours, so the open set drains immediately
         // after popping `start`. Expansion budget must not be exhausted.
         assert!(expansions < MAX_EXPANSIONS);
+    }
+
+    #[test]
+    fn astar_routes_around_blocked_prop_cells() {
+        // Open flat land, but a vertical line of "prop" cells at x=2 for
+        // z ∈ [-2, 2] is blocked — A* must detour around it just like a wall.
+        let terrain = FlatLand { height: 5 };
+        let mut blocked = HashSet::new();
+        for z in -2..=2 {
+            blocked.insert(IVec2::new(2, z));
+        }
+        let start = IVec2::new(0, 0);
+        let goal = IVec2::new(4, 0);
+        let (path, _expansions) = astar(&terrain, start, goal, &blocked);
+        let path = path.expect("there is a route around the blocked cells");
+        for cell in &path {
+            assert!(
+                !blocked.contains(cell),
+                "path stepped onto a blocked prop cell: {:?}",
+                path
+            );
+        }
+        assert_eq!(path.first().copied(), Some(start));
+        assert_eq!(path.last().copied(), Some(goal));
+        assert!(path.len() > 5, "expected detour, got direct path: {:?}", path);
+    }
+
+    #[test]
+    fn astar_escape_hatch_allows_blocked_start_and_goal() {
+        // Both start and goal are themselves blocked (e.g. the player stands on
+        // a prop cell, or clicked one). The escape hatch must still find a route.
+        let terrain = FlatLand { height: 5 };
+        let start = IVec2::new(0, 0);
+        let goal = IVec2::new(3, 0);
+        let mut blocked = HashSet::new();
+        blocked.insert(start);
+        blocked.insert(goal);
+        let (path, _expansions) = astar(&terrain, start, goal, &blocked);
+        let path = path.expect("start/goal escape hatch keeps the route valid");
+        assert_eq!(path.first().copied(), Some(start));
+        assert_eq!(path.last().copied(), Some(goal));
     }
 
     #[test]
@@ -529,7 +612,8 @@ mod tests {
         // cells if it ran to completion. We just need a reachable goal whose
         // search the heuristic guides quickly; bound is sanity, not stress.
         let terrain = FlatLand { height: 5 };
-        let (_path, expansions) = astar(&terrain, IVec2::new(0, 0), IVec2::new(20, 20));
+        let (_path, expansions) =
+            astar(&terrain, IVec2::new(0, 0), IVec2::new(20, 20), &no_blocked());
         assert!(
             expansions <= MAX_EXPANSIONS,
             "A* exceeded its expansion cap: {expansions}"

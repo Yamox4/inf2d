@@ -11,3 +11,5 @@ bevy = { workspace = true }
 inf3d_core = { workspace = true }
 inf3d_worldgen = { workspace = true }
 inf3d_render = { workspace = true }
+inf3d_physics = { workspace = true }
+avian3d = { workspace = true }

@@ -68,7 +68,11 @@ fn emit_dust(
     let mut rng = rand::rng();
 
     for b in bursts.read() {
-        for _ in 0..b.amount {
+        // Clamp the burst size so a stray/huge `amount` can't spawn an
+        // unbounded number of entities synchronously in one frame.
+        const MAX_BURST: u32 = 256;
+        let amount = b.amount.min(MAX_BURST);
+        for _ in 0..amount {
             // Scatter on a random horizontal heading, biased upward.
             let angle = rng.random_range(0.0..std::f32::consts::TAU);
             let radial = rng.random_range(0.2..1.0);
@@ -85,8 +89,10 @@ fn emit_dust(
             commands.spawn((
                 Mesh3d(assets.mesh.clone()),
                 MeshMaterial3d(assets.material.clone()),
-                // Start at zero scale; update_dust pops it in.
-                Transform::from_translation(b.pos + offset).with_scale(Vec3::ZERO),
+                // Start at a tiny non-zero scale; update_dust pops it in.
+                // A literal zero scale gives a degenerate model matrix/AABB on
+                // the first frame, so begin slightly above zero instead.
+                Transform::from_translation(b.pos + offset).with_scale(Vec3::splat(0.01)),
                 Dust {
                     vel,
                     age: 0.0,
