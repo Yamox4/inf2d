@@ -6,7 +6,7 @@
 //! quality / stats resources; register it **first** in the app so subsequent
 //! plugins observe non-default `QualitySettings` at their own `build` time.
 
-use bevy::platform::collections::HashSet;
+use bevy::platform::collections::HashMap;
 use bevy::prelude::*;
 
 /// Explicit ordering backbone for the `Update` schedule. Every `Update` system
@@ -36,8 +36,51 @@ pub enum GameSet {
 /// Lives in `inf3d_core` because pathfinding is *upstream* of render and so
 /// cannot depend on it — the data crosses the dependency direction through this
 /// shared resource (the same pattern as [`FollowTarget`]).
+///
+/// **Refcounted.** The map value is the number of distinct prop discs (across
+/// any number of foliage tiles) currently claiming that cell. A cell is
+/// impassable iff its count is `> 0`. Refcounting is mandatory because one cell
+/// can legitimately sit inside two props' inflated footprints — both within a
+/// single tile AND across a tile boundary (a prop in an edge column inflates its
+/// disc by `PLAYER_RADIUS` and spills into the neighbouring tile). Without the
+/// count, the first tile to despawn would clear a cell the surviving neighbour
+/// still occupies, routing the pathfinder straight into a still-present trunk.
+/// Claim with [`BlockedCells::claim`], release with [`BlockedCells::release`].
 #[derive(Resource, Default)]
-pub struct BlockedCells(pub HashSet<IVec2>);
+pub struct BlockedCells(pub HashMap<IVec2, u32>);
+
+impl BlockedCells {
+    /// Claim `cell` for one prop disc, incrementing its refcount. Returns `true`
+    /// the first time the cell transitions from unclaimed → claimed (count went
+    /// `0 → 1`), so the caller can record it once per *tile* for later release.
+    pub fn claim(&mut self, cell: IVec2) -> bool {
+        let count = self.0.entry(cell).or_insert(0);
+        *count += 1;
+        *count == 1
+    }
+
+    /// Release one claim on `cell`, decrementing its refcount and removing the
+    /// entry only when it reaches zero (the last claimant left). A release with
+    /// no matching claim is ignored.
+    pub fn release(&mut self, cell: IVec2) {
+        if let Some(count) = self.0.get_mut(&cell) {
+            *count -= 1;
+            if *count == 0 {
+                self.0.remove(&cell);
+            }
+        }
+    }
+
+    /// Whether `cell` is currently claimed by at least one prop disc (impassable).
+    pub fn contains(&self, cell: IVec2) -> bool {
+        self.0.contains_key(&cell)
+    }
+
+    /// Iterate the currently-claimed (impassable) cells.
+    pub fn iter(&self) -> impl Iterator<Item = IVec2> + '_ {
+        self.0.keys().copied()
+    }
+}
 
 /// The current click-to-move destination cell `(x, z)`, or `None` when the
 /// player is idle / has arrived. Set by `inf3d_pathfinding` when a click
@@ -121,7 +164,9 @@ pub struct QualitySettings {
     /// Screen-space ambient occlusion. Gated on Medium+ (mirrors the old
     /// `bloom_enabled` proxy the camera used before real flags existed).
     pub ssao_enabled: bool,
-    /// Per-object / camera motion blur. Gated on Medium+ alongside SSAO.
+    /// Per-object / camera motion blur. **High-only** novelty: dubious for an
+    /// orthographic click-to-move game, so unlike SSAO (Medium+) it stays off
+    /// on Medium.
     pub motion_blur_enabled: bool,
     pub water_enabled: bool,
     pub water_amplitude: f32,
@@ -204,7 +249,10 @@ impl QualitySettings {
                 dof_enabled: false,
                 bloom_enabled: true,
                 ssao_enabled: true,
-                motion_blur_enabled: true,
+                // Motion blur is a High-only novelty: it's dubious for an
+                // orthographic click-to-move game (little camera/object screen
+                // velocity to smear), so Medium keeps SSAO but drops it.
+                motion_blur_enabled: false,
                 water_enabled: true,
                 water_amplitude: 0.35,
                 foliage_ring_max: 4,
@@ -285,6 +333,55 @@ impl Plugin for CorePlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_cells_refcount_survives_cross_tile_release() {
+        // Two tiles both claim the same boundary cell (a prop in each tile's edge
+        // column inflates into the shared cell). Releasing one tile's claim must
+        // NOT free the cell while the other tile still occupies it.
+        let cell = IVec2::new(7, 3);
+        let mut blocked = BlockedCells::default();
+
+        // Tile A's prop claims it first (0 -> 1, first-claim true).
+        assert!(blocked.claim(cell));
+        // Tile B's prop claims the same cell (1 -> 2, not first).
+        assert!(!blocked.claim(cell));
+        assert!(blocked.contains(cell));
+
+        // Tile A despawns / re-streams and releases its one claim.
+        blocked.release(cell);
+        // Tile B's prop is still physically there → cell stays blocked.
+        assert!(
+            blocked.contains(cell),
+            "cell freed while a neighbour tile's prop still occupies it"
+        );
+
+        // Tile B finally releases → now the cell is free.
+        blocked.release(cell);
+        assert!(!blocked.contains(cell));
+        assert!(blocked.0.is_empty(), "fully-released cell must drop its entry");
+    }
+
+    #[test]
+    fn blocked_cells_release_without_claim_is_ignored() {
+        let mut blocked = BlockedCells::default();
+        blocked.release(IVec2::new(1, 1));
+        assert!(blocked.0.is_empty());
+        assert!(!blocked.contains(IVec2::new(1, 1)));
+    }
+
+    #[test]
+    fn blocked_cells_iter_yields_claimed_cells_once() {
+        let mut blocked = BlockedCells::default();
+        let a = IVec2::new(0, 0);
+        let b = IVec2::new(2, 5);
+        blocked.claim(a);
+        blocked.claim(a); // double-claimed, still one logical cell
+        blocked.claim(b);
+        let mut got: Vec<IVec2> = blocked.iter().collect();
+        got.sort_by_key(|c| (c.x, c.y));
+        assert_eq!(got, vec![a, b]);
+    }
 
     #[test]
     fn cycle_visits_every_preset_and_returns_to_start() {
@@ -381,7 +478,8 @@ mod tests {
     }
 
     #[test]
-    fn ssao_and_motion_blur_gated_on_medium_and_high() {
+    fn ssao_gated_on_medium_and_high() {
+        // SSAO is worthwhile on the blocky terrain, so it turns on from Medium up.
         for (p, on) in [
             (QualityPreset::Potato, false),
             (QualityPreset::Low, false),
@@ -390,6 +488,20 @@ mod tests {
         ] {
             let s = QualitySettings::from_preset(p);
             assert_eq!(s.ssao_enabled, on, "ssao gate wrong for {:?}", p);
+        }
+    }
+
+    #[test]
+    fn motion_blur_gated_on_high_only() {
+        // Motion blur is a High-only novelty (dubious for an orthographic
+        // click-to-move game), so unlike SSAO it stays off on Medium.
+        for (p, on) in [
+            (QualityPreset::Potato, false),
+            (QualityPreset::Low, false),
+            (QualityPreset::Medium, false),
+            (QualityPreset::High, true),
+        ] {
+            let s = QualitySettings::from_preset(p);
             assert_eq!(
                 s.motion_blur_enabled, on,
                 "motion blur gate wrong for {:?}",

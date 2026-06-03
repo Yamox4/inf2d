@@ -170,7 +170,7 @@ pathfinding, `Terrain` in world, `WaterSettings` in water).
   (unwalkable) when its standing height ≤ `WATER_HEIGHT`. Players spawn on
   `nearest_land`.
 - **Render distance is per-preset** (`QualitySettings::render_distance_chunks`,
-  5/8/12/16 for Potato/Low/Medium/High) and read **once** at `WorldPlugin::build`
+  4/6/8/10 for Potato/Low/Medium/High) and read **once** at `WorldPlugin::build`
   — `bevy_voxel_world` can't re-register, so changing it needs a restart. It is
   modest **on purpose**: the orthographic iso view is shallow (at max zoom-out it
   spans only ~3 chunks), so a large radius is wasted. Terrain **LOD** (octave

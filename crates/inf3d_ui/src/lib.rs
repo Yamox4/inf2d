@@ -2,8 +2,11 @@ use std::collections::VecDeque;
 
 use bevy::diagnostic::{
     Diagnostic, DiagnosticPath, Diagnostics, DiagnosticsStore, EntityCountDiagnosticsPlugin,
-    FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin, RegisterDiagnostic,
+    FrameTimeDiagnosticsPlugin, RegisterDiagnostic,
 };
+// Dev-only console diagnostics spam; gated to debug builds at its use site.
+#[cfg(debug_assertions)]
+use bevy::diagnostic::LogDiagnosticsPlugin;
 use bevy::prelude::*;
 use bevy_voxel_world::prelude::Chunk;
 
@@ -41,14 +44,19 @@ struct HudStats {
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
+        // The HUD reads these every frame, so they're always compiled in.
         app.add_plugins((
             FrameTimeDiagnosticsPlugin::default(),
             EntityCountDiagnosticsPlugin::default(),
-            // Streams every registered metric to the console each second, so the
-            // whole live game state is visible from logs.
-            LogDiagnosticsPlugin::default(),
-        ))
-        .register_diagnostic(Diagnostic::new(DIAG_CHUNKS))
+        ));
+
+        // `LogDiagnosticsPlugin` streams every registered metric to the console
+        // each second — useful while developing, but noisy console spam in a
+        // shipped build. Dev-only (debug builds): release builds stay quiet.
+        #[cfg(debug_assertions)]
+        app.add_plugins(LogDiagnosticsPlugin::default());
+
+        app.register_diagnostic(Diagnostic::new(DIAG_CHUNKS))
         .register_diagnostic(Diagnostic::new(DIAG_MESHES))
         .init_resource::<HudStats>()
         .add_systems(Startup, spawn_hud)
@@ -158,7 +166,7 @@ fn update_frame_stats(
     stats.ms_p95 = p95;
 }
 
-/// F2 cycles the active quality preset (Potato → Low → Medium → High → Ultra →
+/// F2 cycles the active quality preset (Potato → Low → Medium → High →
 /// Potato). `QualitySettings` is mutated by-value so other systems can react
 /// via `is_changed()`; render distance specifically is read once at startup
 /// and won't move until the binary restarts.
@@ -225,7 +233,7 @@ fn update_hud(
     let on_off = |b: bool| if b { "on" } else { "off" };
 
     text.0 = format!(
-        "FPS: {:.0}  ({:.1} ms, p95 {:.1} ms)\nEntities: {:.0}   Chunks: {}\nPlayer: ({:.1}, {:.1}, {:.1})  cell=({}, {})\nQuality: {}  rd={}  SSAO {}  MB {}  [F2]\n{}",
+        "FPS: {:.0}  ({:.1} ms, p95 {:.1} ms)\nEntities: {:.0}   Chunks: {}\nPlayer: ({:.1}, {:.1}, {:.1})  cell=({}, {})\nQuality: {}  rd={} (restart)  SSAO {}  MB {}  [F2]\n{}",
         fps,
         frame_ms,
         frame.ms_p95,

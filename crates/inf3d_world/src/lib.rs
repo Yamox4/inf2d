@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use bevy::{
-    light::{CascadeShadowConfigBuilder, VolumetricLight},
+    light::CascadeShadowConfigBuilder,
     platform::collections::HashMap,
     prelude::*,
 };
@@ -155,7 +155,14 @@ impl VoxelWorldConfig for MainWorld {
         // of the ring streams in/out by pure distance (see the despawn/spawn
         // strategies below), never by frustum — so detail doesn't pop at the
         // edge of the (wide) isometric view.
-        6
+        //
+        // PRESET-SCALED: render distance is preset-driven (Potato 4 … High 10).
+        // A fixed `6` would meet or exceed the spawn radius on Potato (4) / Low
+        // (6), so the protected core would be as large as — or larger than — the
+        // whole spawned disc, which is contradictory. Derive it from the spawn
+        // radius instead and clamp it safely below: keep a >= 1 core but always
+        // leave a couple of rings that can stream by distance.
+        self.render_distance_chunks.saturating_sub(2).max(1)
     }
 
     fn chunk_despawn_strategy(&self) -> ChunkDespawnStrategy {
@@ -200,6 +207,25 @@ impl VoxelWorldConfig for MainWorld {
         // never clamps" guarantee holds on every preset, not just Medium.
         let span = 2 * self.render_distance_chunks as usize + 1;
         span * span + 32
+    }
+
+    fn chunk_y_bounds(&self) -> Option<(i32, i32)> {
+        // PERF (vertical clamp — the big structural win): stock bevy_voxel_world
+        // spawns a full 3D SPHERE of chunk entities around the camera, but this
+        // is a heightfield world — all terrain lives in a shallow, FIXED band of
+        // chunk layers regardless of where the (always-overhead) camera sits, so
+        // most of the sphere is empty air above / fully-solid invisible chunks
+        // below. This (vendored-fork) hook clamps streaming to that band.
+        //
+        // Chunks are 32 voxels tall. Solid terrain spans `SEA_FLOOR_MIN` (-8,
+        // chunk -1) up through the noise surface (`sample_height` = noise*50,
+        // realistically < ~100, chunk <= 3). Below chunk -1 every column is
+        // fully solid and has no exposed faces (invisible); the player walks the
+        // analytic surface, so we never need those underground chunks. Band
+        // `[-1, 3]` (world y -32..127) covers every visible face with headroom
+        // for the tallest peaks while dropping the ~12 wasted layers the sphere
+        // would otherwise stream.
+        Some((-1, 3))
     }
 
     /// Select a voxel LOD from the chunk's distance to the camera. Band width
@@ -343,8 +369,16 @@ fn setup_lighting(mut commands: Commands) {
     // world units and produces a grid-like speckle pattern on the voxel terrain
     // (visible as a "second grey layer" over the green), and the shadow pass
     // itself becomes very expensive. 120 is plenty for the iso view.
+    // PERF: the directional shadow re-renders every visible chunk once PER
+    // CASCADE, so both the cascade reach and the cascade count multiply the
+    // shadow pass cost. For this shallow iso view the camera only ever sees a
+    // few chunks, so we trim conservatively: 80 world units still extends well
+    // beyond the visible area (the camera sits ~40 units out and looks down a
+    // shallow slope), and 2 cascades keep near-detail crisp without paying for
+    // the default 4 cascades' worth of extra terrain re-renders.
     let cascade_shadow_config = CascadeShadowConfigBuilder {
-        maximum_distance: 120.0,
+        maximum_distance: 80.0,
+        num_cascades: 2,
         ..default()
     }
     .build();
@@ -359,12 +393,10 @@ fn setup_lighting(mut commands: Commands) {
         },
         Transform::from_xyz(0.0, 0.0, 0.0).looking_at(Vec3::new(-0.15, -0.1, 0.15), Vec3::Y),
         cascade_shadow_config,
-        // Lets the sun scatter through the volumetric fog (god-ray feel).
-        VolumetricLight,
     ));
 
-    // Cool, lifted ambient so shadowed basins read as foggy haze rather than
-    // pure black (pairs with the atmospheric fog).
+    // Cool, lifted ambient so shadowed basins read as soft haze rather than
+    // pure black.
     commands.insert_resource(GlobalAmbientLight {
         color: Color::srgb(0.80, 0.86, 0.96),
         brightness: 350.0,
@@ -374,13 +406,19 @@ fn setup_lighting(mut commands: Commands) {
 
 /// Per-chunk voxel lookup closure (runs on worker threads). Solidity and the
 /// land/water split both derive from the shared [`inf3d_worldgen`] column
-/// helpers, so the meshed geometry and material choice can never desync from
-/// the [`Terrain`] oracle that pathfinding/standing read.
+/// helpers ([`ColumnKind`]), so the *classification* (land vs water) a player
+/// stands/pathfinds on agrees with the material picked for each meshed voxel.
 ///
-/// `lod` selects how many noise octaves feed the height field: coarser (higher)
-/// LODs drop high-frequency octaves, which is cheaper and avoids baking detail
-/// the downsampled chunk mesh can't show. The seafloor/water threshold logic is
-/// LOD-independent so coastlines stay put.
+/// Two honest caveats to that agreement:
+///   - The meshed seafloor descends to `SEA_FLOOR_MIN`, which is below the
+///     oracle's `surface_y.max(0)` for submerged columns. Harmless: those
+///     columns are unwalkable water, so gameplay never reads that deep bottom.
+///   - `lod` selects how many noise octaves feed the height field (coarser LODs
+///     drop high-frequency octaves — cheaper, and they avoid baking detail the
+///     downsampled mesh can't show). Because that changes the sampled height, a
+///     far chunk's *visual* coastline can shift slightly from the full-res one.
+///     The gameplay oracle ([`Terrain`]) always samples LOD-0 noise, so
+///     navigation stays consistent with the finest (near-camera) geometry.
 fn get_voxel_fn(lod: u8) -> Box<dyn FnMut(IVec3, Option<WorldVoxel>) -> WorldVoxel + Send + Sync> {
     let noise = build_noise_lod(lod);
     let mut cache = HashMap::<(i32, i32), f64>::new();

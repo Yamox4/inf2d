@@ -7,7 +7,6 @@ use bevy::window::{PresentMode, Window, WindowPlugin};
 use inf3d_camera::IsoCameraPlugin;
 use inf3d_core::CorePlugin;
 use inf3d_gameplay::PlayerPlugin;
-use inf3d_monitor::MonitorPlugin;
 use inf3d_pathfinding::PathfindPlugin;
 use inf3d_physics::PhysicsGamePlugin;
 use inf3d_render::{DustPlugin, FogPlugin, FoliagePlugin, HighlightPlugin, WaterPlugin};
@@ -15,7 +14,8 @@ use inf3d_ui::HudPlugin;
 use inf3d_world::WorldPlugin;
 
 fn main() {
-    App::new()
+    let mut app = App::new();
+    app
         // AutoVsync for normal play: caps FPS at the monitor refresh so the
         // engine idles between frames instead of pinning CPU+GPU at 100% (which
         // magnifies every other cost and causes thermal throttling). Set
@@ -59,10 +59,16 @@ fn main() {
         .add_plugins(FogPlugin)
         .add_plugins(HudPlugin)
         .add_plugins(WaterPlugin)
-        .add_plugins(FoliagePlugin)
-        // Read-only telemetry recorder — writes `inf3d-monitor.log` each run.
-        // Added last so it observes every other plugin's state. Disable with
-        // `INF3D_NO_MONITOR=1`.
-        .add_plugins(MonitorPlugin)
-        .run();
+        .add_plugins(FoliagePlugin);
+
+    // Read-only telemetry recorder — writes `inf3d-monitor.log` each run. Added
+    // last so it observes every other plugin's state. Compiled in only with the
+    // `telemetry` feature (on by default for developers; a shipping build uses
+    // `--no-default-features` to drop it entirely). When it IS compiled in, the
+    // recorder still honors the `INF3D_NO_MONITOR=1` runtime opt-out internally.
+    // Inline path so there's no always-compiled top-level `use` to gate.
+    #[cfg(feature = "telemetry")]
+    app.add_plugins(inf3d_monitor::MonitorPlugin);
+
+    app.run();
 }

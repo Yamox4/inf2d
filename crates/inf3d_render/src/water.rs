@@ -62,7 +62,7 @@ fn init_water_settings(mut commands: Commands, quality: Res<QualitySettings>) {
         height: WATER_HEIGHT,
         // Quality-driven swell size. The voxel scale is 1x1x1 so the default
         // bevy_water amplitude of 1.0 is huge — presets keep it in the
-        // 0.06..0.15 range.
+        // 0.20..0.45 range (0.20/0.35/0.45 for Low/Medium/High).
         amplitude: quality.water_amplitude,
         // BRIGHT base tint so the water always reads "lit up" rather than going
         // dark at angles where the sun glint doesn't hit — the user wants the

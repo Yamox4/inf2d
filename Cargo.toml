@@ -110,3 +110,13 @@ opt-level = 3
 codegen-units = 1
 lto = "thin"
 strip = "debuginfo"
+
+# Local fork of bevy_voxel_world 0.16.0 (vendored under vendor/) adding an
+# optional `chunk_y_bounds()` config hook so the streamed chunk region can be
+# clamped to a shallow vertical slab instead of a full 3D sphere — the iso view
+# is shallow and the stock sphere spawned ~2100 chunk entities, ~87% empty air
+# above/below the thin terrain. The patch is additive (default `None` = stock
+# behavior); see vendor/bevy_voxel_world for the diff. Keep the version matching
+# the crates.io requirement (`bevy_voxel_world = "0.16"`).
+[patch.crates-io]
+bevy_voxel_world = { path = "vendor/bevy_voxel_world" }

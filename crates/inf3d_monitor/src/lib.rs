@@ -39,6 +39,7 @@ use inf3d_core::{QualityPreset, QualitySettings, Rock, Tree};
 use inf3d_gameplay::{MovePath, Player};
 use inf3d_physics::{CharacterController, DesiredMove, InteractionTarget};
 use inf3d_pathfinding::PathTiming;
+use inf3d_render::FoliageTile;
 use inf3d_world::MainWorld;
 
 /// Log file name (created in the process working directory, overwritten per run).
@@ -200,7 +201,7 @@ fn record_frame(
         Query<(), With<Chunk<MainWorld>>>,
         Query<(), With<Tree>>,
         Query<(), With<Rock>>,
-        Query<&Name>,
+        Query<(), With<FoliageTile>>,
     ),
     q_player: Query<(&Transform, &Player, &CharacterController, &DesiredMove, &MovePath)>,
     q_cam: Query<(&Projection, &GlobalTransform), With<IsoCamera>>,
@@ -210,7 +211,7 @@ fn record_frame(
     }
     let (water, path_timing, interaction) = opt_res;
     let (meshes, materials, images) = assets;
-    let (q_all, q_mesh, q_chunk, q_tree, q_rock, q_names) = count_q;
+    let (q_all, q_mesh, q_chunk, q_tree, q_rock, q_tiles) = count_q;
 
     let dt_ms = time.delta_secs() * 1000.0;
     let elapsed = time.elapsed_secs();
@@ -237,10 +238,7 @@ fn record_frame(
         entities: q_all.iter().count() as i64,
         meshes: q_mesh.iter().count() as i64,
         chunks: q_chunk.iter().count() as i64,
-        foliage_tiles: q_names
-            .iter()
-            .filter(|name| name.as_str().starts_with("FoliageTile"))
-            .count() as i64,
+        foliage_tiles: q_tiles.iter().count() as i64,
         trees: q_tree.iter().count() as i64,
         rocks: q_rock.iter().count() as i64,
     };

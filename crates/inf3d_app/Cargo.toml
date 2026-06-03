@@ -22,4 +22,12 @@ inf3d_render = { workspace = true }
 inf3d_gameplay = { workspace = true }
 inf3d_pathfinding = { workspace = true }
 inf3d_ui = { workspace = true }
-inf3d_monitor = { workspace = true }
+# Optional: the telemetry recorder is a DEV/profiling tool (it writes
+# `inf3d-monitor.log` each run). Gated behind the `telemetry` feature so a
+# shipping build (`--no-default-features`) excludes it entirely. On by default
+# for developers.
+inf3d_monitor = { workspace = true, optional = true }
+
+[features]
+default = ["telemetry"]
+telemetry = ["dep:inf3d_monitor"]

@@ -7,6 +7,6 @@ mod water;
 
 pub use dust::{DustBurst, DustPlugin};
 pub use fog::FogPlugin;
-pub use foliage::FoliagePlugin;
+pub use foliage::{FoliagePlugin, FoliageTile};
 pub use highlight::{HighlightPlugin, Hover};
 pub use water::WaterPlugin;

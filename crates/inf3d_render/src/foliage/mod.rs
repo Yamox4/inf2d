@@ -14,10 +14,33 @@
 //! and use `dot_vox` ourselves.
 //!
 //! Each variant is loaded once at startup. Spawned props are scattered around
-//! the player on a tile-ring (see [`stream`]) and parented to a per-tile entity
-//! so leaving the ring cascades the despawn. The ring scales with the camera's
-//! orthographic viewport so that zooming out shows props all the way to the
-//! screen edges (clamped per quality preset).
+//! the player and parented to a per-tile entity so leaving a ring cascades the
+//! despawn.
+//!
+//! ## Two independent streaming layers
+//!
+//! Foliage streams as **two genuinely independent layers**, each with its own
+//! tile field, its own ring, and its own per-frame budgets:
+//!
+//! * **Solid layer** ([`SolidField`]) — trees + rocks. Streamed in a
+//!   **zoom-driven** ring ([`stream::compute_ring`] from
+//!   [`QualitySettings::foliage_ring_max`](inf3d_core::QualitySettings)) so
+//!   zooming out shows props all the way to the iso-view edges. Solid props get
+//!   per-prop colliders ([`SolidPropCollider`](inf3d_physics::SolidPropCollider))
+//!   and record footprint-inflated [`BlockedCells`](inf3d_core::BlockedCells) for
+//!   the pathfinder.
+//! * **Grass layer** ([`GrassField`]) — grass only. Streamed in a
+//!   **player-centered, zoom-INDEPENDENT** ring whose radius is
+//!   `ceil(grass_radius_world / TILE)` tiles, so the dense grass carpet is a
+//!   fixed-size disc that simply follows the player. Grass gets NO collider and
+//!   records NO blocked cells; a grass tile despawns the moment it leaves the
+//!   grass ring.
+//!
+//! Splitting the layers is what removes the old whole-tile re-stream churn: the
+//! solid ring (zoom-driven) and the grass disc (player-driven) move at different
+//! rates, but neither ever touches the other's entities. A grass tile appearing
+//! or disappearing never disturbs a tree/rock collider or its blocked cells, and
+//! a solid tile never re-streams for a grass reason.
 //!
 //! ## Streaming performance (async scatter + budgeting + hysteresis)
 //!
@@ -25,23 +48,25 @@
 //! `TILE*TILE` (256) five-octave Perlin lookups deciding, for each column,
 //! whether it's land and what prop (if any) sits there. That used to run
 //! synchronously inside the `Update` system and hitched the render thread
-//! whenever the player crossed a tile boundary (and especially on first spawn /
-//! zoom-out, when the whole ring streamed at once).
+//! whenever the player crossed a tile boundary.
 //!
-//! Now the scatter runs on a [`bevy::tasks::AsyncComputeTaskPool`] worker
-//! (mirroring `inf3d_pathfinding`): the streamer snapshots the cheap-to-clone
-//! [`Terrain`](inf3d_worldgen::Terrain) oracle into a task, the worker returns a
-//! plain `Vec<ScatterItem>` (no ECS), and the main thread only spawns entities
-//! from that list. Determinism is preserved because the seed derives purely from
-//! the tile coordinate. Tile *task starts* are budgeted per frame
-//! (nearest-to-center first), so a big zoom-out fills the ring over several
-//! frames instead of in one stall.
+//! Both layers run their scatter on a [`bevy::tasks::AsyncComputeTaskPool`]
+//! worker (mirroring `inf3d_pathfinding`): the streamer snapshots the
+//! cheap-to-clone [`Terrain`](inf3d_worldgen::Terrain) oracle into a task, the
+//! worker returns a plain `Vec<ScatterItem>` (no ECS), and the main thread only
+//! spawns entities from that list. Determinism is preserved because each tile's
+//! seed derives purely from the tile coordinate — and crucially the SAME seed
+//! derivation is shared by both layers, so a tile's grass is stable whether or
+//! not its solid props are currently streamed. Tile *task starts* and *despawns*
+//! are budgeted per frame (nearest-to-center first), so a big zoom-out or a fast
+//! walk fills/clears each ring over several frames instead of in one stall.
 //!
 //! ## Module layout
 //!
 //! * [`vox_mesh`] — parse `.vox` files and build cull-face meshes at load time.
-//! * [`scatter`] — the off-thread per-tile scatter worker (pure data, no ECS).
-//! * [`stream`] — the streaming system that rings tiles in/out around the camera.
+//! * [`scatter`] — the off-thread per-tile scatter workers (pure data, no ECS):
+//!   one for the solid layer, one for the grass layer.
+//! * [`stream`] — the two streaming systems (solid + grass) that ring tiles in/out.
 //! * [`spawn`] — main-thread replay of [`ScatterItem`]s into real entities.
 
 use std::collections::HashMap;
@@ -55,6 +80,10 @@ mod scatter;
 mod spawn;
 mod stream;
 mod vox_mesh;
+
+/// Per-tile parent marker (re-exported from the crate root) so downstream
+/// telemetry can count foliage tiles by component instead of by name.
+pub use spawn::FoliageTile;
 
 /// Side length of one streaming tile, in voxel columns.
 const TILE: i32 = 16;
@@ -96,6 +125,11 @@ struct FoliageAssets {
 /// data out of the worker so the main thread can index the right `Vec` in
 /// [`FoliageAssets`]; the variant *index* within the category was already
 /// chosen (deterministically) by the worker.
+///
+/// The solid scatter worker emits only [`Tree`](ScatterCategory::Tree) /
+/// [`Rock`](ScatterCategory::Rock); the grass scatter worker emits only
+/// [`Grass`](ScatterCategory::Grass). The enum stays unified so [`spawn`] can
+/// replay either layer's items through one path.
 #[derive(Clone, Copy)]
 enum ScatterCategory {
     Tree,
@@ -115,60 +149,65 @@ struct ScatterItem {
 }
 
 /// Snapshot of the per-variant footprint *sizes* (post-scale bounding boxes)
-/// the worker needs to (a) pick a variant index and (b) run the SAME solid-prop
-/// overlap test the synchronous spawner used. Cloned into the task alongside the
-/// [`Terrain`](inf3d_worldgen::Terrain) so the worker touches no ECS / asset
-/// state. Cheap: a few `Vec3`s.
+/// the SOLID worker needs to (a) pick a variant index and (b) run the SAME
+/// solid-prop overlap test the synchronous spawner used. Cloned into the task
+/// alongside the [`Terrain`](inf3d_worldgen::Terrain) so the worker touches no
+/// ECS / asset state. Cheap: a few `Vec3`s.
 #[derive(Clone)]
-struct VariantSizes {
+struct SolidVariantSizes {
     trees: Vec<Vec3>,
     rocks: Vec<Vec3>,
-    grass: Vec<Vec3>,
+}
+
+/// Per-tile seed derived purely from the tile coordinate. Shared by BOTH scatter
+/// workers so a tile's grass is stable whether or not its solid layer is
+/// currently streamed (and vice versa). The two workers then advance their own
+/// RNG streams independently — the solid layer's tree/rock placement is never
+/// perturbed by the grass layer, and grass is bit-identical run to run.
+fn tile_seed(tile: IVec2) -> u64 {
+    (tile.x as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (tile.y as i64 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
 }
 
 /// An in-flight (or just-finished) per-tile scatter computation running on the
 /// [`AsyncComputeTaskPool`](bevy::tasks::AsyncComputeTaskPool). Mirrors
 /// `inf3d_pathfinding::ActivePathTask`: we hold the [`Task`] handle and poll it
 /// once per frame with `block_on(poll_once(..))`; when it resolves we spawn the
-/// entities.
+/// entities. Used by both layers.
 struct TileScatterTask {
     task: Task<Vec<ScatterItem>>,
-    /// The scatter-time grass eligibility this task was started with: `true` when
-    /// the tile was NOT cheap-LOD (inside both `foliage_lod_distance` and
-    /// `grass_radius_world`), so the worker scattered grass. Carried through to
-    /// [`TileState::Live`] so the streamer can later detect when a Live tile's
-    /// CURRENT eligibility has changed and needs re-streaming (the grass-cap
-    /// coverage fix).
-    with_grass: bool,
 }
 
-/// State a tile occupies in the streaming field. Tiles flow
+/// State a SOLID tile occupies in [`SolidField`]. Tiles flow
 /// `Pending` (scatter task in flight) → `Live` (entities spawned, parent held).
 ///
 /// `Live` also carries the voxel cells its SOLID props occupy, so that when the
 /// tile despawns we can remove exactly those cells from
 /// [`BlockedCells`](inf3d_core::BlockedCells) (the shared resource the
-/// pathfinder reads). Grass cells are never recorded.
-///
-/// `Live` additionally records the grass eligibility it was streamed with
-/// (`with_grass`). Grass eligibility is decided at scatter time, but a tile that
-/// streamed grass-free at the (zoom-driven) ring edge must GAIN grass as the
-/// player walks toward it — and a tile that streamed with grass must shed it when
-/// the player walks away. The streamer compares this stored flag against the
-/// tile's CURRENT eligibility each frame and re-streams the few tiles that crossed
-/// the boundary (see [`stream`]).
-enum TileState {
+/// pathfinder reads).
+enum SolidTileState {
     Pending(TileScatterTask),
-    Live {
-        entity: Entity,
-        cells: Vec<IVec2>,
-        with_grass: bool,
-    },
+    Live { entity: Entity, cells: Vec<IVec2> },
 }
 
+/// State a GRASS tile occupies in [`GrassField`]. Like [`SolidTileState`] but
+/// grass records NO blocked cells and gets NO collider, so `Live` carries only
+/// the parent entity to cascade-despawn when the tile leaves the grass ring.
+enum GrassTileState {
+    Pending(TileScatterTask),
+    Live { entity: Entity },
+}
+
+/// The SOLID streaming field (trees + rocks), ringed by camera zoom.
 #[derive(Resource, Default)]
-struct FoliageField {
-    tiles: HashMap<IVec2, TileState>,
+struct SolidField {
+    tiles: HashMap<IVec2, SolidTileState>,
+}
+
+/// The GRASS streaming field, ringed in a fixed-size player-centered disc.
+#[derive(Resource, Default)]
+struct GrassField {
+    tiles: HashMap<IVec2, GrassTileState>,
 }
 
 /// Horizontal footprint radius of a prop from its post-scale bounding box
@@ -184,10 +223,15 @@ pub struct FoliagePlugin;
 impl Plugin for FoliagePlugin {
     fn build(&self, app: &mut App) {
         // `QualitySettings` and `BlockedCells` are owned (init) by `CorePlugin`;
-        // foliage only reads them. `FoliageField` is foliage's own state.
-        app.init_resource::<FoliageField>()
+        // foliage only reads them. `SolidField` / `GrassField` are foliage's own
+        // state — one per layer.
+        app.init_resource::<SolidField>()
+            .init_resource::<GrassField>()
             .add_systems(Startup, setup_foliage)
-            .add_systems(Update, stream::stream_foliage.in_set(GameSet::Streaming));
+            .add_systems(
+                Update,
+                (stream::stream_solid, stream::stream_grass).in_set(GameSet::Streaming),
+            );
     }
 }
 

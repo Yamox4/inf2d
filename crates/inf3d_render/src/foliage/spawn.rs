@@ -1,10 +1,12 @@
 //! Main-thread replay of [`ScatterItem`]s into real entities.
 //!
-//! The worker ([`super::scatter`]) decides *what* goes *where*; this module owns
-//! the ECS side: spawning the per-tile parent and each prop's mesh + material +
-//! collider request. Solid props (trees, rocks) get a [`SolidPropCollider`] that
-//! the physics crate turns into a real collider; grass gets none, so the player
-//! walks through it.
+//! The scatter workers ([`super::scatter`]) decide *what* goes *where*; this
+//! module owns the ECS side: spawning the per-tile parent and each prop's mesh +
+//! material + collider request. It's shared by BOTH streaming layers — the solid
+//! layer feeds it tree/rock items, the grass layer feeds it grass items — and the
+//! per-item branch below routes each category correctly: solid props (trees,
+//! rocks) get a [`SolidPropCollider`] the physics crate turns into a real
+//! collider, while grass gets none so the player walks through it.
 
 use bevy::prelude::*;
 
@@ -15,8 +17,14 @@ use super::{footprint_radius, FoliageAssets, FoliageVariant, ScatterCategory, Sc
 
 /// Marker on a per-tile parent entity. Despawning it cascades to every prop
 /// scattered under that tile (the streamer relies on this for unloading).
+///
+/// Public + re-exported from the crate root so downstream sinks (e.g.
+/// `inf3d_monitor`) can count foliage tiles with
+/// `Query<(), With<inf3d_render::FoliageTile>>` instead of a fragile
+/// `Name`-prefix scan. Attached to EVERY tile parent (both the solid and grass
+/// layers go through [`spawn_tile_entities`]).
 #[derive(Component)]
-struct FoliageTile;
+pub struct FoliageTile;
 
 /// Which kind of static collider a solid prop requests. Grass is represented by
 /// `None` at the call site and gets no collider at all.

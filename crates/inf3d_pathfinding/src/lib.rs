@@ -25,7 +25,13 @@ use inf3d_worldgen::Terrain;
 /// Max |Δheight| (in voxels) allowed between adjacent cells when walking.
 pub const MAX_STEP: i32 = 1;
 /// Safety bound on A* expansion so a click into the void can't hang the worker.
-pub const MAX_EXPANSIONS: usize = 20_000;
+/// The search runs off-thread on an [`AsyncComputeTaskPool`] worker, so this can
+/// be generous: a far/blocked click that would otherwise fail silently at a low
+/// cap gets enough budget to actually find (or rule out) a route.
+pub const MAX_EXPANSIONS: usize = 60_000;
+/// Max ring radius (in cells) the goal-snap spiral searches before giving up.
+/// Bounds the cost of snapping a click on water/props to a reachable cell.
+pub const MAX_GOAL_SNAP: i32 = 32;
 
 pub struct PathfindPlugin;
 
@@ -153,16 +159,25 @@ fn dispatch_path_task(
     // Snapshot the prop-blocked cells so the worker (which touches no ECS) can
     // treat them as impassable. The resident set is bounded by the foliage ring,
     // so this clone is small.
-    let blocked_snapshot: HashSet<IVec2> = blocked.0.iter().copied().collect();
+    let blocked_snapshot: HashSet<IVec2> = blocked.iter().collect();
     let pool = AsyncComputeTaskPool::get();
     let task = pool.spawn(async move {
         let started = Instant::now();
-        let (cells, expansions) =
-            astar(&terrain_snapshot, req.start, req.goal, &blocked_snapshot);
+        // Snap the goal to the nearest walkable, unblocked cell so clicking a
+        // tree/rock walks to a reachable spot beside it and clicking water walks
+        // to the shore. If nothing suitable is in range, fall back to the raw
+        // goal — A* will then report no path (existing behavior).
+        let goal = snap_goal(&terrain_snapshot, req.goal, &blocked_snapshot).unwrap_or(req.goal);
+        let (cells, expansions) = astar(&terrain_snapshot, req.start, goal, &blocked_snapshot);
+        // String-pull the blocky 8-connected route into long straight diagonals
+        // (Diablo feel) while keeping every dropped corner's clearance. No-op for
+        // `None`/empty routes.
+        let cells =
+            cells.map(|route| smooth_path(&terrain_snapshot, &route, &blocked_snapshot));
         let elapsed_ms = started.elapsed().as_secs_f32() * 1000.0;
         PathSearchResult {
             cells,
-            goal: req.goal,
+            goal,
             expansions,
             elapsed_ms,
             terrain: terrain_snapshot,
@@ -197,11 +212,15 @@ fn poll_path_task(
     };
 
     let Some(cells) = result.cells else {
-        // No route or expansion cap hit — nothing to send. Caller already sees
-        // the timing update.
-        trace!(
-            "pathfinding: no path (expansions = {}, {:.2} ms)",
-            result.expansions, result.elapsed_ms
+        // No route — truly unreachable or the expansion cap was hit. Leave
+        // `PathTarget` unset (untouched) so no false destination marker appears,
+        // and surface the failure explicitly: a click that goes nowhere should be
+        // visible, not silent. `info!` (not `trace!`) so it shows by default; the
+        // expansion count distinguishes "cap hit" (== MAX_EXPANSIONS) from "no
+        // route" (< cap, open set drained). The timing update already landed.
+        info!(
+            "pathfinding: no path to goal {:?} (expansions = {}/{}, {:.2} ms)",
+            result.goal, result.expansions, MAX_EXPANSIONS, result.elapsed_ms
         );
         return;
     };
@@ -301,17 +320,71 @@ impl SurfaceOracle for Terrain {
     }
 }
 
+/// Snap a requested goal to the nearest cell that is BOTH walkable
+/// (`is_land`) AND not in `blocked` (a cell the player capsule can actually
+/// occupy). Returns `goal` unchanged when it is already suitable, otherwise the
+/// nearest suitable cell found by a bounded outward ring search, or `None` if
+/// none lies within [`MAX_GOAL_SNAP`] cells.
+///
+/// Mirrors [`Terrain::nearest_land`]: each radius `r` scans only the perimeter
+/// of the radius-`r` square (O(perimeter), not O((2r+1)^2)) with `dx` ascending
+/// then `dz` ascending, so equidistant ties resolve deterministically.
+fn snap_goal<O: SurfaceOracle>(
+    terrain: &O,
+    goal: IVec2,
+    blocked: &HashSet<IVec2>,
+) -> Option<IVec2> {
+    let suitable = |c: IVec2| terrain.is_land(c.x, c.y) && !blocked.contains(&c);
+    if suitable(goal) {
+        return Some(goal);
+    }
+    for r in 1..=MAX_GOAL_SNAP {
+        for dx in -r..=r {
+            if dx.abs() == r {
+                // Left/right edge columns: every dz lies on the ring.
+                for dz in -r..=r {
+                    let c = IVec2::new(goal.x + dx, goal.y + dz);
+                    if suitable(c) {
+                        return Some(c);
+                    }
+                }
+            } else {
+                // Interior columns: only the top/bottom rows lie on the ring.
+                for dz in [-r, r] {
+                    let c = IVec2::new(goal.x + dx, goal.y + dz);
+                    if suitable(c) {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// 8-connected A* over the terrain surface grid.
 ///
 /// Cells are `(x, z)` columns; heights come from [`SurfaceOracle::surface_y`].
 /// An edge `a → b` is walkable iff `|surface_y(a) - surface_y(b)| <= MAX_STEP`
-/// and `b` is not in `blocked` (solid-prop cells), unless `b` is the `start` or
-/// `goal` cell (the escape hatch that keeps the player from being trapped).
+/// and `b` is not in `blocked` — where `blocked` is the set of cells the PLAYER
+/// CAPSULE cannot occupy (prop footprints already inflated by the player
+/// radius). The only escape hatch is `start`: a player standing on a prop cell
+/// can always step off it. The `goal` gets no escape hatch — callers pass a goal
+/// already guaranteed walkable+unblocked by [`snap_goal`].
+///
+/// DIAGONAL CORNER-CUT PREVENTION: a diagonal move is allowed only when BOTH
+/// orthogonally-adjacent cells (`current + (dx,0)` and `current + (0,dz)`) are
+/// themselves walkable, unblocked, and within [`MAX_STEP`] of `current` — so the
+/// capsule never slips through a blocked/cliff corner between two props.
+///
 /// Step cost is `1.0` orthogonal / `SQRT_2` diagonal plus a height penalty of
 /// `0.5 * |Δheight|`. Returns `(cells, expansions)` where `cells` is the
 /// inclusive `start..=goal` path, or `None` if `goal == start`, no path exists,
 /// or the search exceeds [`MAX_EXPANSIONS`] pops. `expansions` is always the
 /// number of nodes popped from the open set (useful for diagnostics).
+///
+/// [`MAX_STEP`] is kept consistent with the physics `STEP_HEIGHT` so a route the
+/// solver accepts is one the player capsule can actually climb.
 fn astar<O: SurfaceOracle>(
     terrain: &O,
     start: IVec2,
@@ -347,18 +420,32 @@ fn astar<O: SurfaceOracle>(
         let current_g = *g_score.get(&current).unwrap_or(&f32::INFINITY);
         let h_current = terrain.surface_y(current.x, current.y);
 
+        // Whether `cell` is a surface the capsule may stand on, reachable from
+        // `current` in a single step: walkable land, not capsule-blocked, and
+        // within MAX_STEP of `current`'s height. The lone exception is `start`,
+        // which is always passable so a player atop a prop can step off.
+        let passable = |cell: IVec2| {
+            if !terrain.is_land(cell.x, cell.y) {
+                return false;
+            }
+            if blocked.contains(&cell) && cell != start {
+                return false;
+            }
+            (h_current - terrain.surface_y(cell.x, cell.y)).abs() <= MAX_STEP
+        };
+
         for offset in NEIGHBORS {
             let next = current + offset;
             // Water (seafloor flats below the water line) is not walkable.
             if !terrain.is_land(next.x, next.y) {
                 continue;
             }
-            // Solid props (trees/rocks) block their cell. Escape hatch: the
-            // start and goal cells are always allowed even if blocked, so the
-            // player is never trapped under a prop and can still path to a cell
-            // a prop happens to sit on (the goal). Any other blocked cell is
-            // impassable, forcing the route to detour around props.
-            if blocked.contains(&next) && next != start && next != goal {
+            // Cells the player capsule cannot occupy (inflated prop footprints)
+            // are impassable, forcing the route to detour around props. Escape
+            // hatch: `start` is always allowed so a player standing on a prop
+            // cell is never trapped. The goal carries no escape hatch — it was
+            // snapped to a walkable, unblocked cell before the search began.
+            if blocked.contains(&next) && next != start {
                 continue;
             }
             let h_next = terrain.surface_y(next.x, next.y);
@@ -368,6 +455,15 @@ fn astar<O: SurfaceOracle>(
             }
 
             let diagonal = offset.x != 0 && offset.y != 0;
+            // Corner-cut prevention: a diagonal step is only safe when both
+            // orthogonally-adjacent cells are themselves passable, so the
+            // capsule never clips a blocked/cliff corner between two props.
+            if diagonal
+                && (!passable(current + IVec2::new(offset.x, 0))
+                    || !passable(current + IVec2::new(0, offset.y)))
+            {
+                continue;
+            }
             let base = if diagonal {
                 std::f32::consts::SQRT_2
             } else {
@@ -385,6 +481,137 @@ fn astar<O: SurfaceOracle>(
     }
 
     (None, expansions)
+}
+
+/// String-pull a blocky 8-connected cell route into one with long straight
+/// diagonals. Greedily drop intermediate cells: from an anchor, advance the
+/// frontier as far as there is [`cell_line_of_sight`] from the anchor, then
+/// commit the last visible cell as the next anchor. Start and goal are always
+/// kept.
+///
+/// CLEARANCE: line-of-sight reuses the exact A* edge rules (`is_land`,
+/// not-`blocked`, and within [`MAX_STEP`] height across each grid step), so a
+/// smoothed shortcut never cuts a corner the capsule couldn't have walked. The
+/// `start` escape hatch is honored so a player on a blocked prop cell isn't
+/// pinned — only the anchor end may be the (possibly blocked) `start`.
+///
+/// Routes of `< 3` cells are already minimal and returned as-is.
+fn smooth_path<O: SurfaceOracle>(
+    terrain: &O,
+    route: &[IVec2],
+    blocked: &HashSet<IVec2>,
+) -> Vec<IVec2> {
+    if route.len() < 3 {
+        return route.to_vec();
+    }
+    let start = route[0];
+
+    let mut out = vec![start];
+    let mut anchor = 0usize;
+    while anchor < route.len() - 1 {
+        // Furthest cell still visible in a straight line from the anchor. Seed
+        // with `anchor + 1` so we always make progress even if the immediate
+        // next step somehow fails the check (it can't, but stay defensive).
+        let mut furthest = anchor + 1;
+        for j in (anchor + 2)..route.len() {
+            if cell_line_of_sight(terrain, route[anchor], route[j], start, blocked) {
+                furthest = j;
+            } else {
+                // Grid LOS is not strictly monotone for arbitrary obstacles, but
+                // stopping at the first occlusion keeps the route conservative
+                // (never optimistically skips past a wall it can't see through).
+                break;
+            }
+        }
+        out.push(route[furthest]);
+        anchor = furthest;
+    }
+    out
+}
+
+/// Whether the capsule can walk in a straight line from cell `a` to cell `b`,
+/// using the same clearance rules A* applies to a single step. Walks the
+/// supercover set of cells the segment `a → b` touches (a Bresenham variant that
+/// includes BOTH cells when the line crosses a grid corner, so no blocked corner
+/// is skipped) and checks each consecutive pair: every cell must be walkable
+/// land and not `blocked`, and each transition must stay within [`MAX_STEP`]
+/// height. `start` is exempt from the `blocked` test (the escape hatch).
+fn cell_line_of_sight<O: SurfaceOracle>(
+    terrain: &O,
+    a: IVec2,
+    b: IVec2,
+    start: IVec2,
+    blocked: &HashSet<IVec2>,
+) -> bool {
+    // A cell the capsule may stand on: walkable land and not blocked (except the
+    // `start` escape hatch). Height continuity is checked between consecutive
+    // cells below, mirroring A*'s per-edge MAX_STEP rule.
+    let standable = |c: IVec2| {
+        if !terrain.is_land(c.x, c.y) {
+            return false;
+        }
+        if blocked.contains(&c) && c != start {
+            return false;
+        }
+        true
+    };
+
+    let cells = supercover(a, b);
+    // Endpoints must themselves be standable; A* already guarantees this for the
+    // real route cells, but the supercover walk relies on it for the interior.
+    let mut prev: Option<IVec2> = None;
+    for c in cells {
+        if !standable(c) {
+            return false;
+        }
+        if let Some(p) = prev {
+            let dh = (terrain.surface_y(p.x, p.y) - terrain.surface_y(c.x, c.y)).abs();
+            if dh > MAX_STEP {
+                return false;
+            }
+        }
+        prev = Some(c);
+    }
+    true
+}
+
+/// Supercover line rasterization between two grid cells, inclusive of both
+/// endpoints. Unlike plain Bresenham (which may "jump" a diagonal and skip the
+/// two cells flanking a grid corner), this yields EVERY cell the continuous
+/// segment passes through — so a wall corner can never hide between two emitted
+/// cells. Steps one unit in x or z at a time (or both on an exact diagonal),
+/// driven by the running error term.
+fn supercover(a: IVec2, b: IVec2) -> Vec<IVec2> {
+    let mut x = a.x;
+    let mut z = a.y;
+    let dx = (b.x - a.x).abs();
+    let dz = (b.y - a.y).abs();
+    let sx = if b.x > a.x { 1 } else { -1 };
+    let sz = if b.y > a.y { 1 } else { -1 };
+
+    let mut cells = vec![IVec2::new(x, z)];
+    // `err` tracks dx - dz scaled by 2 so we never need fractions. When the line
+    // passes exactly through a lattice corner (err == 0) we advance both axes,
+    // emitting only the diagonal cell — there is no corner to slip through there.
+    let mut err = dx - dz;
+    while x != b.x || z != b.y {
+        let e2 = 2 * err;
+        if e2 > -dz && e2 < dz {
+            // Straddling a corner exactly: single diagonal step.
+            x += sx;
+            z += sz;
+            err += dx - dz;
+        } else if e2 > -dz {
+            err -= dz;
+            x += sx;
+        } else {
+            // e2 < dz
+            err += dx;
+            z += sz;
+        }
+        cells.push(IVec2::new(x, z));
+    }
+    cells
 }
 
 /// Walk `came_from` back from `goal` to the start, returning the cell path in
@@ -439,6 +666,35 @@ mod tests {
         }
         fn is_land(&self, x: i32, z: i32) -> bool {
             !(x == self.wall_x && z >= self.wall_z_min && z <= self.wall_z_max)
+        }
+    }
+
+    /// Flat low land with a one-column-thick raised RIDGE: every column is land,
+    /// but the single column `x == ridge_x` (over `ridge_z_min..=ridge_z_max`)
+    /// stands `MAX_STEP + 1` voxels higher than the surrounding low tier. Both
+    /// seams into that column (from `ridge_x-1` and from `ridge_x+1`) exceed
+    /// [`MAX_STEP`], so the ridge is an uncrossable barrier the route must skirt
+    /// — exercising the `dh > MAX_STEP` clearance branch that the constant-height
+    /// fixtures never touch, while keeping start/goal on the reachable low tier.
+    /// Both z-ends of the ridge are open so A* can detour around either end.
+    struct StepLand {
+        ridge_x: i32,
+        ridge_z_min: i32,
+        ridge_z_max: i32,
+        low: i32,
+        high: i32,
+    }
+
+    impl SurfaceOracle for StepLand {
+        fn surface_y(&self, x: i32, z: i32) -> i32 {
+            if x == self.ridge_x && z >= self.ridge_z_min && z <= self.ridge_z_max {
+                self.high
+            } else {
+                self.low
+            }
+        }
+        fn is_land(&self, _x: i32, _z: i32) -> bool {
+            true
         }
     }
 
@@ -588,19 +844,99 @@ mod tests {
     }
 
     #[test]
-    fn astar_escape_hatch_allows_blocked_start_and_goal() {
-        // Both start and goal are themselves blocked (e.g. the player stands on
-        // a prop cell, or clicked one). The escape hatch must still find a route.
+    fn astar_escape_hatch_allows_blocked_start() {
+        // The player stands on a blocked prop cell. The start escape hatch must
+        // still let them step off and reach an unblocked goal. (The goal carries
+        // no escape hatch — callers snap it to an unblocked cell first.)
         let terrain = FlatLand { height: 5 };
         let start = IVec2::new(0, 0);
         let goal = IVec2::new(3, 0);
         let mut blocked = HashSet::new();
         blocked.insert(start);
-        blocked.insert(goal);
         let (path, _expansions) = astar(&terrain, start, goal, &blocked);
-        let path = path.expect("start/goal escape hatch keeps the route valid");
+        let path = path.expect("start escape hatch keeps the route valid");
         assert_eq!(path.first().copied(), Some(start));
         assert_eq!(path.last().copied(), Some(goal));
+    }
+
+    #[test]
+    fn snap_goal_returns_goal_when_already_walkable() {
+        // A goal on open, unblocked land needs no snapping.
+        let terrain = FlatLand { height: 5 };
+        let goal = IVec2::new(4, 2);
+        assert_eq!(snap_goal(&terrain, goal, &no_blocked()), Some(goal));
+    }
+
+    #[test]
+    fn snap_goal_snaps_blocked_goal_to_adjacent_reachable_cell() {
+        // Clicking a single blocked prop cell on open land snaps to one of its
+        // walkable, unblocked neighbours, and A* then reaches that snapped cell.
+        let terrain = FlatLand { height: 5 };
+        let goal = IVec2::new(4, 0);
+        let mut blocked = HashSet::new();
+        blocked.insert(goal);
+
+        let snapped = snap_goal(&terrain, goal, &blocked).expect("a free neighbour exists");
+        assert_ne!(snapped, goal, "goal was blocked, must snap elsewhere");
+        assert!(!blocked.contains(&snapped) && terrain.is_land(snapped.x, snapped.y));
+        // The snapped cell is immediately adjacent (first ring) to the click.
+        let d = snapped - goal;
+        assert!(d.x.abs() <= 1 && d.y.abs() <= 1 && d != IVec2::ZERO);
+
+        let start = IVec2::new(0, 0);
+        let (path, _expansions) = astar(&terrain, start, snapped, &blocked);
+        let path = path.expect("route to the snapped goal exists");
+        assert_eq!(path.first().copied(), Some(start));
+        assert_eq!(path.last().copied(), Some(snapped));
+        // The route must never set foot on the blocked prop cell.
+        for cell in &path {
+            assert!(!blocked.contains(cell), "path stepped onto a blocked cell: {path:?}");
+        }
+    }
+
+    #[test]
+    fn snap_goal_gives_up_outside_radius() {
+        // Only the click cell itself is land, and it is blocked: no suitable
+        // cell exists anywhere in range, so the snap fails.
+        let terrain = Island; // only (0,0) is land
+        let mut blocked = HashSet::new();
+        blocked.insert(IVec2::ZERO);
+        assert_eq!(snap_goal(&terrain, IVec2::ZERO, &blocked), None);
+    }
+
+    #[test]
+    fn astar_no_diagonal_when_both_cardinals_blocked() {
+        // Two props sit at the cardinal cells (1,0) and (0,1) flanking the
+        // diagonal step start -> (1,1). Corner-cut prevention must forbid that
+        // diagonal, forcing any route to (1,1) to go the long way around — which
+        // here is impossible, so no path exists.
+        let terrain = FlatLand { height: 5 };
+        let start = IVec2::new(0, 0);
+        let goal = IVec2::new(1, 1);
+        let mut blocked = HashSet::new();
+        blocked.insert(IVec2::new(1, 0));
+        blocked.insert(IVec2::new(0, 1));
+        // Wall off the only alternate approaches so the diagonal is the sole
+        // candidate edge into the goal; with corner-cut prevention it is denied.
+        blocked.insert(IVec2::new(2, 1));
+        blocked.insert(IVec2::new(1, 2));
+        let (path, _expansions) = astar(&terrain, start, goal, &blocked);
+        assert!(
+            path.is_none(),
+            "diagonal corner-cut between two blocked cardinals must be denied: {path:?}"
+        );
+    }
+
+    #[test]
+    fn astar_allows_diagonal_when_cardinals_clear() {
+        // With no blocked cells, the diagonal step start -> (1,1) is a legal
+        // shortcut: A* takes the single diagonal rather than two orthogonals.
+        let terrain = FlatLand { height: 5 };
+        let start = IVec2::new(0, 0);
+        let goal = IVec2::new(1, 1);
+        let (path, _expansions) = astar(&terrain, start, goal, &no_blocked());
+        let path = path.expect("open diagonal is reachable");
+        assert_eq!(path, vec![start, goal]);
     }
 
     #[test]
@@ -615,5 +951,219 @@ mod tests {
             expansions <= MAX_EXPANSIONS,
             "A* exceeded its expansion cap: {expansions}"
         );
+    }
+
+    #[test]
+    fn max_expansions_is_raised_for_async_worker() {
+        // M3: the cap lives off-thread, so it was raised from 20k to a safer
+        // value. Pin the new floor so a regression that lowers it back into the
+        // "fails far clicks silently" range is caught.
+        assert!(
+            MAX_EXPANSIONS >= 60_000,
+            "expansion cap regressed below the async-worker floor: {MAX_EXPANSIONS}"
+        );
+    }
+
+    #[test]
+    fn supercover_straight_line_is_dense() {
+        // A horizontal line touches every cell between the endpoints, inclusive.
+        let cells = supercover(IVec2::new(0, 0), IVec2::new(3, 0));
+        assert_eq!(
+            cells,
+            vec![
+                IVec2::new(0, 0),
+                IVec2::new(1, 0),
+                IVec2::new(2, 0),
+                IVec2::new(3, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn supercover_diagonal_walks_corners() {
+        // A pure diagonal collapses to the diagonal cells (the segment passes
+        // exactly through each lattice corner — no orthogonal cell to slip past).
+        let cells = supercover(IVec2::new(0, 0), IVec2::new(2, 2));
+        assert_eq!(
+            cells,
+            vec![IVec2::new(0, 0), IVec2::new(1, 1), IVec2::new(2, 2)]
+        );
+        // Consecutive cells are always grid-adjacent (the LOS check relies on it).
+        for w in cells.windows(2) {
+            let d = w[1] - w[0];
+            assert!(d.x.abs() <= 1 && d.y.abs() <= 1 && d != IVec2::ZERO);
+        }
+    }
+
+    #[test]
+    fn line_of_sight_is_clear_on_open_land() {
+        let terrain = FlatLand { height: 5 };
+        assert!(cell_line_of_sight(
+            &terrain,
+            IVec2::new(0, 0),
+            IVec2::new(5, 3),
+            IVec2::new(0, 0),
+            &no_blocked(),
+        ));
+    }
+
+    #[test]
+    fn line_of_sight_is_blocked_through_a_wall() {
+        // A wall column at x=2 sits squarely between the endpoints, so the
+        // straight line crosses an unwalkable cell — LOS must fail.
+        let terrain = WalledLand {
+            wall_x: 2,
+            wall_z_min: -2,
+            wall_z_max: 2,
+        };
+        assert!(!cell_line_of_sight(
+            &terrain,
+            IVec2::new(0, 0),
+            IVec2::new(4, 0),
+            IVec2::new(0, 0),
+            &no_blocked(),
+        ));
+    }
+
+    #[test]
+    fn line_of_sight_is_blocked_through_a_height_cliff() {
+        // A height cliff at x=2 (the high tier is MAX_STEP+1 above the low tier)
+        // sits between the endpoints. Both cells are land, so this exercises the
+        // `dh > MAX_STEP` clearance branch — not the is_land wall path — and LOS
+        // must fail because the straight line crosses an unclimbable seam.
+        let terrain = StepLand {
+            ridge_x: 2,
+            ridge_z_min: -2,
+            ridge_z_max: 2,
+            low: 5,
+            high: 5 + MAX_STEP + 1,
+        };
+        // Sanity: the seam really does exceed MAX_STEP.
+        let dh = (terrain.surface_y(1, 0) - terrain.surface_y(2, 0)).abs();
+        assert!(dh > MAX_STEP, "fixture seam must exceed MAX_STEP");
+        assert!(!cell_line_of_sight(
+            &terrain,
+            IVec2::new(0, 0),
+            IVec2::new(4, 0),
+            IVec2::new(0, 0),
+            &no_blocked(),
+        ));
+    }
+
+    #[test]
+    fn smooth_path_keeps_bend_around_a_height_cliff() {
+        // Mirrors `smooth_path_keeps_bend_around_a_wall`, but the obstacle is a
+        // HEIGHT cliff (all land) rather than a water/unwalkable wall. The detour
+        // A* finds around the cliff's z-extent must survive smoothing: the result
+        // keeps a genuine bend and no smoothed hop's straight line crosses the
+        // unclimbable seam. This pins the cliff-clearance path in cell_line_of_sight
+        // that the constant-height fixtures leave untested.
+        let terrain = StepLand {
+            ridge_x: 2,
+            ridge_z_min: -2,
+            ridge_z_max: 2,
+            low: 5,
+            high: 5 + MAX_STEP + 1,
+        };
+        let start = IVec2::new(0, 0);
+        let goal = IVec2::new(4, 0);
+        let (route, _) = astar(&terrain, start, goal, &no_blocked());
+        let route = route.expect("a route around the cliff exists");
+
+        let smoothed = smooth_path(&terrain, &route, &no_blocked());
+
+        // Endpoints preserved.
+        assert_eq!(smoothed.first().copied(), Some(start));
+        assert_eq!(smoothed.last().copied(), Some(goal));
+        // A real bend remains — smoothing did NOT string a line through the cliff.
+        assert!(
+            smoothed.len() >= 3,
+            "smoothing flattened the necessary cliff detour: {smoothed:?}"
+        );
+        // Every kept hop must itself be a clear straight line: no segment may
+        // cross the unclimbable seam.
+        for hop in smoothed.windows(2) {
+            assert!(
+                cell_line_of_sight(&terrain, hop[0], hop[1], start, &no_blocked()),
+                "smoothed hop {:?} -> {:?} crosses the height cliff",
+                hop[0],
+                hop[1]
+            );
+        }
+    }
+
+    #[test]
+    fn smooth_path_collapses_straight_open_field() {
+        // A straight A* run across open flat land must string-pull down to just
+        // its endpoints (~2 points): every interior cell has LOS to the goal.
+        let terrain = FlatLand { height: 5 };
+        let start = IVec2::new(0, 0);
+        let goal = IVec2::new(6, 0);
+        let (route, _) = astar(&terrain, start, goal, &no_blocked());
+        let route = route.expect("flat land is reachable");
+        let smoothed = smooth_path(&terrain, &route, &no_blocked());
+        assert_eq!(
+            smoothed,
+            vec![start, goal],
+            "open-field route should collapse to start + goal, got {smoothed:?}"
+        );
+    }
+
+    #[test]
+    fn smooth_path_collapses_straight_open_diagonal() {
+        // A pure diagonal run likewise collapses to its endpoints.
+        let terrain = FlatLand { height: 5 };
+        let start = IVec2::new(0, 0);
+        let goal = IVec2::new(5, 5);
+        let (route, _) = astar(&terrain, start, goal, &no_blocked());
+        let route = route.expect("flat land is reachable");
+        let smoothed = smooth_path(&terrain, &route, &no_blocked());
+        assert_eq!(smoothed, vec![start, goal]);
+    }
+
+    #[test]
+    fn smooth_path_keeps_bend_around_a_wall() {
+        // The detour around a wall must survive smoothing: the result keeps a
+        // genuine bend (more than 2 points) and never has a segment whose
+        // straight line crosses the wall.
+        let terrain = WalledLand {
+            wall_x: 2,
+            wall_z_min: -2,
+            wall_z_max: 2,
+        };
+        let start = IVec2::new(0, 0);
+        let goal = IVec2::new(4, 0);
+        let (route, _) = astar(&terrain, start, goal, &no_blocked());
+        let route = route.expect("a route around the wall exists");
+        let smoothed = smooth_path(&terrain, &route, &no_blocked());
+
+        // Endpoints preserved.
+        assert_eq!(smoothed.first().copied(), Some(start));
+        assert_eq!(smoothed.last().copied(), Some(goal));
+        // A real bend remains — it did NOT smooth straight through the wall.
+        assert!(
+            smoothed.len() >= 3,
+            "smoothing flattened the necessary detour: {smoothed:?}"
+        );
+        // No smoothed segment may have line-of-sight crossing the wall: every
+        // kept hop must itself be a clear straight line over walkable cells.
+        for hop in smoothed.windows(2) {
+            assert!(
+                cell_line_of_sight(&terrain, hop[0], hop[1], start, &no_blocked()),
+                "smoothed hop {:?} -> {:?} crosses the wall",
+                hop[0],
+                hop[1]
+            );
+        }
+    }
+
+    #[test]
+    fn smooth_path_preserves_short_routes() {
+        // Routes shorter than 3 cells are already minimal and returned verbatim.
+        let terrain = FlatLand { height: 5 };
+        let two = vec![IVec2::new(0, 0), IVec2::new(1, 0)];
+        assert_eq!(smooth_path(&terrain, &two, &no_blocked()), two);
+        let one = vec![IVec2::new(0, 0)];
+        assert_eq!(smooth_path(&terrain, &one, &no_blocked()), one);
     }
 }

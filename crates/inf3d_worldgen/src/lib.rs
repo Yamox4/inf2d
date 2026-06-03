@@ -44,11 +44,14 @@ pub fn sample_height(noise: &HybridMulti<Perlin>, x: i32, z: i32) -> f64 {
 }
 
 /// Resolved classification of a single terrain column. The single source of
-/// truth for the land/water/seafloor split: both the [`Terrain`] gameplay
-/// oracle and `inf3d_world::get_voxel_fn` (the meshing delegate on worker
-/// threads) derive their answers from [`column_kind`], so the surface a player
-/// stands/pathfinds on can never desync from the meshed geometry or the
-/// material picked for a voxel.
+/// truth for the land/water/seafloor *classification*: both the [`Terrain`]
+/// gameplay oracle and `inf3d_world::get_voxel_fn` (the meshing delegate on
+/// worker threads) derive their land/water answer from [`column_kind`], so the
+/// surface a player stands/pathfinds on agrees with the material picked for a
+/// voxel — given the same sampled height. The height itself is not identical
+/// everywhere: meshing may sample LOD-reduced noise for far chunks (shifting
+/// their visual coastline), whereas the oracle always samples LOD-0; see
+/// `inf3d_world::get_voxel_fn` for the full caveats.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ColumnKind {
     /// Y index of the topmost solid voxel in the column (>= 0).
@@ -83,9 +86,11 @@ impl ColumnKind {
 
 /// Classify a single column. The `noise` is the only per-call input so callers
 /// can pass an LOD-reduced noise (meshing worker) or the canonical LOD-0 noise
-/// (gameplay oracle) and still get a split that agrees on coastlines. Thin
-/// wrapper over [`ColumnKind::from_height`] for callers that haven't already
-/// sampled the height.
+/// (gameplay oracle); both run the *same* classification, but on whatever height
+/// their noise samples — so an LOD-reduced caller can land on a slightly
+/// different coastline than the LOD-0 oracle (the oracle is the navigation
+/// authority). Thin wrapper over [`ColumnKind::from_height`] for callers that
+/// haven't already sampled the height.
 pub fn column_kind(noise: &HybridMulti<Perlin>, x: i32, z: i32) -> ColumnKind {
     ColumnKind::from_height(sample_height(noise, x, z))
 }
@@ -110,8 +115,10 @@ impl Terrain {
 
     /// Classify the column at `(x, z)` from the oracle's (LOD-0) noise. The one
     /// helper that all the public accessors below delegate to, so the oracle
-    /// and the meshing closure (which calls [`column_kind`] directly) can never
-    /// disagree about land/water/seafloor.
+    /// applies the *same* land/water classification as the meshing closure
+    /// (which calls [`column_kind`] directly). The oracle always samples LOD-0,
+    /// so it is the authority navigation trusts where an LOD-reduced far chunk's
+    /// visual coastline would differ.
     fn column(&self, x: i32, z: i32) -> ColumnKind {
         column_kind(&self.noise, x, z)
     }
