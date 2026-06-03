@@ -79,7 +79,7 @@ impl QualityPreset {
 }
 
 /// Global visual / streaming knobs. Read by world (render distance), render
-/// (grass density / fog steps / dof / bloom / water), and ui (HUD readout +
+/// (grass density / dof / bloom / water), and ui (HUD readout +
 /// F2 cycle). Most fields take effect each frame when `is_changed()` fires;
 /// `render_distance_chunks` is read **once** at plugin build time (the voxel
 /// world plugin doesn't re-register).
@@ -92,8 +92,6 @@ pub struct QualitySettings {
     pub grass_density: f32,
     pub grass_lod_enabled: bool,
     pub foliage_enabled: bool,
-    pub fog_enabled: bool,
-    pub fog_step_count: u32,
     pub dof_enabled: bool,
     pub bloom_enabled: bool,
     pub water_enabled: bool,
@@ -126,8 +124,6 @@ impl QualitySettings {
                 grass_density: 0.0,
                 grass_lod_enabled: false,
                 foliage_enabled: false,
-                fog_enabled: false,
-                fog_step_count: 0,
                 dof_enabled: false,
                 bloom_enabled: false,
                 water_enabled: false,
@@ -144,8 +140,6 @@ impl QualitySettings {
                 grass_density: 0.22,
                 grass_lod_enabled: true,
                 foliage_enabled: true,
-                fog_enabled: false,
-                fog_step_count: 0,
                 dof_enabled: false,
                 bloom_enabled: false,
                 water_enabled: true,
@@ -162,8 +156,6 @@ impl QualitySettings {
                 grass_density: 0.35,
                 grass_lod_enabled: true,
                 foliage_enabled: true,
-                fog_enabled: true,
-                fog_step_count: 12,
                 dof_enabled: false,
                 bloom_enabled: true,
                 water_enabled: true,
@@ -180,8 +172,6 @@ impl QualitySettings {
                 grass_density: 0.5,
                 grass_lod_enabled: true,
                 foliage_enabled: true,
-                fog_enabled: true,
-                fog_step_count: 20,
                 dof_enabled: true,
                 bloom_enabled: true,
                 water_enabled: true,

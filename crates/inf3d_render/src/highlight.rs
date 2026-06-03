@@ -105,3 +105,59 @@ fn update_highlight(
         }
     }
 }
+
+/// Spawn the persistent click-to-move destination marker, hidden until a path
+/// target exists. A cyan/green emissive cube, distinct from the yellow hover
+/// [`VoxelHighlight`], so the player can tell "where I'm pointing" from "where
+/// I told the character to go".
+fn spawn_target_highlight(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let mesh = meshes.add(Cuboid::from_length(HIGHLIGHT_SCALE));
+    let material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.30, 1.0, 0.70, 0.30),
+        emissive: LinearRgba::rgb(0.25, 1.30, 0.85),
+        alpha_mode: AlphaMode::Blend,
+        unlit: true,
+        ..default()
+    });
+
+    commands.spawn((
+        Mesh3d(mesh),
+        MeshMaterial3d(material),
+        Transform::default(),
+        Visibility::Hidden,
+        TargetHighlight,
+    ));
+}
+
+/// Snap the destination marker onto the active [`PathTarget`] cell — sitting on
+/// that column's top surface voxel (same center convention as the hover
+/// highlight: integer corner + 0.5) — and show it. Hidden whenever the player is
+/// idle / has arrived (`PathTarget` is `None`). The cell's surface height comes
+/// from the [`Terrain`] oracle, so the marker is correct even for columns whose
+/// chunk hasn't streamed in yet.
+fn update_target_highlight(
+    target: Res<PathTarget>,
+    terrain: Res<Terrain>,
+    mut marker: Query<(&mut Transform, &mut Visibility), With<TargetHighlight>>,
+) {
+    let Ok((mut transform, mut visibility)) = marker.single_mut() else {
+        return;
+    };
+
+    match target.0 {
+        Some(cell) => {
+            let surface_y = terrain.surface_y(cell.x, cell.y);
+            transform.translation = Vec3::new(
+                cell.x as f32 + 0.5,
+                surface_y as f32 + 0.5,
+                cell.y as f32 + 0.5,
+            );
+            *visibility = Visibility::Visible;
+        }
+        None => *visibility = Visibility::Hidden,
+    }
+}

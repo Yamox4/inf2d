@@ -219,14 +219,8 @@ fn update_hud(
         "Tile: —".to_string()
     };
 
-    let fog_line = if settings.fog_enabled {
-        format!("Fog: on  steps={}", settings.fog_step_count)
-    } else {
-        "Fog: off".to_string()
-    };
-
     text.0 = format!(
-        "FPS: {:.0}  ({:.1} ms, p95 {:.1} ms)\nEntities: {:.0}   Chunks: {}\nPlayer: ({:.1}, {:.1}, {:.1})  cell=({}, {})\nQuality: {}  rd={}  [F2]\n{}\n{}",
+        "FPS: {:.0}  ({:.1} ms, p95 {:.1} ms)\nEntities: {:.0}   Chunks: {}\nPlayer: ({:.1}, {:.1}, {:.1})  cell=({}, {})\nQuality: {}  rd={}  [F2]\n{}",
         fps,
         frame_ms,
         frame.ms_p95,
@@ -236,7 +230,6 @@ fn update_hud(
         cell.x, cell.y,
         settings.preset.name(),
         settings.render_distance_chunks,
-        fog_line,
         hover_line,
     );
 }

@@ -173,8 +173,8 @@ fn spawn_camera(mut commands: Commands, quality: Res<QualitySettings>) {
 /// adding or stripping `Bloom`, `DepthPrepass`, `DepthOfField`, SSAO (+ its
 /// `NormalPrepass`/`Msaa::Off`), and motion blur (+ its `MotionVectorPrepass`)
 /// to match the new preset. Skips re-inserting when the component is already
-/// present (avoids GPU churn). Fog is a screen-space UI overlay now (see
-/// inf3d_render::fog) and is no longer a camera component.
+/// present (avoids GPU churn). There is no fog component: atmospheric fog was
+/// removed (see inf3d_render::fog, now just the horizon clear color).
 fn apply_quality_to_camera(
     mut commands: Commands,
     quality: Res<QualitySettings>,
