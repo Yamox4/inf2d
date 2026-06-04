@@ -9,7 +9,7 @@ use bevy::post_process::bloom::Bloom;
 use bevy::post_process::dof::DepthOfField;
 use bevy::post_process::motion_blur::MotionBlur;
 use bevy::prelude::*;
-use bevy::render::view::{Hdr, Msaa};
+use bevy::render::view::{ColorGrading, Hdr, Msaa};
 use bevy_voxel_world::prelude::*;
 
 use inf3d_core::{FollowTarget, GameSet, QualitySettings};
@@ -219,6 +219,21 @@ fn motion_blur_component() -> MotionBlur {
     }
 }
 
+/// Filmic color grading on the camera's tonemapped output. The default tonemapper
+/// is neutral, so the scene reads flat; a touch of midtone contrast + post
+/// saturation gives it the graded, "AAA" pop without touching gameplay. Always on
+/// (it folds into the existing tonemapping pass — effectively free). Deliberately
+/// subtle — bump `post_saturation` for richer color, `midtones.contrast` for more
+/// punch.
+fn color_grading_component() -> ColorGrading {
+    let mut grading = ColorGrading::default();
+    // 1.0 = neutral. Post-tonemap saturation lift for richer color.
+    grading.global.post_saturation = 1.08;
+    // A little midtone contrast so the image isn't flat (1.0 = no change).
+    grading.midtones.contrast = 1.06;
+    grading
+}
+
 fn spawn_camera(mut commands: Commands, quality: Res<QualitySettings>) {
     let yaw = std::f32::consts::FRAC_PI_4; // classic 45° iso
 
@@ -248,6 +263,8 @@ fn spawn_camera(mut commands: Commands, quality: Res<QualitySettings>) {
         },
         // HDR is the color pipeline contract regardless of post-FX quality.
         Hdr,
+        // Filmic grade on the tonemapped output (subtle contrast + saturation).
+        color_grading_component(),
     ));
 
     if quality.bloom_enabled {
