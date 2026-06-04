@@ -4,6 +4,7 @@ use avian3d::prelude::*;
 use bevy::prelude::*;
 use bevy::window::{PresentMode, Window, WindowPlugin};
 
+use inf3d_audio::AudioPlugin;
 use inf3d_camera::IsoCameraPlugin;
 use inf3d_core::CorePlugin;
 use inf3d_gameplay::PlayerPlugin;
@@ -61,6 +62,7 @@ fn main() {
         .add_plugins(DustPlugin)
         .add_plugins(FogPlugin)
         .add_plugins(HudPlugin)
+        .add_plugins(AudioPlugin)
         .add_plugins(WaterPlugin)
         .add_plugins(FoliagePlugin);
 

@@ -32,6 +32,16 @@ pub struct MovePath {
     pub waypoints: VecDeque<Vec3>,
 }
 
+/// Emitted once each time the walking character lands a hop (its feet touch the
+/// ground), at the same instant the visual dust burst fires. A downstream audio
+/// sink ([`inf3d_audio`]) plays a footstep per message, decoupled from the dust —
+/// audio never piggybacks on dust particle counts. `pos` is the feet position at
+/// the step, for future spatial audio / per-surface clip selection.
+#[derive(Message)]
+pub struct Footstep {
+    pub pos: Vec3,
+}
+
 /// The animated root node holding all the character body parts. Kept separate
 /// from the logical player transform so animation never feeds back into the
 /// movement integration. The whole figure bobs and yaws via this node.
@@ -75,7 +85,8 @@ impl Plugin for PlayerPlugin {
         // `PathTarget` is a shared resource owned solely by `CorePlugin`; we only
         // read/clear it here. `follow_path` sets the movement intent and
         // `animate_player` reads it — both are per-frame game logic.
-        app.add_systems(Startup, spawn_player)
+        app.add_message::<Footstep>()
+            .add_systems(Startup, spawn_player)
             // `follow_path` drives the movement INTENT and must run at the FIXED
             // rate, in lockstep with the `inf3d_physics` character controller
             // (`FixedPostUpdate`). At low fps the fixed loop runs several steps
@@ -289,6 +300,7 @@ fn follow_path(
 fn animate_player(
     time: Res<Time>,
     mut dust: MessageWriter<inf3d_render::DustBurst>,
+    mut footstep: MessageWriter<Footstep>,
     state_q: Query<(&Transform, &MovePath, &Player), (Without<CharacterRoot>, Without<Part>)>,
     mut root_q: Query<&mut Transform, (With<CharacterRoot>, Without<Part>, Without<Player>)>,
     mut part_q: Query<(&mut Transform, &Part, &RestPos), (Without<CharacterRoot>, Without<Player>)>,
@@ -327,6 +339,10 @@ fn animate_player(
                 amount: 12,
                 speed: 2.2,
             });
+            // One footstep sound per hop landing (inf3d_audio plays it with a
+            // slight random pitch/volume). Separate from the dust above so audio
+            // and particles can evolve independently.
+            footstep.write(Footstep { pos: feet });
         }
         // Trailing dirt puffs at a steady cadence.
         *walk_accum += dt;
