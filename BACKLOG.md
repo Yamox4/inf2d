@@ -32,7 +32,7 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
 ## Phase B — Engine foundation (prereqs for adding block/material content)
 
-- [ ] **B1 (#3) Block material PALETTE table + consistency test.** Collapse the 6
+- [x] **B1 (#3) Block material PALETTE table + consistency test.** Collapse the 6
   hand-synced material sites (`TerrainMaterialId` enum / `label` / `from_index` /
   texture-array `LAYERS`+palette / `texture_index_mapper` / `get_voxel_fn`) into ONE
   table, generate the rest from it, and add a test asserting table↔enum consistency so a

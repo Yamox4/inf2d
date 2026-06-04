@@ -59,12 +59,9 @@ impl TerrainMaterialId {
     /// submerged column, i.e. what the cursor lands on over the (unwalkable)
     /// water plane, so the gameplay-relevant name is "Water".
     pub const fn label(self) -> &'static str {
-        match self {
-            TerrainMaterialId::Grass => "Grass",
-            TerrainMaterialId::Dirt => "Dirt",
-            TerrainMaterialId::Stone => "Stone",
-            TerrainMaterialId::Seafloor => "Water",
-        }
+        // Derived from the single PALETTE table (indexed by discriminant), so a
+        // material's label can never desync from its texture / index — see PALETTE.
+        PALETTE[self as usize].label
     }
 
     /// Map a raw `MainWorld::MaterialIndex` (`u8`) back to its
@@ -73,15 +70,69 @@ impl TerrainMaterialId {
     /// [`label`](Self::label) — without hand-keeping a parallel match on the
     /// discriminants.
     pub const fn from_index(index: u8) -> Option<Self> {
-        match index {
-            x if x == TerrainMaterialId::Grass as u8 => Some(TerrainMaterialId::Grass),
-            x if x == TerrainMaterialId::Dirt as u8 => Some(TerrainMaterialId::Dirt),
-            x if x == TerrainMaterialId::Stone as u8 => Some(TerrainMaterialId::Stone),
-            x if x == TerrainMaterialId::Seafloor as u8 => Some(TerrainMaterialId::Seafloor),
-            _ => None,
+        // A valid index is exactly a row in the single PALETTE table.
+        if (index as usize) < PALETTE.len() {
+            Some(PALETTE[index as usize].id)
+        } else {
+            None
         }
     }
 }
+
+/// One terrain material's data — the SINGLE source of truth for the palette, one
+/// row per [`TerrainMaterialId`] variant IN DISCRIMINANT ORDER. Adding a block =
+/// add an enum variant AND a row here (in order); the `palette_matches_enum` test
+/// fails loudly if they ever drift, so a new material can't silently mis-texture.
+/// The HUD label ([`TerrainMaterialId::label`]), [`TerrainMaterialId::from_index`],
+/// the procedural texture-array colors + layer count (in
+/// [`terrain_material`](crate::terrain_material)), and the per-face layer mapper
+/// ([`MainWorld::texture_index_mapper`]) are ALL derived from this one table.
+pub(crate) struct MaterialDef {
+    /// The variant this row describes. Must satisfy `PALETTE[i].id as u8 == i`.
+    pub id: TerrainMaterialId,
+    /// Player-facing HUD label.
+    pub label: &'static str,
+    /// RGB of this material's own texture-array layer (procedurally tinted).
+    pub color: [u8; 3],
+    /// Texture-array layers sampled per face — `[top, side, bottom]`. A uniform
+    /// material repeats its own layer; land mixes grass-cap / dirt-side / stone-base.
+    pub faces: [u32; 3],
+}
+
+/// The canonical material palette. Order MUST match the [`TerrainMaterialId`]
+/// discriminants (guarded by the `palette_matches_enum` test).
+pub(crate) const PALETTE: [MaterialDef; 4] = [
+    MaterialDef {
+        id: TerrainMaterialId::Grass,
+        label: "Grass",
+        color: [0x4f, 0x7a, 0x35],
+        faces: [
+            TerrainMaterialId::Grass.layer(),
+            TerrainMaterialId::Dirt.layer(),
+            TerrainMaterialId::Stone.layer(),
+        ],
+    },
+    MaterialDef {
+        id: TerrainMaterialId::Dirt,
+        label: "Dirt",
+        color: [0x6b, 0x4a, 0x2c],
+        faces: [TerrainMaterialId::Dirt.layer(); 3],
+    },
+    MaterialDef {
+        id: TerrainMaterialId::Stone,
+        label: "Stone",
+        color: [0x6e, 0x6f, 0x72],
+        faces: [TerrainMaterialId::Stone.layer(); 3],
+    },
+    MaterialDef {
+        // Seafloor reads as "Water" to the player (the voxel under a submerged
+        // column). Sandy/tan shows through bevy_water's translucent surface.
+        id: TerrainMaterialId::Seafloor,
+        label: "Water",
+        color: [0xd4, 0xc1, 0x88],
+        faces: [TerrainMaterialId::Seafloor.layer(); 3],
+    },
+];
 
 /// Fixed-high chunk radius streamed around the camera when no `QualitySettings`
 /// resource is present. Used only as a fallback — in practice `CorePlugin`
@@ -304,19 +355,16 @@ impl VoxelWorldConfig for MainWorld {
     }
 
     fn texture_index_mapper(&self) -> Arc<dyn Fn(Self::MaterialIndex) -> [u32; 3] + Send + Sync> {
-        use TerrainMaterialId::*;
         // The returned `[u32; 3]` is `[top, side, bottom]` — the shader samples
-        // `tex_idx[tex_face]` where `tex_face` is 0/1/2 for top/side/bottom (it
-        // is picked per-vertex from the axis-aligned face normal). Land voxels
-        // get the classic block look — grass cap, dirt sides, stone underneath
-        // — so every texture-array layer is wired in. Seafloor is uniform: all
-        // faces show the sandy layer that reads through the water.
-        Arc::new(|mat| match mat {
-            m if m == Grass as u8 => [Grass.layer(), Dirt.layer(), Stone.layer()],
-            m if m == Seafloor as u8 => [Seafloor.layer(); 3],
-            // Unknown index: fall back to the all-grass land cap rather than a
-            // blank layer, so a stray material still reads as terrain.
-            _ => [Grass.layer(), Dirt.layer(), Stone.layer()],
+        // `tex_idx[tex_face]` where `tex_face` is 0/1/2 for top/side/bottom (picked
+        // per-vertex from the axis-aligned face normal). Per-face layers come
+        // straight from the single PALETTE table; an unknown index falls back to
+        // the grass land cap so a stray material still reads as terrain.
+        Arc::new(|mat| {
+            PALETTE
+                .get(mat as usize)
+                .map(|d| d.faces)
+                .unwrap_or(PALETTE[TerrainMaterialId::Grass as usize].faces)
         })
     }
 }
@@ -456,4 +504,39 @@ fn get_voxel_fn(lod: u8) -> Box<dyn FnMut(IVec3, Option<WorldVoxel>) -> WorldVox
             WorldVoxel::Air
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PALETTE is the single source of truth, indexed by discriminant. This guards
+    /// the invariant every consumer relies on: row `i` describes the variant whose
+    /// discriminant is `i`, the table covers EVERY variant exactly once, and
+    /// `from_index` / `label` round-trip through it. If someone adds a variant but
+    /// forgets a row (or mis-orders them), this fails loudly here instead of
+    /// silently mis-texturing terrain in-game (the desync this table exists to kill).
+    #[test]
+    fn palette_matches_enum() {
+        use TerrainMaterialId::*;
+        // Every variant, listed once. Adding a variant means updating this list,
+        // the enum, AND PALETTE — and any mismatch trips an assertion below.
+        let all = [Grass, Dirt, Stone, Seafloor];
+        assert_eq!(
+            PALETTE.len(),
+            all.len(),
+            "PALETTE must have exactly one row per TerrainMaterialId variant"
+        );
+        for (i, def) in PALETTE.iter().enumerate() {
+            assert_eq!(def.id as usize, i, "PALETTE[{i}] must describe discriminant {i}");
+            assert_eq!(
+                TerrainMaterialId::from_index(i as u8),
+                Some(def.id),
+                "from_index({i}) must round-trip to PALETTE[{i}].id"
+            );
+            assert_eq!(def.id.label(), def.label, "label() must equal the table label");
+        }
+        // Out-of-range indices have no material.
+        assert_eq!(TerrainMaterialId::from_index(PALETTE.len() as u8), None);
+    }
 }

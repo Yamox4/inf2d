@@ -225,19 +225,11 @@ fn build_terrain_texture(images: &mut Assets<Image>) -> Handle<Image> {
     /// Side length of each layer in pixels. Square and a power of two so
     /// the stacked-as-array reinterpret has integer math.
     const LAYER_SIZE: u32 = 32;
-    /// Number of layers. One per `TerrainMaterialId` variant; the mapper in
-    /// `MainWorld::texture_index_mapper` indexes into these by discriminant.
-    const LAYERS: u32 = 4;
-
-    let palette: [[u8; 3]; LAYERS as usize] = [
-        [0x4f, 0x7a, 0x35], // 0 Grass — land top face
-        [0x6b, 0x4a, 0x2c], // 1 Dirt  — land side faces
-        [0x6e, 0x6f, 0x72], // 2 Stone — land bottom faces
-        // Seafloor: bevy_water has `clarity: 0.4`, so this color shows through
-        // the water surface. Sandy/tan reads as "shallow beach water"; the old
-        // dark brown made the water look muddy.
-        [0xd4, 0xc1, 0x88], // 3 Seafloor — submerged columns (shows through water)
-    ];
+    /// Number of layers = one row per [`crate::PALETTE`] (= per `TerrainMaterialId`
+    /// variant). Colors come from that single table too, so this builder can't
+    /// desync from the material indices / labels / per-face mapper — add a block by
+    /// adding ONE palette row (the `palette_matches_enum` test guards consistency).
+    const LAYERS: u32 = crate::PALETTE.len() as u32;
 
     let pixels_per_layer = (LAYER_SIZE * LAYER_SIZE) as usize;
     let bytes_per_layer = pixels_per_layer * 4;
@@ -249,7 +241,7 @@ fn build_terrain_texture(images: &mut Assets<Image>) -> Handle<Image> {
     // byte-identical every run). The linear sampler below smooths it into soft
     // shading variation rather than hard pixels.
     for layer in 0..LAYERS as usize {
-        let [r, g, b] = palette[layer];
+        let [r, g, b] = crate::PALETTE[layer].color;
         for py in 0..LAYER_SIZE {
             for px in 0..LAYER_SIZE {
                 let f = texel_brightness(px, py, layer as u32);
