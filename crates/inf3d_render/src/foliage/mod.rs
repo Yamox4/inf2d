@@ -23,7 +23,7 @@
 //! tile field, its own ring, and its own per-frame budgets:
 //!
 //! * **Solid layer** ([`SolidField`]) — trees + rocks. Streamed in a
-//!   **zoom-driven** ring ([`stream::compute_ring`] from
+//!   **zoom-driven** ring ([`stream::compute_ring`] clamped by
 //!   [`QualitySettings::foliage_ring_max`](inf3d_core::QualitySettings)) so
 //!   zooming out shows props all the way to the iso-view edges. Solid props get
 //!   per-prop colliders ([`SolidPropCollider`](inf3d_physics::SolidPropCollider))

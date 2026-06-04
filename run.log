@@ -1,0 +1,405 @@
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.65s
+     Running `target\debug\inf3d.exe`
+[2m2026-06-04T15:39:25.557503Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m GENERAL [Loader Message (0x0)]
+	loader_get_json: Failed to open JSON file C:\Program Files (x86)\Epic Games\Epic Online Services\managedArtifacts\98bc04bc842e4906993fd6d6644ffb8d\EOSOverlayVkLayer-Win64.json
+[2m2026-06-04T15:39:25.557552Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m 	objects: (type: INSTANCE, hndl: 0x27dc1eb8450, name: ?)
+[2m2026-06-04T15:39:25.838621Z[0m [32m INFO[0m [2mbevy_render::renderer[0m[2m:[0m AdapterInfo { name: "NVIDIA GeForce RTX 3060 Laptop GPU", vendor: 4318, device: 9504, device_type: DiscreteGpu, driver: "NVIDIA", driver_info: "595.97", backend: Vulkan }
+[2m2026-06-04T15:39:26.386163Z[0m [32m INFO[0m [2mbevy_render::batching::gpu_preprocessing[0m[2m:[0m GPU preprocessing is fully supported on this device.
+[2m2026-06-04T15:39:26.389025Z[0m [32m INFO[0m [2mbevy_winit::system[0m[2m:[0m Creating new window inf3d (0v0)
+[2m2026-06-04T15:39:26.418235Z[0m [32m INFO[0m [2minf3d_world[0m[2m:[0m inf3d: left-click the ground to move the player (A* over the voxel surface).
+[2m2026-06-04T15:39:26.418683Z[0m [32m INFO[0m [2minf3d_monitor[0m[2m:[0m inf3d_monitor: recording to C:\Users\yaman\Desktop\inf3d\inf3d/inf3d-monitor.log
+[2m2026-06-04T15:39:26.427042Z[0m [32m INFO[0m [2minf3d_render::foliage[0m[2m:[0m foliage: loaded 5 trees, 4 rocks, 5 grass
+[2m2026-06-04T15:39:26.849325Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %87 = OpAtomicIAdd %uint %88 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-06-04T15:39:26.849422Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %86 = OpAtomicIAdd %uint %87 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-06-04T15:39:26.851019Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %86 = OpAtomicIAdd %uint %87 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-06-04T15:39:26.875237Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicLoad: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %390 = OpAtomicLoad %uint %389 %int_1 %uint_64
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-06-04T15:39:26.954590Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %87 = OpAtomicIAdd %uint %88 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-06-04T15:39:26.957462Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %86 = OpAtomicIAdd %uint %87 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-06-04T15:39:26.967070Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %86 = OpAtomicIAdd %uint %87 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-06-04T15:39:26.983435Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %538 = OpAtomicIAdd %uint %539 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-06-04T15:39:26.988585Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %321 = OpAtomicIAdd %uint %322 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-06-04T15:39:27.033923Z[0m [31mERROR[0m [2mwgpu_hal::vulkan::instance[0m[2m:[0m VALIDATION [VUID-StandaloneSpirv-MemorySemantics-10871 (0x72170603)]
+	(Warning - This VUID has now been reported 10 times, which is the duplicate_message_limit value, this will be the last time reporting it).
+vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+AtomicIAdd: Memory Semantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease)
+  %87 = OpAtomicIAdd %uint %88 %int_1 %uint_64 %uint_1
+
+Command to reproduce:
+	spirv-val <input.spv> --relax-block-layout --target-env vulkan1.3
+
+The Vulkan spec states: MemorySemantics with at least one Vulkan-supported storage class semantics bit set (UniformMemory, WorkgroupMemory, ImageMemory, or OutputMemory) must use a non-relaxed memory order (Acquire, Release, or AcquireRelease) (https://docs.vulkan.org/spec/latest/appendices/spirvenv.html#VUID-StandaloneSpirv-MemorySemantics-10871)
+[2m2026-06-04T15:39:27.441631Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   62.083884   (avg 46.967244)
+[2m2026-06-04T15:39:27.441733Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            :  626.647181   (avg 520.095238)
+[2m2026-06-04T15:39:27.441747Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   16.112074ms (avg 50.434145ms)
+[2m2026-06-04T15:39:27.441757Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 100.857143)
+[2m2026-06-04T15:39:27.441769Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 20.000000
+[2m2026-06-04T15:39:27.441780Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 1177.000000   (avg 1162.809524)
+[2m2026-06-04T15:39:27.441789Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 1608.367314   (avg 1486.095238)
+[2m2026-06-04T15:39:28.438564Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   79.773610   (avg 56.545028)
+[2m2026-06-04T15:39:28.438624Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1557.461406   (avg 965.162162)
+[2m2026-06-04T15:39:28.438630Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   12.573711ms (avg 27.481890ms)
+[2m2026-06-04T15:39:28.438634Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 101.675676)
+[2m2026-06-04T15:39:28.438638Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 73.000000
+[2m2026-06-04T15:39:28.438642Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3401.309199   (avg 2042.581081)
+[2m2026-06-04T15:39:28.438647Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4115.910339   (avg 2571.040541)
+[2m2026-06-04T15:39:29.438834Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   68.507945   (avg 64.958806)
+[2m2026-06-04T15:39:29.438882Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1700.418150   (avg 1446.266667)
+[2m2026-06-04T15:39:29.438888Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   14.597706ms (avg 16.487780ms)
+[2m2026-06-04T15:39:29.438892Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:29.438898Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 141.000000
+[2m2026-06-04T15:39:29.438903Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3460.013250   (avg 3000.083333)
+[2m2026-06-04T15:39:29.438907Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4448.040619   (avg 3783.833333)
+[2m2026-06-04T15:39:30.435872Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   73.062760   (avg 69.380063)
+[2m2026-06-04T15:39:30.435917Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1634.122359   (avg 1668.041667)
+[2m2026-06-04T15:39:30.435923Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.687808ms (avg 14.507418ms)
+[2m2026-06-04T15:39:30.435927Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:30.435932Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 212.000000
+[2m2026-06-04T15:39:30.435936Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3297.148053   (avg 3386.441667)
+[2m2026-06-04T15:39:30.435940Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4284.226178   (avg 4361.966667)
+[2m2026-06-04T15:39:31.433101Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   67.335080   (avg 72.449942)
+[2m2026-06-04T15:39:31.433142Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1692.588014   (avg 1658.066667)
+[2m2026-06-04T15:39:31.433147Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   14.860992ms (avg 13.839067ms)
+[2m2026-06-04T15:39:31.433151Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:31.433156Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 284.000000
+[2m2026-06-04T15:39:31.433159Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3444.017414   (avg 3363.108333)
+[2m2026-06-04T15:39:31.433163Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4432.645905   (avg 4350.858333)
+[2m2026-06-04T15:39:32.437792Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   74.941245   (avg 72.833619)
+[2m2026-06-04T15:39:32.437839Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1720.286017   (avg 1701.700000)
+[2m2026-06-04T15:39:32.437845Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.344305ms (avg 13.761550ms)
+[2m2026-06-04T15:39:32.437908Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:32.437917Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 357.000000
+[2m2026-06-04T15:39:32.437921Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3446.558616   (avg 3448.483333)
+[2m2026-06-04T15:39:32.437924Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4470.077902   (avg 4451.866667)
+[2m2026-06-04T15:39:33.446699Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   64.952470   (avg 72.597949)
+[2m2026-06-04T15:39:33.446761Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1618.004843   (avg 1675.933333)
+[2m2026-06-04T15:39:33.446766Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   15.411701ms (avg 13.800890ms)
+[2m2026-06-04T15:39:33.446770Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:33.446775Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 430.000000
+[2m2026-06-04T15:39:33.446779Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3157.166555   (avg 3331.308333)
+[2m2026-06-04T15:39:33.446783Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4182.117408   (avg 4354.708333)
+[2m2026-06-04T15:39:34.440552Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   77.357459   (avg 73.204547)
+[2m2026-06-04T15:39:34.440596Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1714.626229   (avg 1665.158333)
+[2m2026-06-04T15:39:34.440602Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   12.935582ms (avg 13.715916ms)
+[2m2026-06-04T15:39:34.440606Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:34.440610Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 503.000000
+[2m2026-06-04T15:39:34.440614Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3301.531553   (avg 3242.866667)
+[2m2026-06-04T15:39:34.440618Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4366.294323   (avg 4285.008333)
+[2m2026-06-04T15:39:35.439915Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   72.344941   (avg 73.785030)
+[2m2026-06-04T15:39:35.439958Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1785.637941   (avg 1739.308333)
+[2m2026-06-04T15:39:35.439964Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.822872ms (avg 13.585454ms)
+[2m2026-06-04T15:39:35.439968Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:35.439973Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 576.000000
+[2m2026-06-04T15:39:35.439977Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3449.744438   (avg 3368.866667)
+[2m2026-06-04T15:39:35.439981Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4544.650726   (avg 4439.200000)
+[2m2026-06-04T15:39:36.438421Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   74.726372   (avg 72.451190)
+[2m2026-06-04T15:39:36.438479Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1805.422834   (avg 1776.691667)
+[2m2026-06-04T15:39:36.438485Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.383080ms (avg 13.871388ms)
+[2m2026-06-04T15:39:36.438489Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:36.438494Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 648.000000
+[2m2026-06-04T15:39:36.438498Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3446.000045   (avg 3437.066667)
+[2m2026-06-04T15:39:36.438511Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4558.897637   (avg 4526.066667)
+[2m2026-06-04T15:39:37.437158Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   71.227464   (avg 73.331389)
+[2m2026-06-04T15:39:37.437218Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1775.512833   (avg 1789.925000)
+[2m2026-06-04T15:39:37.437230Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   14.040161ms (avg 13.696192ms)
+[2m2026-06-04T15:39:37.437239Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:37.437249Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 722.000000
+[2m2026-06-04T15:39:37.437258Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3344.156604   (avg 3410.191667)
+[2m2026-06-04T15:39:37.437266Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4468.609343   (avg 4523.291667)
+[2m2026-06-04T15:39:38.437496Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   70.122761   (avg 73.577449)
+[2m2026-06-04T15:39:38.437540Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1802.694011   (avg 1781.541667)
+[2m2026-06-04T15:39:38.437545Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   14.262366ms (avg 13.614044ms)
+[2m2026-06-04T15:39:38.437549Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:38.437555Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 795.000000
+[2m2026-06-04T15:39:38.437559Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3381.117280   (avg 3353.266667)
+[2m2026-06-04T15:39:38.437562Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4537.917222   (avg 4484.091667)
+[2m2026-06-04T15:39:39.434859Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   73.713814   (avg 73.184881)
+[2m2026-06-04T15:39:39.434914Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1790.177352   (avg 1796.241667)
+[2m2026-06-04T15:39:39.434921Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.571901ms (avg 13.705992ms)
+[2m2026-06-04T15:39:39.434925Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:39.434930Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 868.000000
+[2m2026-06-04T15:39:39.434935Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3381.053108   (avg 3376.083333)
+[2m2026-06-04T15:39:39.434939Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4546.446800   (avg 4528.900000)
+[2m2026-06-04T15:39:40.437024Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   74.395107   (avg 73.360993)
+[2m2026-06-04T15:39:40.437077Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1821.051315   (avg 1801.775000)
+[2m2026-06-04T15:39:40.437082Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.442799ms (avg 13.715308ms)
+[2m2026-06-04T15:39:40.437086Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:40.437091Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 941.000000
+[2m2026-06-04T15:39:40.437095Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3443.999275   (avg 3417.225000)
+[2m2026-06-04T15:39:40.437098Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4609.051547   (avg 4571.816667)
+[2m2026-06-04T15:39:41.434446Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   74.864631   (avg 72.574051)
+[2m2026-06-04T15:39:41.434497Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1827.216757   (avg 1818.350000)
+[2m2026-06-04T15:39:41.434512Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.359740ms (avg 13.833485ms)
+[2m2026-06-04T15:39:41.434520Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:41.434525Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1014.000000
+[2m2026-06-04T15:39:41.434529Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3444.000000   (avg 3444.000000)
+[2m2026-06-04T15:39:41.434533Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4614.763657   (avg 4606.075000)
+[2m2026-06-04T15:39:42.438859Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   76.873297   (avg 73.606416)
+[2m2026-06-04T15:39:42.438911Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1828.113291   (avg 1825.966667)
+[2m2026-06-04T15:39:42.438916Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.016602ms (avg 13.614095ms)
+[2m2026-06-04T15:39:42.438920Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:42.438926Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1088.000000
+[2m2026-06-04T15:39:42.438929Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3444.000000   (avg 3444.000000)
+[2m2026-06-04T15:39:42.438933Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4615.115233   (avg 4613.291667)
+[2m2026-06-04T15:39:43.443979Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   74.085739   (avg 73.786670)
+[2m2026-06-04T15:39:43.444045Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1860.280009   (avg 1831.841667)
+[2m2026-06-04T15:39:43.444052Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.499185ms (avg 13.589775ms)
+[2m2026-06-04T15:39:43.444056Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:43.444061Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1162.000000
+[2m2026-06-04T15:39:43.444065Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3446.124001   (avg 3445.733333)
+[2m2026-06-04T15:39:43.444068Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4639.003659   (avg 4617.866667)
+[2m2026-06-04T15:39:44.446989Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   75.269721   (avg 74.466430)
+[2m2026-06-04T15:39:44.447032Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1836.301761   (avg 1844.033333)
+[2m2026-06-04T15:39:44.447037Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.285695ms (avg 13.513551ms)
+[2m2026-06-04T15:39:44.447042Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:44.447046Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1236.000000
+[2m2026-06-04T15:39:44.447050Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3373.087347   (avg 3420.808333)
+[2m2026-06-04T15:39:44.447054Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4571.347079   (avg 4609.333333)
+[2m2026-06-04T15:39:45.445639Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   72.006303   (avg 74.781792)
+[2m2026-06-04T15:39:45.445703Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1834.984787   (avg 1835.266667)
+[2m2026-06-04T15:39:45.445709Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.890947ms (avg 13.455752ms)
+[2m2026-06-04T15:39:45.445714Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:45.445720Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1311.000000
+[2m2026-06-04T15:39:45.445733Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3373.000001   (avg 3374.216667)
+[2m2026-06-04T15:39:45.445741Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4565.385429   (avg 4569.783333)
+[2m2026-06-04T15:39:46.433055Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   66.989034   (avg 75.196417)
+[2m2026-06-04T15:39:46.433104Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1837.749000   (avg 1835.458333)
+[2m2026-06-04T15:39:46.433110Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   14.929710ms (avg 13.320563ms)
+[2m2026-06-04T15:39:46.433114Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:46.433119Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1385.000000
+[2m2026-06-04T15:39:46.433124Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3373.000000   (avg 3373.000000)
+[2m2026-06-04T15:39:46.433128Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4567.493877   (avg 4566.116667)
+[2m2026-06-04T15:39:47.443957Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   76.659046   (avg 74.261309)
+[2m2026-06-04T15:39:47.444019Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1793.179662   (avg 1827.616667)
+[2m2026-06-04T15:39:47.444024Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.050315ms (avg 13.483723ms)
+[2m2026-06-04T15:39:47.444028Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:47.444033Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1460.000000
+[2m2026-06-04T15:39:47.444037Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3229.996924   (avg 3346.991667)
+[2m2026-06-04T15:39:47.444041Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4427.503191   (avg 4540.450000)
+[2m2026-06-04T15:39:48.446281Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   72.171747   (avg 74.192598)
+[2m2026-06-04T15:39:48.446326Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1802.954885   (avg 1805.766667)
+[2m2026-06-04T15:39:48.446331Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.869926ms (avg 13.495212ms)
+[2m2026-06-04T15:39:48.446336Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:48.446342Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1534.000000
+[2m2026-06-04T15:39:48.446346Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3228.000016   (avg 3257.541667)
+[2m2026-06-04T15:39:48.446349Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4435.792851   (avg 4459.641667)
+[2m2026-06-04T15:39:49.445013Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   75.296780   (avg 73.613680)
+[2m2026-06-04T15:39:49.445066Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1806.745428   (avg 1802.375000)
+[2m2026-06-04T15:39:49.445073Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.282165ms (avg 13.610093ms)
+[2m2026-06-04T15:39:49.445077Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:49.445081Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1607.000000
+[2m2026-06-04T15:39:49.445085Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3228.000000   (avg 3228.000000)
+[2m2026-06-04T15:39:49.445089Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4433.788949   (avg 4434.700000)
+[2m2026-06-04T15:39:50.434834Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   75.059787   (avg 73.517110)
+[2m2026-06-04T15:39:50.434989Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1824.798057   (avg 1813.716667)
+[2m2026-06-04T15:39:50.435006Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.324124ms (avg 13.618536ms)
+[2m2026-06-04T15:39:50.435010Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:50.435015Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1680.000000
+[2m2026-06-04T15:39:50.435019Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3228.000000   (avg 3228.000000)
+[2m2026-06-04T15:39:50.435023Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4458.146353   (avg 4445.516667)
+[2m2026-06-04T15:39:51.444948Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   74.197076   (avg 73.542581)
+[2m2026-06-04T15:39:51.445018Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1797.617954   (avg 1820.400000)
+[2m2026-06-04T15:39:51.445025Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.505094ms (avg 13.618864ms)
+[2m2026-06-04T15:39:51.445029Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:51.445035Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1754.000000
+[2m2026-06-04T15:39:51.445039Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3137.734550   (avg 3217.916667)
+[2m2026-06-04T15:39:51.445043Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4369.168845   (avg 4447.066667)
+[2m2026-06-04T15:39:52.434911Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   76.972615   (avg 71.641742)
+[2m2026-06-04T15:39:52.434963Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1788.273579   (avg 1799.683333)
+[2m2026-06-04T15:39:52.434969Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   12.993929ms (avg 14.057188ms)
+[2m2026-06-04T15:39:52.434973Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:52.434979Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1823.000000
+[2m2026-06-04T15:39:52.434983Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3118.000248   (avg 3154.666667)
+[2m2026-06-04T15:39:52.434987Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4342.276750   (avg 4380.708333)
+[2m2026-06-04T15:39:53.446681Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   66.924652   (avg 71.437423)
+[2m2026-06-04T15:39:53.446726Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1788.896258   (avg 1788.758333)
+[2m2026-06-04T15:39:53.446733Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   14.947800ms (avg 14.094247ms)
+[2m2026-06-04T15:39:53.446738Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:53.446744Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1895.000000
+[2m2026-06-04T15:39:53.446749Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3118.000000   (avg 3118.000000)
+[2m2026-06-04T15:39:53.446753Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4341.908843   (avg 4342.641667)
+[2m2026-06-04T15:39:54.436572Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   74.363967   (avg 72.189528)
+[2m2026-06-04T15:39:54.436620Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1917.022490   (avg 1856.883333)
+[2m2026-06-04T15:39:54.436626Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.448844ms (avg 13.922076ms)
+[2m2026-06-04T15:39:54.436630Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:54.436696Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 1967.000000
+[2m2026-06-04T15:39:54.436704Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3442.990164   (avg 3300.141667)
+[2m2026-06-04T15:39:54.436708Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4664.982990   (avg 4520.650000)
+[2m2026-06-04T15:39:55.440820Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   74.882431   (avg 73.798475)
+[2m2026-06-04T15:39:55.440865Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1906.087130   (avg 1911.575000)
+[2m2026-06-04T15:39:55.440871Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.354722ms (avg 13.570572ms)
+[2m2026-06-04T15:39:55.440876Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:55.440881Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2041.000000
+[2m2026-06-04T15:39:55.440885Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3446.000455   (avg 3445.900000)
+[2m2026-06-04T15:39:55.440889Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4660.763258   (avg 4664.441667)
+[2m2026-06-04T15:39:56.435174Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   72.276352   (avg 73.368828)
+[2m2026-06-04T15:39:56.435228Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1844.224381   (avg 1872.900000)
+[2m2026-06-04T15:39:56.435234Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.839994ms (avg 13.661091ms)
+[2m2026-06-04T15:39:56.435238Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:56.435243Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2113.000000
+[2m2026-06-04T15:39:56.435247Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3303.003872   (avg 3366.158333)
+[2m2026-06-04T15:39:56.435250Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4503.230355   (avg 4574.691667)
+[2m2026-06-04T15:39:57.441129Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   75.916741   (avg 73.459739)
+[2m2026-06-04T15:39:57.441175Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1845.629732   (avg 1844.691667)
+[2m2026-06-04T15:39:57.441181Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.174147ms (avg 13.638513ms)
+[2m2026-06-04T15:39:57.441185Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:57.441190Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2187.000000
+[2m2026-06-04T15:39:57.441194Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3303.000000   (avg 3303.000000)
+[2m2026-06-04T15:39:57.441198Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4502.635535   (avg 4502.908333)
+[2m2026-06-04T15:39:58.434748Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   72.396982   (avg 72.566483)
+[2m2026-06-04T15:39:58.434815Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1856.319277   (avg 1848.333333)
+[2m2026-06-04T15:39:58.434821Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.817212ms (avg 13.814959ms)
+[2m2026-06-04T15:39:58.434825Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:58.434830Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2258.000000
+[2m2026-06-04T15:39:58.434833Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3303.000000   (avg 3303.000000)
+[2m2026-06-04T15:39:58.434837Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4507.161948   (avg 4503.341667)
+[2m2026-06-04T15:39:59.445461Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   63.380913   (avg 68.495522)
+[2m2026-06-04T15:39:59.445511Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1894.397125   (avg 1851.825000)
+[2m2026-06-04T15:39:59.445517Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   15.783000ms (avg 14.720681ms)
+[2m2026-06-04T15:39:59.445522Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:39:59.445527Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2324.000000
+[2m2026-06-04T15:39:59.445532Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3367.153316   (avg 3292.816667)
+[2m2026-06-04T15:39:59.445536Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4571.409500   (avg 4495.958333)
+[2m2026-06-04T15:40:00.439589Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   73.272257   (avg 65.977051)
+[2m2026-06-04T15:40:00.439632Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1896.520984   (avg 1876.575000)
+[2m2026-06-04T15:40:00.439637Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.654558ms (avg 15.272665ms)
+[2m2026-06-04T15:40:00.439642Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:40:00.439646Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2390.000000
+[2m2026-06-04T15:40:00.439650Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3367.999990   (avg 3329.933333)
+[2m2026-06-04T15:40:00.439654Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4573.521418   (avg 4535.133333)
+[2m2026-06-04T15:40:01.446921Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   73.913775   (avg 67.930745)
+[2m2026-06-04T15:40:01.446968Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1870.376244   (avg 1892.175000)
+[2m2026-06-04T15:40:01.446974Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.529826ms (avg 14.799059ms)
+[2m2026-06-04T15:40:01.446978Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:40:01.446983Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2459.000000
+[2m2026-06-04T15:40:01.446987Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3414.915805   (avg 3375.150000)
+[2m2026-06-04T15:40:01.446991Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4620.424327   (avg 4580.750000)
+[2m2026-06-04T15:40:02.436067Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   64.187341   (avg 67.900268)
+[2m2026-06-04T15:40:02.436134Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1898.073743   (avg 1884.025000)
+[2m2026-06-04T15:40:02.436141Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   15.579448ms (avg 14.795299ms)
+[2m2026-06-04T15:40:02.436145Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:40:02.436150Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2525.000000
+[2m2026-06-04T15:40:02.436154Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3424.254385   (avg 3381.083333)
+[2m2026-06-04T15:40:02.436158Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4632.919223   (avg 4587.391667)
+[2m2026-06-04T15:40:03.446765Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   64.888052   (avg 69.804382)
+[2m2026-06-04T15:40:03.446813Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1743.086843   (avg 1832.116667)
+[2m2026-06-04T15:40:03.446829Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   15.547139ms (avg 14.415875ms)
+[2m2026-06-04T15:40:03.446840Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:40:03.446846Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2597.000000
+[2m2026-06-04T15:40:03.446851Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3078.570753   (avg 3219.183333)
+[2m2026-06-04T15:40:03.446856Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4287.718685   (avg 4428.408333)
+[2m2026-06-04T15:40:04.436210Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   70.922649   (avg 72.961074)
+[2m2026-06-04T15:40:04.436265Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1906.874753   (avg 1851.308333)
+[2m2026-06-04T15:40:04.436271Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   14.100483ms (avg 13.766802ms)
+[2m2026-06-04T15:40:04.436275Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:40:04.436280Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2669.000000
+[2m2026-06-04T15:40:04.436284Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3444.995131   (avg 3280.716667)
+[2m2026-06-04T15:40:04.436288Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4660.860540   (avg 4491.516667)
+[2m2026-06-04T15:40:05.436216Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   72.643036   (avg 72.840394)
+[2m2026-06-04T15:40:05.436280Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1905.554701   (avg 1904.916667)
+[2m2026-06-04T15:40:05.436286Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.770182ms (avg 13.749674ms)
+[2m2026-06-04T15:40:05.436290Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:40:05.436295Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2741.000000
+[2m2026-06-04T15:40:05.436300Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3445.000000   (avg 3445.000000)
+[2m2026-06-04T15:40:05.436304Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4659.557355   (avg 4658.600000)
+[2m2026-06-04T15:40:06.437264Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   69.271813   (avg 72.536937)
+[2m2026-06-04T15:40:06.437329Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1866.811152   (avg 1892.216667)
+[2m2026-06-04T15:40:06.437334Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   14.436137ms (avg 13.808037ms)
+[2m2026-06-04T15:40:06.437339Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:40:06.437344Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2814.000000
+[2m2026-06-04T15:40:06.437348Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3447.802867   (avg 3446.516667)
+[2m2026-06-04T15:40:06.437352Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4631.198069   (avg 4648.250000)
+[2m2026-06-04T15:40:07.444383Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   72.195314   (avg 72.224852)
+[2m2026-06-04T15:40:07.444439Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1866.925538   (avg 1868.516667)
+[2m2026-06-04T15:40:07.444445Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.851516ms (avg 13.868498ms)
+[2m2026-06-04T15:40:07.444449Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:40:07.444454Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2886.000000
+[2m2026-06-04T15:40:07.444466Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3447.000009   (avg 3447.716667)
+[2m2026-06-04T15:40:07.444473Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4630.909185   (avg 4630.491667)
+[2m2026-06-04T15:40:08.444621Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   71.368183   (avg 70.744685)
+[2m2026-06-04T15:40:08.444665Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1864.051923   (avg 1864.800000)
+[2m2026-06-04T15:40:08.444671Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   14.019495ms (avg 14.196581ms)
+[2m2026-06-04T15:40:08.444675Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:40:08.444680Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 2956.000000
+[2m2026-06-04T15:40:08.444684Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3447.000000   (avg 3447.000000)
+[2m2026-06-04T15:40:08.444688Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4627.744565   (avg 4628.391667)
+[2m2026-06-04T15:40:09.438743Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m fps               :   74.142339   (avg 69.990738)
+[2m2026-06-04T15:40:09.438791Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m meshes            : 1859.367320   (avg 1861.500000)
+[2m2026-06-04T15:40:09.438798Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_time        :   13.490430ms (avg 14.344095ms)
+[2m2026-06-04T15:40:09.438802Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m started_load_count:  102.000000   (avg 102.000000)
+[2m2026-06-04T15:40:09.438807Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m frame_count       : 3026.000000
+[2m2026-06-04T15:40:09.438811Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m chunks            : 3447.385771   (avg 3450.566667)
+[2m2026-06-04T15:40:09.438815Z[0m [32m INFO[0m [2mbevy_diagnostic[0m[2m:[0m entity_count      : 4631.451862   (avg 4631.258333)
+[2m2026-06-04T15:40:09.808564Z[0m [32m INFO[0m [2mbevy_window::system[0m[2m:[0m No windows are open, exiting
+[2m2026-06-04T15:40:09.813033Z[0m [32m INFO[0m [2mbevy_winit::system[0m[2m:[0m Closing window 0v0

@@ -1,51 +1,63 @@
-//! inf3d_monitor — comprehensive per-run telemetry recorder.
+//! inf3d_monitor — comprehensive per-run telemetry recorder ("flight recorder").
 //!
-//! A read-only "flight recorder" that writes a dense log of the whole game state
-//! every run, so a developer (or an AI assistant reading the file) can reconstruct
-//! almost exactly what happened — frame timing, entity/mesh/chunk/foliage counts,
-//! asset counts, player physics, camera/zoom, quality settings, water, and
-//! pathfinding — without attaching a debugger.
+//! A read-only sink (like the HUD) that writes a dense log of the WHOLE engine
+//! state every run, so a developer — or an AI assistant reading the file — can
+//! reconstruct almost exactly what happened without attaching a debugger. It only
+//! *reads* ECS state (queries + resources); it never instruments other crates.
 //!
-//! It writes to **`inf3d-monitor.log`** in the process working directory
-//! (the repo root when launched via `cargo run -p inf3d_app`), overwriting it
-//! each run so the file always reflects the latest session. Disable by setting
-//! the env var `INF3D_NO_MONITOR=1`.
+//! Writes to **`inf3d-monitor.log`** in the process working directory (the repo
+//! root under `cargo run`), OVERWRITTEN each run so the file always reflects the
+//! latest session. Disable with `INF3D_NO_MONITOR=1`.
 //!
-//! ## What it captures
-//! - **Summary line** every [`SUMMARY_INTERVAL`] seconds: the full snapshot.
-//! - **SPIKE line** the instant a frame hitches (frame time over an absolute or
-//!   relative threshold), tagged with the frame-over-frame **deltas** of every
-//!   count and the number of fixed physics ticks that frame — so each hitch is
-//!   correlated with its likely cause (foliage spawn burst vs chunk remesh vs
-//!   physics catch-up). This is the line that explains stutters.
-//! - **EVENT lines** on discrete state changes: movement start/stop, quality
-//!   preset change.
-//!
-//! The recorder only *reads* ECS state (queries + resources) and frame-over-frame
-//! count deltas — it never instruments other crates, so it adds no coupling to the
-//! systems it watches (it's a pure downstream sink, like `inf3d_ui`).
+//! ## Line types
+//! - **FRAME** — every [`SUMMARY_INTERVAL`]s: the fast-changing per-frame numbers
+//!   (fps / dt / p95 / interval min-max / spike-count / fixed-ticks) plus world
+//!   counts (chunks / meshes / entities + deltas), player, zoom, dynamic render
+//!   distance.
+//! - **STATE** — every [`STATE_INTERVAL`]s (+ frame 1): the slow-changing full
+//!   pipeline state across several labelled sub-lines — CAMERA, GFX (post-FX +
+//!   prepass + MSAA + HDR), LIGHT (sun + shadows + cascades + ambient + clear),
+//!   QUALITY (fixed graphics fields), WATER, ASSETS. This is the section that makes
+//!   graphics / shader / lighting regressions visible (e.g. `shadows=false`).
+//! - **SPIKE** — the instant a frame hitches: frame-over-frame deltas of every
+//!   count + the real likely cause (streaming burst / foliage / despawn / high
+//!   zoom / physics). The cause heuristic checks the actual work deltas FIRST —
+//!   high `fixed_ticks` is a *symptom* of an already-slow frame, not the cause, so
+//!   it's the last resort, not the first guess.
+//! - **EVENT** — discrete changes: movement start/stop.
 
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 
 use bevy::camera::{Projection, ScalingMode};
+use bevy::core_pipeline::prepass::{DepthPrepass, MotionVectorPrepass, NormalPrepass};
+use bevy::light::{CascadeShadowConfig, DirectionalLightShadowMap};
+use bevy::pbr::ScreenSpaceAmbientOcclusion;
+use bevy::post_process::bloom::Bloom;
+use bevy::post_process::dof::DepthOfField;
+use bevy::post_process::motion_blur::MotionBlur;
 use bevy::prelude::*;
+use bevy::render::view::{Hdr, Msaa};
 use bevy_voxel_world::prelude::Chunk;
 use bevy_water::WaterSettings;
 
 use inf3d_camera::IsoCamera;
-use inf3d_core::{QualityPreset, QualitySettings, Rock, Tree};
+use inf3d_core::{QualitySettings, Rock, Tree};
 use inf3d_gameplay::{MovePath, Player};
-use inf3d_physics::{CharacterController, DesiredMove, InteractionTarget};
 use inf3d_pathfinding::PathTiming;
+use inf3d_physics::{CharacterController, DesiredMove, InteractionTarget};
 use inf3d_render::FoliageTile;
 use inf3d_world::MainWorld;
 
 /// Log file name (created in the process working directory, overwritten per run).
 const LOG_PATH: &str = "inf3d-monitor.log";
-/// Seconds between full summary lines.
+/// Seconds between FRAME lines (fast per-frame numbers).
 const SUMMARY_INTERVAL: f32 = 0.5;
+/// Seconds between full STATE dumps (slow-changing camera/gfx/light/quality
+/// state). Less frequent than FRAME so the log stays readable while still
+/// snapshotting the whole pipeline many times per run.
+const STATE_INTERVAL: f32 = 2.0;
 /// A frame slower than this (ms) is always logged as a spike.
 const SPIKE_ABS_MS: f32 = 24.0;
 /// ...or a frame slower than this multiple of the rolling median is a spike.
@@ -53,11 +65,11 @@ const SPIKE_MULT: f32 = 1.8;
 /// Rolling frame-time window length (samples) for median / p95.
 const WINDOW: usize = 120;
 /// Minimum samples before the *relative* (median-based) spike test engages, so
-/// the first chaotic startup frames don't each read as a spike.
+/// the chaotic startup frames don't each read as a spike.
 const SPIKE_WARMUP: usize = 30;
 
 /// Frame-over-frame countable quantities. Deltas of these on a spiked frame point
-/// straight at the cause (e.g. `meshes +40` == a foliage spawn burst).
+/// straight at the cause (e.g. `meshes +40` == a foliage/chunk spawn burst).
 #[derive(Default, Clone, Copy)]
 struct Counts {
     entities: i64,
@@ -82,8 +94,8 @@ impl Counts {
 }
 
 /// Counts the number of fixed-schedule ticks that elapse between rendered frames.
-/// `>= 2` on a spiked frame means the physics loop ran extra catch-up steps (a
-/// classic fixed-timestep hitch amplifier).
+/// `>= 2` on a spiked frame means the physics loop ran extra catch-up steps — but
+/// that is an *amplifier* of an already-slow frame, not usually the root cause.
 #[derive(Resource, Default)]
 struct FixedTickCounter(u32);
 
@@ -95,10 +107,15 @@ struct Monitor {
     frame: u64,
     times_ms: VecDeque<f32>,
     last_summary_t: f32,
+    last_state_t: f32,
     prev: Counts,
-    /// Previous-frame movement / preset, for edge-triggered EVENT lines.
+    /// Previous-frame movement, for edge-triggered EVENT lines.
     prev_moving: bool,
-    prev_preset: Option<QualityPreset>,
+    /// Min / max dt and spike count accumulated since the last FRAME line, so each
+    /// FRAME reports the worst case in its interval (not just the instant sample).
+    interval_min_ms: f32,
+    interval_max_ms: f32,
+    interval_spikes: u32,
 }
 
 impl Default for Monitor {
@@ -109,9 +126,12 @@ impl Default for Monitor {
             frame: 0,
             times_ms: VecDeque::with_capacity(WINDOW),
             last_summary_t: 0.0,
+            last_state_t: 0.0,
             prev: Counts::default(),
             prev_moving: false,
-            prev_preset: None,
+            interval_min_ms: f32::INFINITY,
+            interval_max_ms: 0.0,
+            interval_spikes: 0,
         }
     }
 }
@@ -152,19 +172,12 @@ fn open_log(mut mon: ResMut<Monitor>, quality: Res<QualitySettings>) {
             let _ = writeln!(
                 w,
                 "# inf3d monitor | run_epoch={epoch} | cwd={cwd}\n\
-                 # preset={} render_dist={} grass_radius={} foliage_ring_max={} \
-                 ssao={} motion_blur={} dof={} bloom={} water={} water_amp={}\n\
-                 # SUMMARY every {SUMMARY_INTERVAL}s; SPIKE on frame>{SPIKE_ABS_MS}ms or >{SPIKE_MULT}x median; deltas (d:) are vs previous frame",
-                quality.preset.name(),
+                 # graphics=fixed-high render_dist={} grass_radius={} foliage_ring_max={}\n\
+                 # FRAME every {SUMMARY_INTERVAL}s; STATE every {STATE_INTERVAL}s; \
+                 SPIKE on frame>{SPIKE_ABS_MS}ms or >{SPIKE_MULT}x median; d:=delta vs prev frame",
                 quality.render_distance_chunks,
                 quality.grass_radius_world,
                 quality.foliage_ring_max,
-                quality.ssao_enabled,
-                quality.motion_blur_enabled,
-                quality.dof_enabled,
-                quality.bloom_enabled,
-                quality.water_enabled,
-                quality.water_amplitude,
             );
             let _ = w.flush();
             mon.writer = Some(w);
@@ -177,6 +190,12 @@ fn open_log(mut mon: ResMut<Monitor>, quality: Res<QualitySettings>) {
     }
 }
 
+/// Format a `Color` as `r,g,b` (sRGB, 2 decimals) for compact logging.
+fn rgb(c: Color) -> String {
+    let s = c.to_srgba();
+    format!("{:.2},{:.2},{:.2}", s.red, s.green, s.blue)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_frame(
     time: Res<Time>,
@@ -185,10 +204,14 @@ fn record_frame(
     quality: Res<QualitySettings>,
     // Grouped into tuples to stay within Bevy's 16-system-param limit. All of
     // these are read-only, so the bundled queries never conflict with each other.
-    opt_res: (
+    res: (
         Option<Res<WaterSettings>>,
         Option<Res<PathTiming>>,
         Option<Res<InteractionTarget>>,
+        Res<MainWorld>,
+        Res<ClearColor>,
+        Option<Res<DirectionalLightShadowMap>>,
+        Option<Res<GlobalAmbientLight>>,
     ),
     assets: (
         Res<Assets<Mesh>>,
@@ -203,13 +226,35 @@ fn record_frame(
         Query<(), With<Rock>>,
         Query<(), With<FoliageTile>>,
     ),
-    q_player: Query<(&Transform, &Player, &CharacterController, &DesiredMove, &MovePath)>,
-    q_cam: Query<(&Projection, &GlobalTransform), With<IsoCamera>>,
+    q_player: Query<(
+        &Transform,
+        &Player,
+        &CharacterController,
+        &DesiredMove,
+        &MovePath,
+    )>,
+    q_cam: Query<
+        (
+            &Projection,
+            &GlobalTransform,
+            Option<&Bloom>,
+            Option<&DepthOfField>,
+            Option<&ScreenSpaceAmbientOcclusion>,
+            Option<&MotionBlur>,
+            Option<&DepthPrepass>,
+            Option<&NormalPrepass>,
+            Option<&MotionVectorPrepass>,
+            Option<&Hdr>,
+            Option<&Msaa>,
+        ),
+        With<IsoCamera>,
+    >,
+    q_light: Query<(&DirectionalLight, &Transform, Option<&CascadeShadowConfig>)>,
 ) {
     if !mon.enabled || mon.writer.is_none() {
         return;
     }
-    let (water, path_timing, interaction) = opt_res;
+    let (water, path_timing, interaction, main_world, clear, shadow_map, ambient) = res;
     let (meshes, materials, images) = assets;
     let (q_all, q_mesh, q_chunk, q_tree, q_rock, q_tiles) = count_q;
 
@@ -224,14 +269,26 @@ fn record_frame(
     let fixed_ticks = ticks.0;
     ticks.0 = 0;
 
-    // --- rolling frame-time stats ---
-    let mut sorted: Vec<f32> = mon.times_ms.iter().copied().collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = sorted.len();
-    let median = sorted[n / 2];
-    let p95 = sorted[(n * 95 / 100).min(n - 1)];
-    let mean = sorted.iter().sum::<f32>() / n as f32;
+    // --- rolling frame-time stats (select_nth, no full sort) ---
+    let mut samples: Vec<f32> = mon.times_ms.iter().copied().collect();
+    let n = samples.len();
+    let cmp = |a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+    let med_idx = n / 2;
+    let p95_idx = (n * 95 / 100).min(n - 1);
+    samples.select_nth_unstable_by(p95_idx, cmp);
+    let p95 = samples[p95_idx];
+    samples.select_nth_unstable_by(med_idx, cmp);
+    let median = samples[med_idx];
+    let mean = mon.times_ms.iter().sum::<f32>() / n as f32;
     let fps = if mean > 0.0 { 1000.0 / mean } else { 0.0 };
+
+    // --- spike test + per-interval min/max/spike accumulation ---
+    let is_spike = dt_ms > SPIKE_ABS_MS || (n >= SPIKE_WARMUP && dt_ms > median * SPIKE_MULT);
+    mon.interval_min_ms = mon.interval_min_ms.min(dt_ms);
+    mon.interval_max_ms = mon.interval_max_ms.max(dt_ms);
+    if is_spike {
+        mon.interval_spikes += 1;
+    }
 
     // --- counts (end-of-frame) + deltas ---
     let counts = Counts {
@@ -259,53 +316,132 @@ fn record_frame(
     };
     let moving = waypoints > 0;
 
-    // --- camera / zoom ---
-    let (zoom, cam_pos) = match q_cam.single() {
-        Ok((proj, gt)) => {
-            let z = match proj {
-                Projection::Orthographic(o) => match o.scaling_mode {
-                    ScalingMode::FixedVertical { viewport_height } => viewport_height,
-                    _ => -1.0,
-                },
-                _ => -1.0,
+    // --- camera + full graphics state ---
+    let (
+        zoom,
+        near,
+        far,
+        cam_pos,
+        hdr_on,
+        bloom_s,
+        dof_s,
+        ssao_s,
+        mb_s,
+        depth_pp,
+        normal_pp,
+        motion_pp,
+        msaa,
+    ) = match q_cam.single() {
+        Ok((proj, gt, bloom, dof, ssao, mb, dpp, npp, mpp, hdr, msaa)) => {
+            let (zoom, near, far) = match proj {
+                Projection::Orthographic(o) => {
+                    let z = match o.scaling_mode {
+                        ScalingMode::FixedVertical { viewport_height } => viewport_height,
+                        _ => -1.0,
+                    };
+                    (z, o.near, o.far)
+                }
+                _ => (-1.0, 0.0, 0.0),
             };
-            (z, gt.translation())
+            let msaa_samples = match msaa {
+                Some(Msaa::Off) => 1u32,
+                Some(Msaa::Sample2) => 2,
+                Some(Msaa::Sample4) => 4,
+                Some(Msaa::Sample8) => 8,
+                None => 0,
+            };
+            (
+                zoom,
+                near,
+                far,
+                gt.translation(),
+                hdr.is_some(),
+                bloom
+                    .map(|b| format!("on(int={:.2})", b.intensity))
+                    .unwrap_or_else(|| "off".to_string()),
+                dof.map(|d| format!("on(fd={:.0},f{:.0})", d.focal_distance, d.aperture_f_stops))
+                    .unwrap_or_else(|| "off".to_string()),
+                ssao
+                    .map(|s| format!("on({:?})", s.quality_level))
+                    .unwrap_or_else(|| "off".to_string()),
+                mb.map(|m| format!("on(sa={:.2},n={})", m.shutter_angle, m.samples))
+                    .unwrap_or_else(|| "off".to_string()),
+                dpp.is_some(),
+                npp.is_some(),
+                mpp.is_some(),
+                msaa_samples,
+            )
         }
-        Err(_) => (-1.0, Vec3::ZERO),
+        Err(_) => (
+            -1.0,
+            0.0,
+            0.0,
+            Vec3::ZERO,
+            false,
+            "?".to_string(),
+            "?".to_string(),
+            "?".to_string(),
+            "?".to_string(),
+            false,
+            false,
+            false,
+            0,
+        ),
     };
 
-    // --- pathfinding / interaction / water ---
+    // --- directional light + shadows (the section that exposes shadow regressions) ---
+    let light_str = match q_light.single() {
+        Ok((dl, tf, cascade)) => {
+            let dir = *tf.forward();
+            let (ncasc, max_b) = cascade
+                .map(|c| (c.bounds.len(), c.bounds.last().copied().unwrap_or(0.0)))
+                .unwrap_or((0, 0.0));
+            format!(
+                "dir=({:.2},{:.2},{:.2}) illum={:.0} color=({}) shadows={} cascades={} max_dist={:.0}",
+                dir.x, dir.y, dir.z, dl.illuminance, rgb(dl.color), dl.shadows_enabled, ncasc, max_b,
+            )
+        }
+        Err(_) => "NONE (no single DirectionalLight!)".to_string(),
+    };
+    let shadow_map_size = shadow_map.as_ref().map(|s| s.size).unwrap_or(0);
+    let ambient_str = ambient
+        .as_ref()
+        .map(|a| format!("({},bri={:.0})", rgb(a.color), a.brightness))
+        .unwrap_or_else(|| "none".to_string());
+
+    // --- pathfinding / interaction / water / streaming ---
     let (path_ms, path_exp) = path_timing
         .map(|p| (p.last_ms, p.last_expansions))
         .unwrap_or((0.0, 0));
     let has_target = interaction.map(|i| i.entity.is_some()).unwrap_or(false);
-    let water_amp = water.map(|w| w.amplitude);
-
-    // --- spike test ---
-    let is_spike = dt_ms > SPIKE_ABS_MS || (n >= SPIKE_WARMUP && dt_ms > median * SPIKE_MULT);
-
-    // Asset counts (Res params, independent of `mon`).
+    let water_amp = water.as_ref().map(|w| w.amplitude);
+    let render_dist_dyn = main_world.render_distance_chunks;
     let (mesh_assets, mat_assets, img_assets) = (meshes.len(), materials.len(), images.len());
 
-    // Snapshot the edge-trigger state + decide what to write BEFORE borrowing the
-    // writer — `mon.writer.as_mut()` goes through `ResMut`'s deref, which locks
-    // the whole resource, so we must not read other `mon` fields while it's held.
+    // Snapshot mon-owned fields BEFORE borrowing the writer — `mon.writer.as_mut()`
+    // locks the whole resource through `ResMut`'s deref, so we must not read other
+    // `mon` fields while it's held.
     let moving_changed = moving != mon.prev_moving;
-    let preset_changed = mon.prev_preset != Some(quality.preset);
     let should_summary = elapsed - mon.last_summary_t >= SUMMARY_INTERVAL;
+    let should_state = frame == 1 || elapsed - mon.last_state_t >= STATE_INTERVAL;
+    let interval_min = mon.interval_min_ms;
+    let interval_max = mon.interval_max_ms;
+    let interval_spikes = mon.interval_spikes;
 
-    // All writes happen inside this scope; the writer borrow ends with it, so the
-    // `mon.*` field updates afterward are free of a conflicting borrow.
     if let Some(writer) = mon.writer.as_mut() {
         if is_spike {
-            let cause = if fixed_ticks >= 2 {
-                "physics catch-up (fixed_ticks>=2)"
-            } else if d.chunks.abs() >= 2 {
-                "chunk (re)mesh"
-            } else if d.meshes >= 16 || (d.trees + d.rocks) >= 8 {
+            // Inspect the ACTUAL work deltas first; high `fixed_ticks` is a symptom
+            // of an already-slow frame, so it's the last resort, not the first guess.
+            let cause = if d.chunks.abs() >= 8 || d.meshes.abs() >= 30 {
+                "chunk/mesh streaming burst"
+            } else if d.trees + d.rocks >= 8 || d.meshes >= 12 {
                 "foliage spawn burst"
             } else if d.entities <= -16 {
                 "despawn burst"
+            } else if zoom >= 70.0 {
+                "high-zoom render load"
+            } else if fixed_ticks >= 4 {
+                "physics catch-up (amplifier)"
             } else {
                 "unknown (GPU/asset upload?)"
             };
@@ -313,7 +449,7 @@ fn record_frame(
                 writer,
                 "[t={elapsed:8.2} f={frame:>7}] *** SPIKE dt={dt_ms:6.1}ms (median {median:.1}, p95 {p95:.1}) fixed_ticks={fixed_ticks} *** \
                  cause={cause} | d: ent{:+} mesh{:+} chunk{:+} tile{:+} tree{:+} rock{:+} | \
-                 moving={moving} wps={waypoints} player=({:.1},{:.1},{:.1}) cell=({},{}) zoom={zoom:.0}",
+                 moving={moving} wps={waypoints} player=({:.1},{:.1},{:.1}) cell=({},{}) zoom={zoom:.0} rd={render_dist_dyn}",
                 d.entities, d.meshes, d.chunks, d.foliage_tiles, d.trees, d.rocks,
                 ppos.x, ppos.y, ppos.z, pcell.x, pcell.y,
             );
@@ -327,48 +463,55 @@ fn record_frame(
             );
         }
 
-        if preset_changed {
-            let _ = writeln!(
-                writer,
-                "[t={elapsed:8.2} f={frame:>7}] EVENT preset={} render_dist={} grass_radius={} ssao={} mb={} dof={} bloom={} water={}",
-                quality.preset.name(),
-                quality.render_distance_chunks,
-                quality.grass_radius_world,
-                quality.ssao_enabled,
-                quality.motion_blur_enabled,
-                quality.dof_enabled,
-                quality.bloom_enabled,
-                quality.water_enabled,
-            );
-        }
-
         if should_summary {
             let _ = writeln!(
                 writer,
-                "[t={elapsed:8.2} f={frame:>7}] fps={fps:5.1} dt={dt_ms:5.1}ms p95={p95:5.1}ms fixed_ticks={fixed_ticks} | \
-                 ent={} mesh={} chunk={} tile={} tree={} rock={} | assets: mesh={mesh_assets} mat={mat_assets} img={img_assets} | \
-                 player=({:.1},{:.1},{:.1}) cell=({},{}) facing={pfacing:.2} grounded={grounded} vy={vvel:+.2} desired=({:.1},{:.1},{:.1}) wps={waypoints} | \
-                 cam=({:.1},{:.1},{:.1}) zoom={zoom:.1} | path_last={path_ms:.2}ms exp={path_exp} target={has_target} | \
-                 water_amp={} | preset={} ssao={} mb={} dof={} bloom={}",
-                counts.entities, counts.meshes, counts.chunks, counts.foliage_tiles, counts.trees, counts.rocks,
-                ppos.x, ppos.y, ppos.z, pcell.x, pcell.y, desired.x, desired.y, desired.z,
-                cam_pos.x, cam_pos.y, cam_pos.z,
-                water_amp.map(|a| format!("{a:.2}")).unwrap_or_else(|| "off".to_string()),
-                quality.preset.name(), quality.ssao_enabled, quality.motion_blur_enabled,
-                quality.dof_enabled, quality.bloom_enabled,
+                "[t={elapsed:8.2} f={frame:>7}] FRAME fps={fps:5.1} dt={dt_ms:5.1} p95={p95:5.1} min={interval_min:5.1} max={interval_max:6.1} spikes/intvl={interval_spikes} fixed_ticks={fixed_ticks} | \
+                 chunk={}(d{:+}) mesh={}(d{:+}) ent={}(d{:+}) | tile={} tree={} rock={} | \
+                 player=({:.1},{:.1},{:.1}) cell=({},{}) grounded={grounded} vy={vvel:+.2} wps={waypoints} | zoom={zoom:.0} rd_dyn={render_dist_dyn} | path={path_ms:.2}ms exp={path_exp} target={has_target}",
+                counts.chunks, d.chunks, counts.meshes, d.meshes, counts.entities, d.entities,
+                counts.foliage_tiles, counts.trees, counts.rocks,
+                ppos.x, ppos.y, ppos.z, pcell.x, pcell.y,
             );
         }
 
-        if is_spike || moving_changed || preset_changed || should_summary {
+        if should_state {
+            let _ = writeln!(
+                writer,
+                "[t={elapsed:8.2} f={frame:>7}] STATE\n\
+                 \x20 CAMERA pos=({:.1},{:.1},{:.1}) zoom={zoom:.1} near={near:.1} far={far:.1} facing={pfacing:.2} desired=({:.1},{:.1},{:.1})\n\
+                 \x20 GFX hdr={hdr_on} bloom={bloom_s} dof={dof_s} ssao={ssao_s} motion_blur={mb_s} msaa={msaa} depth_pp={depth_pp} normal_pp={normal_pp} motion_pp={motion_pp}\n\
+                 \x20 LIGHT {light_str} shadow_map={shadow_map_size} ambient={ambient_str} clear=({})\n\
+                 \x20 QUALITY fixed_high=true rd_base={} rd_dyn={} ssao={} mb={} dof={} bloom={} water={}(amp={:.2}) grass_radius={:.0} foliage_ring_max={} terrain_lod={:.0}\n\
+                 \x20 WATER amp={} | ASSETS mesh={mesh_assets} mat={mat_assets} img={img_assets}",
+                cam_pos.x, cam_pos.y, cam_pos.z,
+                desired.x, desired.y, desired.z,
+                rgb(clear.0),
+                quality.render_distance_chunks, render_dist_dyn,
+                quality.ssao_enabled, quality.motion_blur_enabled, quality.dof_enabled,
+                quality.bloom_enabled, quality.water_enabled, quality.water_amplitude,
+                quality.grass_radius_world, quality.foliage_ring_max,
+                main_world.terrain_lod_distance,
+                water_amp.map(|a| format!("{a:.2}")).unwrap_or_else(|| "off".to_string()),
+            );
+        }
+
+        if is_spike || moving_changed || should_summary || should_state {
             let _ = writer.flush();
         }
     }
 
-    // Borrow of `mon.writer` is released; safe to mutate `mon` fields now.
+    // Borrow of `mon.writer` released; safe to mutate `mon` fields now.
     mon.prev = counts;
     mon.prev_moving = moving;
-    mon.prev_preset = Some(quality.preset);
     if should_summary {
         mon.last_summary_t = elapsed;
+        // Reset the per-interval accumulators for the next FRAME window.
+        mon.interval_min_ms = f32::INFINITY;
+        mon.interval_max_ms = 0.0;
+        mon.interval_spikes = 0;
+    }
+    if should_state {
+        mon.last_state_t = elapsed;
     }
 }

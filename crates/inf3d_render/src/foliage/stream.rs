@@ -20,7 +20,7 @@
 //! props don't pop out the moment the camera nudges or zooms — tiles only unload
 //! well outside the visible area. The spawn ring scales with the camera's
 //! orthographic viewport ([`compute_ring`]) so zooming out fills trees/rocks to
-//! the iso-view edges, clamped to the quality preset's `foliage_ring_max`.
+//! the iso-view edges, clamped to fixed settings' `foliage_ring_max`.
 //!
 //! ## Grass layer — [`stream_grass`]
 //!
@@ -63,9 +63,13 @@ const RING_MIN: i32 = 2;
 /// isn't orthographic).
 const RING_FALLBACK: i32 = 3;
 /// Multiplier from the camera's orthographic `viewport_height` to the
-/// world-XZ radius the solid foliage ring needs to cover. Generous (> the literal
-/// half-height) so the spawn ring already covers a margin around the viewport.
-const RING_ZOOM_COVERAGE: f32 = 1.1;
+/// world-XZ radius the solid foliage ring needs to cover. Kept well above the
+/// literal half-height so the spawn ring reaches a MARGIN beyond the visible
+/// viewport — props are scattered before they scroll into view, so they don't
+/// "pop in" at the screen edge as the player walks. (Raised 1.1 -> 1.35; pairs
+/// with the higher `foliage_ring_max` cap so this margin isn't clamped away when
+/// zoomed out.)
+const RING_ZOOM_COVERAGE: f32 = 1.35;
 /// Extra tiles the *despawn* ring extends past the *spawn* ring (hysteresis) for
 /// the solid layer.
 const DESPAWN_RING_MARGIN: i32 = 2;
@@ -122,7 +126,13 @@ pub(super) fn stream_solid(
     let despawn_ring = spawn_ring + DESPAWN_RING_MARGIN;
 
     poll_solid_tasks(&mut commands, &assets, &mut field, &mut blocked);
-    despawn_solid_out_of_band(&mut commands, &mut field, &mut blocked, center, despawn_ring);
+    despawn_solid_out_of_band(
+        &mut commands,
+        &mut field,
+        &mut blocked,
+        center,
+        despawn_ring,
+    );
     start_solid_tasks(&assets, &terrain, &mut field, center, spawn_ring);
 }
 
@@ -140,8 +150,8 @@ pub(super) fn stream_grass(
     let Some(assets) = assets else {
         return;
     };
-    // Grass off when foliage is disabled entirely OR the preset's grass radius is
-    // non-positive (Potato). Either way, unload any grass that's still live.
+    // Grass off when foliage is disabled entirely OR the grass radius is
+    // non-positive. Either way, unload any grass that's still live.
     if !settings.foliage_enabled || settings.grass_radius_world <= 0.0 {
         clear_grass_tiles(&mut commands, &mut field);
         return;
@@ -352,7 +362,8 @@ fn start_solid_tasks(
         // `Vec3`s per category. Both move into the worker.
         let terrain_snapshot: Terrain = terrain.clone();
         let sizes_snapshot = sizes.clone();
-        let task = pool.spawn(async move { scatter_solid(&terrain_snapshot, tile, &sizes_snapshot) });
+        let task =
+            pool.spawn(async move { scatter_solid(&terrain_snapshot, tile, &sizes_snapshot) });
         field
             .tiles
             .insert(tile, SolidTileState::Pending(TileScatterTask { task }));
@@ -363,7 +374,7 @@ fn start_solid_tasks(
 // Grass layer
 // ---------------------------------------------------------------------------
 
-/// Grass off (disabled / Potato / radius 0): unload every live grass tile.
+/// Grass off (disabled / radius 0): unload every live grass tile.
 /// Grass records no blocked cells, so there's nothing to release.
 fn clear_grass_tiles(commands: &mut Commands, field: &mut GrassField) {
     if field.tiles.is_empty() {
@@ -554,18 +565,19 @@ mod tests {
 
     #[test]
     fn compute_ring_scales_with_zoom() {
-        // blocks = viewport_height * RING_ZOOM_COVERAGE (1.1); tiles = ceil(blocks / TILE).
-        // 90 * 1.1 = 99 → ceil(99/16) = 7.
+        // blocks = viewport_height * RING_ZOOM_COVERAGE (1.35); tiles = ceil(blocks / TILE).
+        // 90 * 1.35 = 121.5 → ceil(121.5/16) = 8, so full zoom-out is covered
+        // without the ring being clamped below the view.
         let proj = ortho_proj(90.0);
-        assert_eq!(compute_ring(Some(&proj), 8), 7);
-        // 44 * 1.1 = 48.4 → ceil(48.4/16) = 4.
+        assert_eq!(compute_ring(Some(&proj), 8), 8);
+        // 44 * 1.35 = 59.4 → ceil(59.4/16) = 4.
         let proj = ortho_proj(44.0);
         assert_eq!(compute_ring(Some(&proj), 8), 4);
     }
 
     #[test]
     fn grass_ring_zero_when_disabled() {
-        // radius 0.0 (Potato) / negative → no grass ring at all.
+        // radius 0.0 / negative → no grass ring at all.
         assert_eq!(grass_ring_tiles(0.0), 0);
         assert_eq!(grass_ring_tiles(-5.0), 0);
     }

@@ -135,7 +135,10 @@ fn handle_click(
     let Ok(t) = query.single() else {
         return;
     };
-    let start = IVec2::new(t.translation.x.floor() as i32, t.translation.z.floor() as i32);
+    let start = IVec2::new(
+        t.translation.x.floor() as i32,
+        t.translation.z.floor() as i32,
+    );
 
     requests.write(PathRequest { start, goal });
 }
@@ -172,8 +175,7 @@ fn dispatch_path_task(
         // String-pull the blocky 8-connected route into long straight diagonals
         // (Diablo feel) while keeping every dropped corner's clearance. No-op for
         // `None`/empty routes.
-        let cells =
-            cells.map(|route| smooth_path(&terrain_snapshot, &route, &blocked_snapshot));
+        let cells = cells.map(|route| smooth_path(&terrain_snapshot, &route, &blocked_snapshot));
         let elapsed_ms = started.elapsed().as_secs_f32() * 1000.0;
         PathSearchResult {
             cells,
@@ -804,14 +806,22 @@ mod tests {
         assert_eq!(path.last().copied(), Some(goal));
         // The path must detour: a straight 4-step run would clip the wall.
         // The shortest route around (over z=3 or z=-3) requires extra steps.
-        assert!(path.len() > 5, "expected detour, got direct path: {:?}", path);
+        assert!(
+            path.len() > 5,
+            "expected detour, got direct path: {:?}",
+            path
+        );
     }
 
     #[test]
     fn astar_gives_up_when_goal_is_unreachable() {
         let terrain = Island;
-        let (path, expansions) =
-            astar(&terrain, IVec2::new(0, 0), IVec2::new(10, 10), &no_blocked());
+        let (path, expansions) = astar(
+            &terrain,
+            IVec2::new(0, 0),
+            IVec2::new(10, 10),
+            &no_blocked(),
+        );
         assert!(path.is_none());
         // Island has no walkable neighbours, so the open set drains immediately
         // after popping `start`. Expansion budget must not be exhausted.
@@ -840,7 +850,11 @@ mod tests {
         }
         assert_eq!(path.first().copied(), Some(start));
         assert_eq!(path.last().copied(), Some(goal));
-        assert!(path.len() > 5, "expected detour, got direct path: {:?}", path);
+        assert!(
+            path.len() > 5,
+            "expected detour, got direct path: {:?}",
+            path
+        );
     }
 
     #[test]
@@ -890,7 +904,10 @@ mod tests {
         assert_eq!(path.last().copied(), Some(snapped));
         // The route must never set foot on the blocked prop cell.
         for cell in &path {
-            assert!(!blocked.contains(cell), "path stepped onto a blocked cell: {path:?}");
+            assert!(
+                !blocked.contains(cell),
+                "path stepped onto a blocked cell: {path:?}"
+            );
         }
     }
 
@@ -945,8 +962,12 @@ mod tests {
         // cells if it ran to completion. We just need a reachable goal whose
         // search the heuristic guides quickly; bound is sanity, not stress.
         let terrain = FlatLand { height: 5 };
-        let (_path, expansions) =
-            astar(&terrain, IVec2::new(0, 0), IVec2::new(20, 20), &no_blocked());
+        let (_path, expansions) = astar(
+            &terrain,
+            IVec2::new(0, 0),
+            IVec2::new(20, 20),
+            &no_blocked(),
+        );
         assert!(
             expansions <= MAX_EXPANSIONS,
             "A* exceeded its expansion cap: {expansions}"

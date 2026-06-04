@@ -166,12 +166,15 @@ fn build_voxel_mesh(
 
     let palette = &data.palette;
     let color_of = |pal_idx: u8| -> [f32; 4] {
-        let c = palette.get(pal_idx as usize).copied().unwrap_or(dot_vox::Color {
-            r: 255,
-            g: 0,
-            b: 255,
-            a: 255,
-        });
+        let c = palette
+            .get(pal_idx as usize)
+            .copied()
+            .unwrap_or(dot_vox::Color {
+                r: 255,
+                g: 0,
+                b: 255,
+                a: 255,
+            });
         let lin = bevy::color::LinearRgba::from(Color::srgba_u8(c.r, c.g, c.b, c.a));
         [lin.red, lin.green, lin.blue, lin.alpha]
     };
@@ -207,7 +210,14 @@ fn build_voxel_mesh(
                         normals.push(face.normal);
                         colors.push(color);
                     }
-                    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                    indices.extend_from_slice(&[
+                        base,
+                        base + 1,
+                        base + 2,
+                        base,
+                        base + 2,
+                        base + 3,
+                    ]);
                 }
             }
         }
@@ -255,7 +265,10 @@ fn build_voxel_mesh(
     // Post-scale bounding box: width (X), height (Y, == target_height), depth (Z).
     let scaled_size = extent * scale;
 
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
@@ -318,11 +331,26 @@ mod tests {
             models: vec![dot_vox::Model {
                 size: dot_vox::Size { x: 2, y: 1, z: 1 },
                 voxels: vec![
-                    dot_vox::Voxel { x: 0, y: 0, z: 0, i: 0 },
-                    dot_vox::Voxel { x: 1, y: 0, z: 0, i: 0 },
+                    dot_vox::Voxel {
+                        x: 0,
+                        y: 0,
+                        z: 0,
+                        i: 0,
+                    },
+                    dot_vox::Voxel {
+                        x: 1,
+                        y: 0,
+                        z: 0,
+                        i: 0,
+                    },
                 ],
             }],
-            palette: vec![dot_vox::Color { r: 0, g: 255, b: 0, a: 255 }],
+            palette: vec![dot_vox::Color {
+                r: 0,
+                g: 255,
+                b: 0,
+                a: 255,
+            }],
             materials: vec![],
             scenes: vec![],
             layers: vec![],
@@ -332,7 +360,10 @@ mod tests {
         // so the width (X) stays at twice the height (2.0) — the fix's whole
         // point (previously it would have been squashed to make width == 1.0).
         assert!((size.y - 1.0).abs() < 1e-5, "height should equal target");
-        assert!((size.x - 2.0).abs() < 1e-5, "width preserved relative to height");
+        assert!(
+            (size.x - 2.0).abs() < 1e-5,
+            "width preserved relative to height"
+        );
         let pos = mesh
             .attribute(Mesh::ATTRIBUTE_POSITION)
             .and_then(|a| match a {

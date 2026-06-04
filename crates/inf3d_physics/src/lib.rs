@@ -457,7 +457,13 @@ fn update_interaction_target(
         });
 
     let filter = SpatialQueryFilter::from_mask([GameLayer::Solid]);
-    let hit = spatial.cast_ray(ray.origin, ray.direction, INTERACT_RAY_LENGTH, true, &filter);
+    let hit = spatial.cast_ray(
+        ray.origin,
+        ray.direction,
+        INTERACT_RAY_LENGTH,
+        true,
+        &filter,
+    );
 
     match hit {
         Some(h) => {
@@ -493,8 +499,7 @@ mod tests {
     fn step_up_one_voxel_accepted() {
         let (feet, center) = resting_on(0.0);
         let surface = 1.0; // one voxel rise
-        let (new_y, grounded, vv) =
-            resolve_ground(feet, center, surface, FOOT_OFFSET, 0.0, DT);
+        let (new_y, grounded, vv) = resolve_ground(feet, center, surface, FOOT_OFFSET, 0.0, DT);
         assert!(grounded, "a 1-voxel step must keep the player grounded");
         assert_eq!(vv, 0.0, "grounded resolution zeroes vertical velocity");
         // Eased (not snapped) toward the new resting centre, and strictly rising.
@@ -534,8 +539,7 @@ mod tests {
         let feet = center - FOOT_OFFSET;
         // Precondition: the support is genuinely climbable from the feet.
         assert!(surface <= feet + STEP_HEIGHT && surface >= feet - GROUND_SNAP_DISTANCE);
-        let (new_y, grounded, vv) =
-            resolve_ground(feet, center, surface, FOOT_OFFSET, -4.0, DT);
+        let (new_y, grounded, vv) = resolve_ground(feet, center, surface, FOOT_OFFSET, -4.0, DT);
         assert!(
             grounded,
             "a falling player must land on climbable support, not fall through"
@@ -550,8 +554,7 @@ mod tests {
     fn ledge_goes_airborne_and_falls() {
         let (feet, center) = resting_on(5.0);
         let surface = 0.0; // floor fell away well beyond the snap range
-        let (new_y, grounded, vv) =
-            resolve_ground(feet, center, surface, FOOT_OFFSET, 0.0, DT);
+        let (new_y, grounded, vv) = resolve_ground(feet, center, surface, FOOT_OFFSET, 0.0, DT);
         assert!(!grounded, "stepping off a ledge must go airborne");
         assert!(vv < 0.0, "gravity must pull the velocity negative");
         assert!(new_y < center, "the player must start descending");
@@ -564,8 +567,7 @@ mod tests {
         let (feet, center) = resting_on(2.0);
         // Surface a little below the feet but inside the snap band.
         let surface = 2.0 - (GROUND_SNAP_DISTANCE * 0.5);
-        let (new_y, grounded, vv) =
-            resolve_ground(feet, center, surface, FOOT_OFFSET, 0.0, DT);
+        let (new_y, grounded, vv) = resolve_ground(feet, center, surface, FOOT_OFFSET, 0.0, DT);
         assert!(grounded, "a drop within snap distance stays grounded");
         assert_eq!(vv, 0.0, "snapped resolution zeroes vertical velocity");
         assert!(new_y < center, "the feet ease down onto the lower surface");
@@ -629,9 +631,11 @@ mod tests {
         // overshoot below `min_y` without the clamp.
         let center = min_y + 0.01;
         let feet = center - FOOT_OFFSET;
-        let (new_y, grounded, vv) =
-            resolve_ground(feet, center, surface, FOOT_OFFSET, -50.0, DT);
-        assert_eq!(new_y, min_y, "the centre is clamped exactly onto the surface");
+        let (new_y, grounded, vv) = resolve_ground(feet, center, surface, FOOT_OFFSET, -50.0, DT);
+        assert_eq!(
+            new_y, min_y,
+            "the centre is clamped exactly onto the surface"
+        );
         assert!(grounded, "landing re-grounds the player");
         assert_eq!(vv, 0.0, "landing zeroes the vertical velocity");
         assert!(

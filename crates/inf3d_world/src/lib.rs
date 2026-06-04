@@ -83,21 +83,16 @@ impl TerrainMaterialId {
     }
 }
 
-/// Default chunk radius streamed around the camera when no `QualitySettings`
+/// Fixed-high chunk radius streamed around the camera when no `QualitySettings`
 /// resource is present. Used only as a fallback — in practice `CorePlugin`
-/// installs the resource before this plugin builds, and the value comes from
-/// the active [`QualityPreset`](inf3d_core::QualityPreset).
-///
-/// Runtime preset changes do **not** alter render distance: the underlying
-/// `VoxelWorldPlugin` reads it once at `with_config` time and cannot be
-/// re-registered. Restart the app to apply a new render distance.
-pub const DEFAULT_RENDER_DISTANCE_CHUNKS: u32 = 16;
+/// installs the resource before this plugin builds.
+pub const DEFAULT_RENDER_DISTANCE_CHUNKS: u32 = 10;
 
 /// Default world-space distance (in world units, i.e. voxels) past which
 /// terrain chunks begin dropping to coarser LODs. Fallback for when no
-/// `QualitySettings` resource is present at build time; in practice the value
-/// comes from the active preset's `terrain_lod_distance`.
-pub const DEFAULT_TERRAIN_LOD_DISTANCE: f32 = 70.0;
+/// `QualitySettings` resource is present at build time; the camera raises this
+/// dynamically from the current orthographic footprint.
+pub const DEFAULT_TERRAIN_LOD_DISTANCE: f32 = 165.0;
 
 /// Edge length (in voxels) of a chunk's interior. `bevy_voxel_world` fixes
 /// this at 32; the padded data/mesh shape is this + 2 for the 1-voxel skirt.
@@ -127,6 +122,13 @@ fn lod_padded_shape(lod: u8) -> UVec3 {
 #[derive(Resource, Clone)]
 pub struct MainWorld {
     pub render_distance_chunks: u32,
+    /// Ground-space point that terrain LOD should be centered on. This is
+    /// intentionally separate from the render camera eye: the iso camera sits high
+    /// and far from the player to avoid clipping through mountains, and using that
+    /// eye position for LOD makes chunks around the player look "far" and coarsen
+    /// right underfoot. The camera plugin updates this to the followed player; if
+    /// it has not run yet, `chunk_lod` falls back to the camera XZ position.
+    pub lod_focus_xz: Option<Vec2>,
     /// World-space distance to the first LOD step (mirrors
     /// [`QualitySettings::terrain_lod_distance`]). Each subsequent LOD band is
     /// this distance wide, so LOD `n` starts at `n * terrain_lod_distance`.
@@ -137,6 +139,7 @@ impl Default for MainWorld {
     fn default() -> Self {
         Self {
             render_distance_chunks: DEFAULT_RENDER_DISTANCE_CHUNKS,
+            lod_focus_xz: None,
             terrain_lod_distance: DEFAULT_TERRAIN_LOD_DISTANCE,
         }
     }
@@ -156,12 +159,9 @@ impl VoxelWorldConfig for MainWorld {
         // strategies below), never by frustum — so detail doesn't pop at the
         // edge of the (wide) isometric view.
         //
-        // PRESET-SCALED: render distance is preset-driven (Potato 4 … High 10).
-        // A fixed `6` would meet or exceed the spawn radius on Potato (4) / Low
-        // (6), so the protected core would be as large as — or larger than — the
-        // whole spawned disc, which is contradictory. Derive it from the spawn
-        // radius instead and clamp it safely below: keep a >= 1 core but always
-        // leave a couple of rings that can stream by distance.
+        // Scale from the active spawn radius so the protected core never becomes
+        // as large as the whole spawned disc. Keep a >= 1 core but always leave a
+        // couple of rings that can stream by distance.
         self.render_distance_chunks.saturating_sub(2).max(1)
     }
 
@@ -198,13 +198,9 @@ impl VoxelWorldConfig for MainWorld {
         // spills fill into following frames), while the initial fill / teleport
         // bursts still spread over several frames.
         //
-        // PRESET-SCALED: render distance is preset-driven (Potato 4 … High 10),
-        // and a boundary crossing reveals a perpendicular FACE of the spawned
-        // disc — there is no vertical (Y) clamp, so the worst case is the full
-        // square face `(2*R+1)^2` (e.g. 21x21 = 441 on High, not the Medium
-        // 17x17 = 289 a fixed constant assumed). Derive the cap from the active
-        // `render_distance_chunks` plus a small margin so the "normal walking
-        // never clamps" guarantee holds on every preset, not just Medium.
+        // A boundary crossing reveals a perpendicular FACE of the spawned disc;
+        // derive the cap from the active `render_distance_chunks` plus a small
+        // margin so ordinary walking does not clamp the spawn queue.
         let span = 2 * self.render_distance_chunks as usize + 1;
         span * span + 32
     }
@@ -242,7 +238,15 @@ impl VoxelWorldConfig for MainWorld {
         let band = self.terrain_lod_distance.max(1.0);
         let chunk_center = chunk_position.as_vec3() * CHUNK_INTERIOR as f32
             + Vec3::splat(CHUNK_INTERIOR as f32 * 0.5);
-        let dist = camera_position.distance(chunk_center);
+        // LOD is a ground/readability decision, not an eye-distance decision.
+        // The iso camera can be high and horizontally offset from the player; using
+        // full 3D distance to the camera eye makes the area around the player count
+        // as far terrain and causes coarse LODs to "load on top of" gameplay.
+        // Center the rings on the followed ground focus instead, ignoring height.
+        let focus = self
+            .lod_focus_xz
+            .unwrap_or_else(|| Vec2::new(camera_position.x, camera_position.z));
+        let dist = focus.distance(Vec2::new(chunk_center.x, chunk_center.z));
 
         // Raw band index from distance.
         let raw = (dist / band).floor() as i64;
@@ -323,18 +327,16 @@ impl Plugin for WorldPlugin {
     fn build(&self, app: &mut App) {
         // Read QualitySettings (installed by inf3d_core::CorePlugin earlier in
         // the plugin chain). If absent — e.g. someone forgot to register
-        // CorePlugin — we fall back to the default preset's distance.
+        // CorePlugin — we fall back to fixed high defaults.
         let (render_distance_chunks, terrain_lod_distance) = app
             .world()
             .get_resource::<QualitySettings>()
             .map(|q| (q.render_distance_chunks, q.terrain_lod_distance))
-            .unwrap_or((
-                DEFAULT_RENDER_DISTANCE_CHUNKS,
-                DEFAULT_TERRAIN_LOD_DISTANCE,
-            ));
+            .unwrap_or((DEFAULT_RENDER_DISTANCE_CHUNKS, DEFAULT_TERRAIN_LOD_DISTANCE));
 
         let main_world = MainWorld {
             render_distance_chunks,
+            lod_focus_xz: None,
             terrain_lod_distance,
         };
 
@@ -354,62 +356,42 @@ impl Plugin for WorldPlugin {
         // finally writes the depth + normal prepass.
         let terrain_material = install_terrain_material(app);
 
-        app.add_plugins(
-            VoxelWorldPlugin::with_config(main_world).with_material(terrain_material),
-        )
-        .insert_resource(Terrain::new())
-        // Higher-res directional shadow map (default is 2048). This is what lets
-        // the cascade reach grow to 160 units (see `setup_lighting`) without the
-        // grid-speckle a long reach produces at 2048. Overrides the default the
-        // PBR plugin inserted earlier in the chain.
-        .insert_resource(DirectionalLightShadowMap { size: 4096 })
-        .add_systems(Startup, setup_lighting);
+        app.add_plugins(VoxelWorldPlugin::with_config(main_world).with_material(terrain_material))
+            .insert_resource(Terrain::new())
+            .insert_resource(DirectionalLightShadowMap { size: 4096 })
+            .add_systems(Startup, setup_lighting);
     }
 }
 
 fn setup_lighting(mut commands: Commands) {
     info!("inf3d: left-click the ground to move the player (A* over the voxel surface).");
 
-    // Shadow cascades sized to the orthographic iso view. The camera eye sits
-    // ~53 units from the player (ORBIT_RADIUS 39.6 + ORBIT_HEIGHT 36) and the
-    // view zooms out to a ~90-unit-tall slice, so the visible ground sweeps well
-    // past ~150 units. The old 80-unit reach only shadowed a band near the
-    // camera, so far terrain was unlit AND shadows visibly "blinked" in/out as
-    // the camera orbited (the camera-relative cascade box swept across the
-    // world). 160 covers the zoomed-out diagonal with headroom so shadows stay
-    // put. The higher-res shadow map (`DirectionalLightShadowMap { size: 4096 }`,
-    // set in `WorldPlugin::build`) is what lets the reach grow this far without
-    // the grid-speckle the old long reach produced at 2048; `overlap_proportion`
-    // blends the cascade seam so there's no hard boundary line.
-    // PERF: the directional shadow re-renders every visible chunk once PER
-    // CASCADE, so reach × cascade-count is the cost. 3 cascades is the ceiling
-    // here — if FPS suffers, lower `maximum_distance` or the render/LOD distances
-    // rather than adding cascades.
     let cascade_shadow_config = CascadeShadowConfigBuilder {
-        maximum_distance: 160.0,
+        maximum_distance: 240.0,
         num_cascades: 3,
-        overlap_proportion: 0.2,
+        overlap_proportion: 0.35,
         ..default()
     }
     .build();
-    // Shadows ON: the sun casts directional shadows. This re-renders every
-    // visible chunk per cascade, so it's a heavy cost — if FPS suffers, lower
-    // `maximum_distance` above or the render/LOD distances.
+
     commands.spawn((
         DirectionalLight {
-            color: Color::srgb(0.98, 0.95, 0.82),
+            color: Color::srgb(1.0, 0.82, 0.58),
+            illuminance: 12_000.0,
             shadows_enabled: true,
             ..default()
         },
-        Transform::from_xyz(0.0, 0.0, 0.0).looking_at(Vec3::new(-0.15, -0.1, 0.15), Vec3::Y),
+        // Low warm late-afternoon sun: longer shadows and a cozier terrain read.
+        // The previous y-heavy direction (-0.35, -0.75, 0.35) put the sun high in
+        // the sky, so shadows were technically enabled but visually very short.
+        Transform::from_xyz(0.0, 0.0, 0.0).looking_at(Vec3::new(-0.60, -0.35, 0.60), Vec3::Y),
         cascade_shadow_config,
     ));
 
-    // Cool, lifted ambient so shadowed basins read as soft haze rather than
-    // pure black.
+    // Soft sky fill, kept below the sun so shadows still have readable contrast.
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.80, 0.86, 0.96),
-        brightness: 350.0,
+        color: Color::srgb(0.78, 0.82, 0.90),
+        brightness: 230.0,
         affects_lightmapped_meshes: true,
     });
 }

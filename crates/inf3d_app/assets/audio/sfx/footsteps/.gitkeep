@@ -1,0 +1,3 @@
+# Footstep SFX — footstep_<surface>_NN.ogg  (surface: grass|dirt|stone|sand)
+# e.g. footstep_grass_01.ogg .. footstep_grass_04.ogg  (numbered = random variants)
+# See ../../README.md

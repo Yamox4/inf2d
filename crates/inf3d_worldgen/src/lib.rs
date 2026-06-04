@@ -37,10 +37,22 @@ pub fn build_noise_lod(lod: u8) -> HybridMulti<Perlin> {
     noise
 }
 
+/// Vertical bias (in voxels) added to EVERY terrain height sample — THE knob for
+/// the land/water balance. The terrain noise (`HybridMulti<Perlin>`) sits near 0,
+/// and a column is WATER whenever its height is below 1.0 (see
+/// [`ColumnKind::from_height`] + [`WATER_HEIGHT`]), so with no bias roughly half
+/// the world falls below the water line and reads as ocean. Lifting every column
+/// shifts the coastline out to lower-noise columns → more dry land. Coasts stay
+/// gentle (a column right at the waterline still has height ~1, because the noise
+/// is smooth) and deep basins stay ocean. Each +1 lowers the water cutoff by
+/// ~0.02 in noise units. Raise for more land, lower (toward 0) for more water.
+pub const LAND_BIAS: f64 = 6.0;
+
 /// Raw terrain height sample (in voxel units) at a world column. Solid voxels
-/// fill `y < sample` (plus a sea floor below `y = 1`).
+/// fill `y < sample` (plus a sea floor below `y = 1`). Includes [`LAND_BIAS`], so
+/// meshing and the [`Terrain`] oracle stay consistent (both go through here).
 pub fn sample_height(noise: &HybridMulti<Perlin>, x: i32, z: i32) -> f64 {
-    noise.get([x as f64 / 1000.0, z as f64 / 1000.0]) * 50.0
+    noise.get([x as f64 / 1000.0, z as f64 / 1000.0]) * 50.0 + LAND_BIAS
 }
 
 /// Resolved classification of a single terrain column. The single source of
@@ -80,7 +92,10 @@ impl ColumnKind {
         // line. LOD-independent (it only depends on the standing height vs
         // `WATER_HEIGHT`) so coastlines stay put across LODs.
         let is_water = (surface_y + 1) as f32 <= WATER_HEIGHT;
-        Self { surface_y, is_water }
+        Self {
+            surface_y,
+            is_water,
+        }
     }
 }
 

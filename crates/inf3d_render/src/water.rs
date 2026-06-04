@@ -17,10 +17,9 @@
 //! Wave `amplitude` is driven by `inf3d_core::QualitySettings`. Visual colors
 //! and direction stay hard-coded — they tune the look, not the perf cost.
 //! Whether `BevyWaterPlugin` is registered at all depends on
-//! `QualitySettings::water_enabled` at app build time; runtime toggling of
-//! plugin registration is not supported (Bevy plugin registration cannot be
-//! cleanly unwound mid-run), but runtime amplitude tuning IS supported via
-//! `apply_water_quality`.
+//! `QualitySettings::water_enabled` at app build time. Runtime toggling of
+//! plugin registration is not supported, but runtime amplitude tuning is still
+//! supported for the future settings UI via `apply_water_quality`.
 
 use bevy::prelude::*;
 use bevy_water::{WaterPlugin as BevyWaterPlugin, WaterSettings};
@@ -37,7 +36,7 @@ impl Plugin for WaterPlugin {
         // `CorePlugin`; if `CorePlugin` built first the resource is present, and
         // `unwrap_or_default()` covers the case where it hasn't yet. Plugin
         // registration can't be toggled after the fact, so this is the one
-        // chance to honour `water_enabled = false` (Potato preset).
+        // chance to honour `water_enabled = false` if future settings disable it.
         let settings = app
             .world()
             .get_resource::<QualitySettings>()
@@ -60,9 +59,8 @@ impl Plugin for WaterPlugin {
 fn init_water_settings(mut commands: Commands, quality: Res<QualitySettings>) {
     commands.insert_resource(WaterSettings {
         height: WATER_HEIGHT,
-        // Quality-driven swell size. The voxel scale is 1x1x1 so the default
-        // bevy_water amplitude of 1.0 is huge — presets keep it in the
-        // 0.20..0.45 range (0.20/0.35/0.45 for Low/Medium/High).
+        // Fixed high-quality swell size. The voxel scale is 1x1x1 so the default
+        // bevy_water amplitude of 1.0 is huge; 0.45 keeps it readable.
         amplitude: quality.water_amplitude,
         // BRIGHT base tint so the water always reads "lit up" rather than going
         // dark at angles where the sun glint doesn't hit — the user wants the
@@ -85,14 +83,11 @@ fn init_water_settings(mut commands: Commands, quality: Res<QualitySettings>) {
     });
 }
 
-/// Mirror runtime preset changes onto `WaterSettings::amplitude` so the
-/// pause-menu / settings UI can resize swell without a restart. Only runs on
+/// Mirror runtime settings changes onto `WaterSettings::amplitude` so the
+/// pause-menu / settings UI can resize swell without a restart later. Only runs on
 /// frames where `QualitySettings` changed and the bevy_water plugin is
 /// registered (`WaterSettings` only exists then).
-fn apply_water_quality(
-    quality: Res<QualitySettings>,
-    water: Option<ResMut<WaterSettings>>,
-) {
+fn apply_water_quality(quality: Res<QualitySettings>, water: Option<ResMut<WaterSettings>>) {
     if !quality.is_changed() {
         return;
     }

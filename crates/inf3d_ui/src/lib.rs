@@ -57,16 +57,16 @@ impl Plugin for HudPlugin {
         app.add_plugins(LogDiagnosticsPlugin::default());
 
         app.register_diagnostic(Diagnostic::new(DIAG_CHUNKS))
-        .register_diagnostic(Diagnostic::new(DIAG_MESHES))
-        .init_resource::<HudStats>()
-        .add_systems(Startup, spawn_hud)
-        // F2 is raw input, so it cycles in `Input`; everything else is read-only
-        // diagnostics/presentation and belongs in `Fx` (end of the frame).
-        .add_systems(Update, cycle_preset_keybinding.in_set(GameSet::Input))
-        .add_systems(
-            Update,
-            (measure_diagnostics, update_frame_stats, update_hud).in_set(GameSet::Fx),
-        );
+            .register_diagnostic(Diagnostic::new(DIAG_MESHES))
+            .init_resource::<HudStats>()
+            .add_systems(Startup, spawn_hud)
+            // Graphics settings are currently fixed high; runtime settings UI will
+            // be reintroduced later. Everything below is read-only diagnostics /
+            // presentation and belongs in `Fx` (end of the frame).
+            .add_systems(
+                Update,
+                (measure_diagnostics, update_frame_stats, update_hud).in_set(GameSet::Fx),
+            );
     }
 }
 
@@ -166,21 +166,6 @@ fn update_frame_stats(
     stats.ms_p95 = p95;
 }
 
-/// F2 cycles the active quality preset (Potato → Low → Medium → High →
-/// Potato). `QualitySettings` is mutated by-value so other systems can react
-/// via `is_changed()`; render distance specifically is read once at startup
-/// and won't move until the binary restarts.
-fn cycle_preset_keybinding(
-    keys: Res<ButtonInput<KeyCode>>,
-    mut settings: ResMut<QualitySettings>,
-) {
-    if keys.just_pressed(KeyCode::F2) {
-        let next = settings.preset.cycle();
-        *settings = QualitySettings::from_preset(next);
-        info!("Quality preset → {}", settings.preset.name());
-    }
-}
-
 fn update_hud(
     diagnostics: Res<DiagnosticsStore>,
     player_q: Query<(&Transform, &inf3d_gameplay::Player)>,
@@ -233,7 +218,7 @@ fn update_hud(
     let on_off = |b: bool| if b { "on" } else { "off" };
 
     text.0 = format!(
-        "FPS: {:.0}  ({:.1} ms, p95 {:.1} ms)\nEntities: {:.0}   Chunks: {}\nPlayer: ({:.1}, {:.1}, {:.1})  cell=({}, {})\nQuality: {}  rd={} (restart)  SSAO {}  MB {}  [F2]\n{}",
+        "FPS: {:.0}  ({:.1} ms, p95 {:.1} ms)\nEntities: {:.0}   Chunks: {}\nPlayer: ({:.1}, {:.1}, {:.1})  cell=({}, {})\nGraphics: fixed high  rd={}  terrain_lod0={:.0}  SSAO {}  MB {}\n{}",
         fps,
         frame_ms,
         frame.ms_p95,
@@ -241,8 +226,8 @@ fn update_hud(
         chunk_count,
         pos.x, pos.y, pos.z,
         cell.x, cell.y,
-        settings.preset.name(),
         settings.render_distance_chunks,
+        settings.terrain_lod_distance,
         on_off(settings.ssao_enabled),
         on_off(settings.motion_blur_enabled),
         hover_line,

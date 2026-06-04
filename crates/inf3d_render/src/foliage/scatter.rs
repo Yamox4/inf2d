@@ -111,7 +111,11 @@ pub(super) fn scatter_solid(
 /// its own independent `StdRng`, so a tile's grass is stable run to run and never
 /// shifts when the solid layer's eligibility changes. `variant_count` is the
 /// number of loaded grass variants; `0` (no grass assets) yields an empty vec.
-pub(super) fn scatter_grass(terrain: &Terrain, tile: IVec2, variant_count: usize) -> Vec<ScatterItem> {
+pub(super) fn scatter_grass(
+    terrain: &Terrain,
+    tile: IVec2,
+    variant_count: usize,
+) -> Vec<ScatterItem> {
     if variant_count == 0 {
         return Vec::new();
     }
@@ -258,7 +262,11 @@ mod tests {
                 let tile = IVec2::new(tx, tz);
                 let a = scatter_solid(&terrain, tile, &sizes);
                 let b = scatter_solid(&terrain, tile, &sizes);
-                assert_eq!(solids(&a), solids(&b), "solid scatter of {tile:?} not stable");
+                assert_eq!(
+                    solids(&a),
+                    solids(&b),
+                    "solid scatter of {tile:?} not stable"
+                );
             }
         }
     }

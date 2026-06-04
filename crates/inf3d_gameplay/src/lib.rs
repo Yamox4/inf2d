@@ -342,9 +342,7 @@ fn animate_player(
         for (mut t, part, rest) in &mut part_q {
             let target = match part {
                 Part::FootL => rest.0 + Vec3::new(0.0, s.max(0.0) * STEP_LIFT, s * STEP_SWING),
-                Part::FootR => {
-                    rest.0 + Vec3::new(0.0, (-s).max(0.0) * STEP_LIFT, -s * STEP_SWING)
-                }
+                Part::FootR => rest.0 + Vec3::new(0.0, (-s).max(0.0) * STEP_LIFT, -s * STEP_SWING),
                 Part::HandL => rest.0 + Vec3::new(0.0, s.abs() * 0.04, -s * ARM_SWING),
                 Part::HandR => rest.0 + Vec3::new(0.0, s.abs() * 0.04, s * ARM_SWING),
                 Part::Head => rest.0 + Vec3::new(0.0, (stride * 2.0).sin() * -0.03, 0.0),

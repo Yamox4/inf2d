@@ -105,9 +105,7 @@ fn update_highlight(
         .ok()
         .and_then(|w| w.cursor_position())
         .zip(cam.single().ok())
-        .and_then(|(cursor, (camera, cam_gtf))| {
-            camera.viewport_to_world(cam_gtf, cursor).ok()
-        })
+        .and_then(|(cursor, (camera, cam_gtf))| camera.viewport_to_world(cam_gtf, cursor).ok())
         .and_then(|ray| voxel_world.raycast(ray, &|(_p, _v)| true));
 
     match hit {
@@ -193,7 +191,10 @@ fn tile_outline_mesh() -> Mesh {
     let normals = vec![[0.0, 1.0, 0.0]; positions.len()];
     let uvs = vec![[0.0, 0.0]; positions.len()];
 
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);

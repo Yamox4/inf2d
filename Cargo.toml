@@ -11,6 +11,7 @@ members = [
     "crates/inf3d_pathfinding",
     "crates/inf3d_ui",
     "crates/inf3d_monitor",
+    "crates/inf3d_audio",
     "crates/inf3d_app",
 ]
 
@@ -53,6 +54,7 @@ bevy = { version = "0.18", default-features = false, features = [
     "custom_cursor",
     "default_font",
     "multi_threaded",
+    "mp3",
     "png",
     "tonemapping_luts",
     "vorbis",
@@ -96,6 +98,7 @@ inf3d_gameplay = { path = "crates/inf3d_gameplay" }
 inf3d_pathfinding = { path = "crates/inf3d_pathfinding" }
 inf3d_ui = { path = "crates/inf3d_ui" }
 inf3d_monitor = { path = "crates/inf3d_monitor" }
+inf3d_audio = { path = "crates/inf3d_audio" }
 
 [profile.dev]
 opt-level = 1

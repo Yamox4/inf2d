@@ -16,9 +16,22 @@ use inf3d_core::{FollowTarget, GameSet, QualitySettings};
 use inf3d_world::MainWorld;
 
 /// Horizontal (XZ-plane) distance from the player to the camera.
-const ORBIT_RADIUS: f32 = 39.6;
+///
+/// Keep this paired with [`ORBIT_HEIGHT`] to preserve the same ~42° iso pitch.
+/// The old rig was only ~36 units above the player, but terrain can rise far
+/// higher than that in the visible area, putting mountains between/through the
+/// camera at max zoom. A taller rig prevents high terrain from clipping through
+/// the camera while keeping the same isometric look.
+const ORBIT_RADIUS: f32 = 110.0;
 /// Camera height above the player.
-const ORBIT_HEIGHT: f32 = 36.0;
+const ORBIT_HEIGHT: f32 = 100.0;
+/// Orthographic near plane. Negative on purpose: with a tall heightfield and an
+/// overhead iso camera, nearby/high terrain can sit very close to or slightly
+/// behind the eye plane during max zoom/orbit. A negative near plane prevents the
+/// camera from slicing chunks when peaks get close.
+const ORTHO_NEAR: f32 = -500.0;
+/// Orthographic far plane, large enough for the raised camera + max zoom footprint.
+const ORTHO_FAR: f32 = 1500.0;
 /// Default vertical view size (smaller = more zoomed in).
 const ZOOM_DEFAULT: f32 = 44.0;
 const ZOOM_MIN: f32 = 14.0;
@@ -31,6 +44,41 @@ const ORBIT_SPEED: f32 = 1.8;
 const DRAG_SENS: f32 = 0.008;
 /// Exponential smoothing rate for follow/zoom/orbit. Higher = snappier.
 const SMOOTH: f32 = 12.0;
+
+// ── Zoom-scaled chunk render distance (the "half terrain culled" fix) ────────
+// Voxel terrain only streams within `MainWorld::render_distance_chunks` of the
+// (camera-centered) disc. When the view zooms out past it, the far water plane
+// shows through where terrain isn't loaded and reads as a hard "culled" ocean
+// edge — worse on one side because the disc is centered on the camera, which sits
+// `ORBIT_RADIUS` off the player. The vendored voxel spawner re-reads the distance
+// every frame, so `scale_voxel_render_distance` drives it from zoom: the preset
+// value stays the FLOOR (normal/zoomed-in play unchanged), and zooming out grows
+// the disc to keep the view filled, capped to bound the cost.
+/// Extra chunk rings beyond the fixed base distance. This is a safety cap, not
+/// the main max-zoom knob; with the fixed high base of 10, a cap of 5 still allows
+/// `rd_dyn=15` if the reach formula asks for it.
+const RD_ZOOM_HEADROOM: u32 = 5;
+/// Ground reach (world units) per unit of orthographic `viewport_height` along
+/// the camera's far (toward-horizon) direction, where iso foreshortening makes the
+/// view reach furthest and the disc edge shows first. Empirical. The previous 4.0
+/// pushed max zoom to `rd_dyn=15` (~3400 chunks in the monitor log). With the
+/// player-centered LOD0 footprint fix below, 3.0 still covers max zoom while
+/// keeping the loaded disc closer to `rd_dyn=12`.
+const RD_ZOOM_REACH: f32 = 3.0;
+/// Chunk edge length in world units (matches inf3d_world's 32-voxel chunks).
+const CHUNK_WORLD_SIZE: f32 = 32.0;
+/// Min zoom change (world units) before the disc is re-evaluated — hysteresis so
+/// steady / micro-easing zoom doesn't thrash chunk spawn/despawn. Keep this small:
+/// an 8-unit band could miss a one-chunk threshold near max zoom and leave the
+/// far edge unloaded until another large zoom delta happened.
+const RD_ZOOM_DEADBAND: f32 = 2.0;
+/// Conservative world-XZ reach per orthographic vertical unit for this fixed iso
+/// pitch. It intentionally overestimates the true footprint so LOD 1 begins just
+/// off-screen even on wide windows and uneven heightfields.
+const TERRAIN_LOD_VIEW_REACH: f32 = 2.0;
+/// Extra full-detail world units outside the visible footprint. This hides chunk
+/// center quantization, remesh latency, height variation, and edge scrolling.
+const TERRAIN_LOD_SCREEN_MARGIN: f32 = 64.0;
 
 #[derive(Component)]
 pub struct IsoCamera;
@@ -54,6 +102,9 @@ impl Plugin for IsoCameraPlugin {
         // `apply_quality_to_camera` reconfigures post-FX (Fx phase).
         app.add_systems(Startup, spawn_camera)
             .add_systems(Update, camera_input.in_set(GameSet::Input))
+            // Drive the voxel chunk render distance from zoom (Input phase, before
+            // streaming) so a zoomed-out view loads enough terrain to fill it.
+            .add_systems(Update, scale_voxel_render_distance.in_set(GameSet::Input))
             .add_systems(Update, apply_quality_to_camera.in_set(GameSet::Fx))
             // Follow in PostUpdate, AFTER avian's `TransformInterpolation` easing
             // (which runs in `RunFixedMainLoop`, before `Update`) has written the
@@ -61,13 +112,70 @@ impl Plugin for IsoCameraPlugin {
             // propagation so the camera's `GlobalTransform` is up to date this
             // frame. Reading the interpolated (not mid-step) transform is what
             // keeps the camera smooth at any zoom.
-            .add_systems(PostUpdate, follow_player.before(TransformSystems::Propagate));
+            .add_systems(
+                PostUpdate,
+                follow_player.before(TransformSystems::Propagate),
+            );
     }
 }
 
 /// Camera offset from the player for a given orbit yaw.
 fn orbit_offset(yaw: f32) -> Vec3 {
-    Vec3::new(yaw.sin() * ORBIT_RADIUS, ORBIT_HEIGHT, yaw.cos() * ORBIT_RADIUS)
+    Vec3::new(
+        yaw.sin() * ORBIT_RADIUS,
+        ORBIT_HEIGHT,
+        yaw.cos() * ORBIT_RADIUS,
+    )
+}
+
+/// Drive camera-dependent voxel streaming and terrain LOD.
+///
+/// Streaming still needs a camera-centered disc large enough to cover max zoom.
+/// Terrain LOD, however, is player/focus-centered and must keep LOD 0 over the
+/// whole visible orthographic footprint; otherwise the first coarse ring appears
+/// at the screen edge. Settings provide floors only — the current camera footprint
+/// is the source of truth.
+fn scale_voxel_render_distance(
+    rig: Query<&CameraRig, With<IsoCamera>>,
+    player_q: Query<&Transform, (With<FollowTarget>, Without<IsoCamera>)>,
+    quality: Res<QualitySettings>,
+    mut world: ResMut<MainWorld>,
+    mut last_zoom: Local<f32>,
+) {
+    let Ok(rig) = rig.single() else {
+        return;
+    };
+    if let Ok(player) = player_q.single() {
+        world.lod_focus_xz = Some(Vec2::new(player.translation.x, player.translation.z));
+    }
+
+    // Use the larger of current/target zoom so scrolling out immediately requests
+    // enough coverage before the smoothed camera visually arrives there.
+    let effective_zoom = rig.zoom.max(rig.zoom_target);
+
+    let lod_band = (effective_zoom * TERRAIN_LOD_VIEW_REACH + TERRAIN_LOD_SCREEN_MARGIN)
+        .max(quality.terrain_lod_distance);
+    if (world.terrain_lod_distance - lod_band).abs() >= 1.0 {
+        world.terrain_lod_distance = lod_band;
+    }
+
+    // Re-evaluate streaming only after a meaningful zoom change, so the zoom's
+    // asymptotic easing settling on a value doesn't churn chunk spawn/despawn every frame.
+    if (effective_zoom - *last_zoom).abs() < RD_ZOOM_DEADBAND {
+        return;
+    }
+    *last_zoom = effective_zoom;
+
+    // The fixed high distance is the floor; grow only as much as the current zoom
+    // needs. Reach is the far-direction ground span plus the camera's horizontal
+    // offset from the player (the disc is camera-centered), converted to chunks.
+    let floor = quality.render_distance_chunks;
+    let ceil = floor + RD_ZOOM_HEADROOM;
+    let reach = effective_zoom * RD_ZOOM_REACH + ORBIT_RADIUS;
+    let target = ((reach / CHUNK_WORLD_SIZE).ceil() as u32).clamp(floor, ceil);
+    if target != world.render_distance_chunks {
+        world.render_distance_chunks = target;
+    }
 }
 
 /// Bloom config used everywhere it's enabled (Startup + runtime re-apply).
@@ -120,6 +228,8 @@ fn spawn_camera(mut commands: Commands, quality: Res<QualitySettings>) {
         scaling_mode: ScalingMode::FixedVertical {
             viewport_height: ZOOM_DEFAULT,
         },
+        near: ORTHO_NEAR,
+        far: ORTHO_FAR,
         ..OrthographicProjection::default_3d()
     });
 
@@ -143,8 +253,8 @@ fn spawn_camera(mut commands: Commands, quality: Res<QualitySettings>) {
     if quality.bloom_enabled {
         entity.insert(bloom_component());
     }
-    // SSAO + motion blur are AAA post-FX gated to the higher-quality presets via
-    // their own real `QualitySettings` flags (Medium/High on, Potato/Low off).
+    // SSAO + motion blur are controlled by real `QualitySettings` flags, even
+    // though the project currently runs fixed-high until a settings UI returns.
     // The custom terrain material writes the depth/normal/motion-vector prepass,
     // so the voxel terrain participates in both.
     let ssao_enabled = quality.ssao_enabled;
@@ -179,7 +289,7 @@ fn spawn_camera(mut commands: Commands, quality: Res<QualitySettings>) {
 /// Re-apply the post-FX component set whenever `QualitySettings` changes,
 /// adding or stripping `Bloom`, `DepthPrepass`, `DepthOfField`, SSAO (+ its
 /// `NormalPrepass`/`Msaa::Off`), and motion blur (+ its `MotionVectorPrepass`)
-/// to match the new preset. Skips re-inserting when the component is already
+/// to match the new settings. Skips re-inserting when the component is already
 /// present (avoids GPU churn). There is no fog component: atmospheric fog was
 /// removed (see inf3d_render::fog, now just the horizon clear color).
 fn apply_quality_to_camera(
@@ -209,8 +319,7 @@ fn apply_quality_to_camera(
         return;
     };
 
-    // SSAO + motion blur use their own real quality flags (see spawn_camera) so
-    // Potato/Low stay cheap.
+    // SSAO + motion blur use their own real settings flags (see spawn_camera).
     let ssao_enabled = quality.ssao_enabled;
     let motion_blur_enabled = quality.motion_blur_enabled;
 

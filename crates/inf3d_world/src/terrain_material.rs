@@ -342,4 +342,3 @@ pub fn install_terrain_material(app: &mut App) -> TerrainMaterial {
         },
     }
 }
-
