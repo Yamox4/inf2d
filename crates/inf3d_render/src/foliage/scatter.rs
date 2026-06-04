@@ -30,6 +30,13 @@ const TREE_DENSITY: f32 = 0.004;
 const GRASS_DENSITY: f32 = 0.018;
 const ROCK_DENSITY: f32 = 0.002;
 
+/// Spacing factor between solid props: a candidate must sit at least this multiple
+/// of the just-touching distance from every placed prop, so taller/wider canopies
+/// leave a clear GAP instead of kissing/clipping. 1.0 = old behavior (touching
+/// allowed); 1.3 ≈ a 30% gap. (Within a tile; cross-tile is rare at these low
+/// densities.)
+const PROP_SPACING: f32 = 1.3;
+
 /// Decide, per column in `tile`, whether a tree or rock sits there. Returns
 /// plain tree/rock [`ScatterItem`]s — grass is a separate layer
 /// ([`scatter_grass`]) and is never emitted here.
@@ -168,7 +175,10 @@ fn category_rank(category: ScatterCategory) -> u8 {
 fn try_place_solid(placed: &mut Vec<(Vec2, f32)>, center: Vec2, size: Vec3) -> bool {
     let r = footprint_radius(size);
     for (c, pr) in placed.iter() {
-        if center.distance_squared(*c) < (r + pr) * (r + pr) {
+        // Require a clear GAP (PROP_SPACING × the just-touching distance), not just
+        // non-overlap, so taller/wider canopies don't visually clip into neighbors.
+        let min_dist = (r + pr) * PROP_SPACING;
+        if center.distance_squared(*c) < min_dist * min_dist {
             return false;
         }
     }

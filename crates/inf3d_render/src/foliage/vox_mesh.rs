@@ -55,6 +55,22 @@ const FACES: [Face; 6] = [
         corners: [[0.0, 1.0, 0.0], [1.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]] },
 ];
 
+/// Subtle deterministic per-voxel brightness jitter so foliage surfaces read as
+/// TEXTURED (matching the terrain's per-texel detail) instead of flat palette
+/// blocks. Multiplies the (linear) color by ~0.90..1.10 from a hash of the voxel
+/// position; alpha is untouched. Stable per model — same voxel → same shade.
+fn jitter_color(c: [f32; 4], x: usize, y: usize, z: usize) -> [f32; 4] {
+    let mut h = (x as u32).wrapping_mul(0x27d4_eb2d)
+        ^ (y as u32).wrapping_mul(0x1656_67b1)
+        ^ (z as u32).wrapping_mul(0x9e37_79b1);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2c1b_3c6d);
+    h ^= h >> 12;
+    let n = (h & 0xffff) as f32 / 65535.0; // 0..1
+    let f = 0.90 + n * 0.20; // 0.90..1.10
+    [c[0] * f, c[1] * f, c[2] * f, c[3]]
+}
+
 /// Enumerate `.vox` files under `<APP_ASSETS_ROOT>/<rel_dir>`, parse each
 /// with `dot_vox`, build a cull-face mesh per file, and return mesh handles.
 pub(super) fn load_category(
@@ -190,7 +206,7 @@ fn build_voxel_mesh(
                 let Some(pal) = grid[idx(x, y, z)] else {
                     continue;
                 };
-                let color = color_of(pal);
+                let color = jitter_color(color_of(pal), x, y, z);
                 let (fx, fy, fz) = (x as f32, y as f32, z as f32);
 
                 // Emit each face whose neighbor is air. CCW corner order in the

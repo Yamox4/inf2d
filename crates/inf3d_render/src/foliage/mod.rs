@@ -91,7 +91,7 @@ const TILE: i32 = 16;
 // World-space target heights per category. Each variant is uniform-scaled so
 // its tallest dimension hits this value, keeping props reasonably sized
 // regardless of the source `.vox` model's voxel count.
-const TREE_TARGET_HEIGHT: f32 = 3.0;
+const TREE_TARGET_HEIGHT: f32 = 4.2;
 const GRASS_TARGET_HEIGHT: f32 = 0.45;
 const ROCK_TARGET_HEIGHT: f32 = 1.8;
 
