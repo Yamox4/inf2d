@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
 use bevy_voxel_world::prelude::Chunk;
 
-use inf3d_core::{EditMode, FrameStats, GameSet, QualitySettings};
+use inf3d_core::{AppState, EditMode, FrameStats, GameSet, QualitySettings};
 use inf3d_world::{MainWorld, TerrainMaterialId};
 
 /// Live-monitor metrics, logged each second by `LogDiagnosticsPlugin` alongside
@@ -62,6 +62,16 @@ impl Plugin for HudPlugin {
             .register_diagnostic(Diagnostic::new(DIAG_MESHES))
             .init_resource::<HudStats>()
             .add_systems(Startup, (spawn_hud, spawn_mode_buttons))
+            // The in-game HUD + mode buttons show only during `AppState::InGame`
+            // (they spawn hidden — we boot into the menu). In `Fx`, which stays
+            // ungated, so it still runs in the menu / when paused; `state_changed`
+            // makes it a no-op except on the actual MainMenu<->InGame transition.
+            .add_systems(
+                Update,
+                sync_hud_visibility
+                    .in_set(GameSet::Fx)
+                    .run_if(state_changed::<AppState>),
+            )
             // Mode buttons: press handling in Input, restyle in Fx.
             .add_systems(Update, mode_button_system.in_set(GameSet::Input))
             .add_systems(
@@ -93,6 +103,12 @@ impl Plugin for HudPlugin {
 #[derive(Component)]
 struct HudText;
 
+/// Marks a UI root that is only visible during [`AppState::InGame`] (the HUD text
+/// and the Build/Walk mode buttons). [`sync_hud_visibility`] toggles these on the
+/// menu<->game transition; they spawn hidden because the game boots into the menu.
+#[derive(Component)]
+struct InGameUi;
+
 fn spawn_hud(mut commands: Commands) {
     commands.spawn((
         Text::new(""),
@@ -107,8 +123,28 @@ fn spawn_hud(mut commands: Commands) {
             left: Val::Px(8.0),
             ..default()
         },
+        // Hidden until the player enters a game (we boot into the main menu).
+        Visibility::Hidden,
+        InGameUi,
         HudText,
     ));
+}
+
+/// Show the in-game HUD + mode buttons only in [`AppState::InGame`]; hide them in
+/// the main menu. Runs only on a state change (cheap). Setting `Visibility` on the
+/// UI root propagates to its children.
+fn sync_hud_visibility(
+    state: Res<State<AppState>>,
+    mut q: Query<&mut Visibility, With<InGameUi>>,
+) {
+    let vis = if *state.get() == AppState::InGame {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for mut v in &mut q {
+        *v = vis;
+    }
 }
 
 /// Human-readable name for a terrain material index. Derived from the single
@@ -254,9 +290,9 @@ fn update_hud(
     );
 }
 
-/// One of the three voxel-edit mode buttons on the right edge of the screen.
-/// Carries its [`EditMode`] plus the two background colors used to show whether
-/// it is the active mode (vivid) or not (dim).
+/// One of the two mode buttons on the right edge of the screen. Carries its
+/// [`EditMode`] plus the two background colors used to show whether it is the
+/// active mode (vivid) or not (dim).
 #[derive(Component, Clone, Copy)]
 struct ModeButton {
     mode: EditMode,
@@ -264,51 +300,50 @@ struct ModeButton {
     inactive: Color,
 }
 
-/// Spawn the Build (`+`), Destroy (`x`), Off (`o`) buttons in a vertical stack on
-/// the far-right edge, color-coded (green / red / grey). The active mode is
-/// highlighted by [`update_mode_buttons`]; clicks are handled by
-/// [`mode_button_system`].
+/// Spawn the Build (green) and Walk (grey) buttons in a vertical stack on the
+/// far-right edge. The active mode is highlighted by [`update_mode_buttons`];
+/// clicks are handled by [`mode_button_system`]. Build mode: left-click places a
+/// block, right-click breaks one. Walk mode: left-click moves the player.
 fn spawn_mode_buttons(mut commands: Commands) {
-    // (mode, glyph, active color, inactive color)
+    // (mode, label, active color, inactive color)
     let modes = [
         (
             EditMode::Build,
-            "+",
+            "Build",
             Color::srgb(0.32, 0.66, 0.34),
             Color::srgb(0.19, 0.33, 0.20),
         ),
         (
-            EditMode::Destroy,
-            "x",
-            Color::srgb(0.74, 0.28, 0.26),
-            Color::srgb(0.38, 0.20, 0.19),
-        ),
-        (
-            EditMode::Off,
-            "o",
+            EditMode::Walk,
+            "Walk",
             Color::srgb(0.47, 0.51, 0.57),
             Color::srgb(0.26, 0.28, 0.32),
         ),
     ];
 
     commands
-        .spawn(Node {
-            position_type: PositionType::Absolute,
-            right: Val::Px(10.0),
-            top: Val::Percent(34.0),
-            flex_direction: FlexDirection::Column,
-            row_gap: Val::Px(8.0),
-            ..default()
-        })
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(10.0),
+                top: Val::Percent(34.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(8.0),
+                ..default()
+            },
+            // Hidden until the player enters a game (we boot into the main menu).
+            Visibility::Hidden,
+            InGameUi,
+        ))
         .with_children(|stack| {
-            for (mode, glyph, active, inactive) in modes {
+            for (mode, label, active, inactive) in modes {
                 stack
                     .spawn((
                         Button,
                         Interaction::default(),
                         Node {
-                            width: Val::Px(42.0),
-                            height: Val::Px(42.0),
+                            width: Val::Px(66.0),
+                            height: Val::Px(40.0),
                             justify_content: JustifyContent::Center,
                             align_items: AlignItems::Center,
                             ..default()
@@ -322,9 +357,9 @@ fn spawn_mode_buttons(mut commands: Commands) {
                     ))
                     .with_children(|b| {
                         b.spawn((
-                            Text::new(glyph),
+                            Text::new(label),
                             TextFont {
-                                font_size: 24.0,
+                                font_size: 16.0,
                                 ..default()
                             },
                             TextColor(Color::srgb(0.96, 0.98, 1.0)),
@@ -347,7 +382,7 @@ fn mode_button_system(
 }
 
 /// Highlight the active mode button and dim the others. Runs whenever
-/// [`EditMode`] changes (including the first frame, so the default `Off` lights up).
+/// [`EditMode`] changes (including the first frame, so the default `Walk` lights up).
 fn update_mode_buttons(mode: Res<EditMode>, mut buttons: Query<(&ModeButton, &mut BackgroundColor)>) {
     for (button, mut bg) in &mut buttons {
         bg.0 = if button.mode == *mode {

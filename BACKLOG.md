@@ -71,11 +71,12 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
 ## Next feature (after the above)
 - [~] **Block placing & breaking module** — built on B1 (material table), C2
   (`VoxelOverrides`), reusing the existing `Hover` raycast for targeting.
-  - [x] **Mode selector** — `EditMode` resource (`Off`/`Build`/`Destroy`) in `inf3d_core`;
-    three color-coded buttons on the right edge (HUD), active one highlighted.
-  - [x] **Edit path** — `inf3d_render::edit` (`EditPlugin`): left-click in Build places a
-    block on the hovered face, Destroy removes the hovered voxel; writes `VoxelOverrides`
-    and marks affected chunk(s) `NeedsRemesh` (vendored prelude now re-exports it).
+  - [x] **Mode selector** — `EditMode` resource (`Walk`/`Build`) in `inf3d_core`;
+    two color-coded buttons on the right edge (HUD), active one highlighted.
+  - [x] **Edit path** — `inf3d_render::edit` (`EditPlugin`): in Build mode, left-click
+    places a block on the hovered face and right-click removes the hovered voxel; writes
+    `VoxelOverrides` and marks affected chunk(s) `NeedsRemesh` (vendored prelude now
+    re-exports it). In Walk mode left-click pathfinds.
   - [x] **Targeting** — `Hover` gains the face `normal` (for placement). Pathfinder +
     editor gated on `EditMode` and on UI hover so clicks don't double-act.
   - [x] **Placeholder** — a 3-tall stone pillar near spawn (via the same store) to break/test.

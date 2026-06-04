@@ -93,6 +93,29 @@ pub struct CameraRig {
     zoom_target: f32,
 }
 
+impl CameraRig {
+    /// Current orbit yaw (radians) — read by save/load to persist the view.
+    pub fn yaw(&self) -> f32 {
+        self.yaw
+    }
+
+    /// Current orthographic zoom (vertical view height) — read by save/load.
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Snap BOTH the live value and its easing target to `yaw`/`zoom`, so Load
+    /// restores a saved camera instantly rather than easing from the old view.
+    /// `camera_input` re-applies `zoom` to the projection on the next in-game
+    /// frame; `follow_player` (PostUpdate, ungated) repositions from `yaw`.
+    pub fn snap_to(&mut self, yaw: f32, zoom: f32) {
+        self.yaw = yaw;
+        self.yaw_target = yaw;
+        self.zoom = zoom;
+        self.zoom_target = zoom;
+    }
+}
+
 pub struct IsoCameraPlugin;
 
 impl Plugin for IsoCameraPlugin {

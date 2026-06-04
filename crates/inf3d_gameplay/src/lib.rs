@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use avian3d::prelude::*;
 use bevy::prelude::*;
 
-use inf3d_core::{FollowTarget, GameSet, PathTarget};
+use inf3d_core::{AppState, FollowTarget, GameSet, PathTarget, Pause};
 use inf3d_physics::{CharacterController, DesiredMove, GameLayer, PLAYER_DIMS};
 use inf3d_worldgen::Terrain;
 
@@ -95,7 +95,16 @@ impl Plugin for PlayerPlugin {
             // overshooting waypoints — the path-follow jitter. In `FixedUpdate`
             // it re-aims and pops a waypoint every physics step. It only *reads*
             // `Transform`, so it cannot corrupt the interpolated physics state.
-            .add_systems(FixedUpdate, follow_path)
+            // Gated to un-paused play: `follow_path` is in `FixedUpdate` (not a
+            // `GameSet`), so the one core gating lever does NOT cover it. Without
+            // this it would keep popping waypoints and writing `DesiredMove` while
+            // the pause/main-menu is up. (The physics controller that consumes
+            // `DesiredMove` is gated identically in `inf3d_physics`.)
+            .add_systems(
+                FixedUpdate,
+                follow_path
+                    .run_if(in_state(AppState::InGame).and(in_state(Pause::Running))),
+            )
             // `animate_player` is per-frame VISUAL only (hop/feet/dust; reads the
             // interpolated transform), so it stays in the render-rate Logic set.
             .add_systems(Update, animate_player.in_set(GameSet::Logic));

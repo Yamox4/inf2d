@@ -1,21 +1,22 @@
 //! Block place / break.
 //!
-//! Turns the active [`EditMode`] + a left-click on the hovered voxel into an edit
-//! in the shared [`VoxelOverrides`] store, then marks the affected chunk(s)
-//! [`NeedsRemesh`] so the change becomes visible. Because the store is the single
-//! source of truth (the mesher snapshots it, the [`Terrain`] oracle consults it),
-//! physics ground + pathfinding pick the edit up for free — no extra wiring.
+//! In [`EditMode::Build`], a **left-click** places a block on the hovered face and
+//! a **right-click** removes the hovered voxel — both written into the shared
+//! [`VoxelOverrides`] store, which then marks the affected chunk(s) [`NeedsRemesh`]
+//! so the change becomes visible. Because the store is the single source of truth
+//! (the mesher snapshots it, the [`Terrain`] oracle consults it), physics ground +
+//! pathfinding pick the edit up for free — no extra wiring.
 //!
 //! Targeting reuses the existing [`Hover`] raycast (cursor → voxel + face normal).
 //! Click-to-move (the pathfinder) and these edits are mutually exclusive: the
-//! pathfinder runs only in [`EditMode::Off`], the editor only when it is not.
+//! pathfinder runs only in [`EditMode::Walk`], the editor only in [`EditMode::Build`].
 
 use bevy::prelude::*;
 use bevy_voxel_world::prelude::{Chunk, NeedsRemesh};
 
 use inf3d_core::{EditMode, GameSet};
 use inf3d_world::{MainWorld, TerrainMaterialId};
-use inf3d_worldgen::{Terrain, VoxelOverrides};
+use inf3d_worldgen::VoxelOverrides;
 
 use crate::dust::DustBurst;
 use crate::Hover;
@@ -44,7 +45,7 @@ pub struct EditPlugin;
 impl Plugin for EditPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<BlockEdited>()
-            .add_systems(Startup, (spawn_placeholder_blocks, init_block_fx_assets))
+            .add_systems(Startup, init_block_fx_assets)
             // Input phase, alongside the pathfinder's click handler; the two are
             // gated on opposite `EditMode`s so only one ever acts on a click.
             .add_systems(Update, block_edit.in_set(GameSet::Input))
@@ -77,27 +78,12 @@ struct BlockFx {
     place: bool,
 }
 
-/// A short stone pillar a few tiles from spawn so there is something obvious to
-/// hover, break, and build on the instant the game starts. Written through the
-/// SAME [`VoxelOverrides`] store the player edits, so breaking it exercises the
-/// real edit path. Set in `Startup`, before any chunk meshes, so the pillar shows
-/// up in the first mesh with no remesh kick needed.
-fn spawn_placeholder_blocks(terrain: Res<Terrain>, overrides: Res<VoxelOverrides>) {
-    let base = terrain.nearest_land(IVec2::new(8, 8));
-    let surface = terrain.surface_y(base.x, base.y);
-    for dy in 1..=3 {
-        overrides.place(IVec3::new(base.x, surface + dy, base.y), BUILD_MATERIAL);
-    }
-    info!(
-        "inf3d_render: placeholder pillar at ({}, {}..={}, {})",
-        base.x,
-        surface + 1,
-        surface + 3,
-        base.y
-    );
-}
+// The old startup "placeholder pillar" lived here; the flat test world's stamper
+// in `inf3d_menu` now owns all the seeded test structures, so New Game starts from
+// a clean slate and stamps them deterministically.
 
-/// On a left-click in Build/Destroy mode, edit the hovered voxel and re-mesh.
+/// In Build mode, place (left-click) or break (right-click) the hovered voxel and
+/// re-mesh.
 fn block_edit(
     mouse: Res<ButtonInput<MouseButton>>,
     mode: Res<EditMode>,
@@ -111,7 +97,14 @@ fn block_edit(
     mut edited_events: MessageWriter<BlockEdited>,
     mut commands: Commands,
 ) {
-    if *mode == EditMode::Off || !mouse.just_pressed(MouseButton::Left) {
+    // Editing only happens in Build mode; Walk-mode clicks belong to the pathfinder.
+    if *mode != EditMode::Build {
+        return;
+    }
+    // Left-click places, right-click breaks. Left wins if both land on one frame.
+    let place = mouse.just_pressed(MouseButton::Left);
+    let break_ = mouse.just_pressed(MouseButton::Right);
+    if !place && !break_ {
         return;
     }
     // Ignore clicks that landed on a UI widget (e.g. the mode buttons), so
@@ -125,31 +118,27 @@ fn block_edit(
 
     // Edit the store and gather what the effect needs: the touched cell, the
     // block's color (to tint the puff/cube), and whether it was a place or break.
-    let (edited, color, place) = match *mode {
-        EditMode::Destroy => {
-            overrides.remove(voxel);
-            let color = hover
-                .material
-                .and_then(TerrainMaterialId::from_index)
-                .map(|id| id.color())
-                .unwrap_or(NEUTRAL_DEBRIS);
-            (voxel, color, false)
-        }
-        EditMode::Build => {
-            // Place into the cell on the hovered face. Without a normal there's no
-            // unambiguous side to build on, so do nothing.
-            let Some(normal) = hover.normal else {
-                return;
-            };
-            let target = voxel + normal;
-            overrides.place(target, BUILD_MATERIAL);
-            let color = TerrainMaterialId::from_index(BUILD_MATERIAL)
-                .map(|id| id.color())
-                .unwrap_or(NEUTRAL_DEBRIS);
-            (target, color, true)
-        }
-        // Guarded above.
-        EditMode::Off => return,
+    let (edited, color, place) = if place {
+        // Place into the cell on the hovered face. Without a normal there's no
+        // unambiguous side to build on, so do nothing.
+        let Some(normal) = hover.normal else {
+            return;
+        };
+        let target = voxel + normal;
+        overrides.place(target, BUILD_MATERIAL);
+        let color = TerrainMaterialId::from_index(BUILD_MATERIAL)
+            .map(|id| id.color())
+            .unwrap_or(NEUTRAL_DEBRIS);
+        (target, color, true)
+    } else {
+        // Right-click: remove the hovered voxel.
+        overrides.remove(voxel);
+        let color = hover
+            .material
+            .and_then(TerrainMaterialId::from_index)
+            .map(|id| id.color())
+            .unwrap_or(NEUTRAL_DEBRIS);
+        (voxel, color, false)
     };
 
     mark_chunks_dirty(&mut commands, &chunks, edited);

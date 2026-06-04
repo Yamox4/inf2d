@@ -22,6 +22,7 @@ desktop.ini
 
 # Save files (user data, not source)
 save.ron
+/saves/
 
 # inf3d_monitor telemetry log (regenerated every run)
 inf3d-monitor.log

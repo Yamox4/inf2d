@@ -127,8 +127,8 @@ fn handle_click(
     interactions: Query<&Interaction>,
     mut requests: MessageWriter<PathRequest>,
 ) {
-    // Click-to-move only in normal mode; Build/Destroy clicks are the editor's.
-    if *mode != EditMode::Off || !mouse.just_pressed(MouseButton::Left) {
+    // Click-to-move only in Walk mode; Build-mode clicks are the editor's.
+    if *mode != EditMode::Walk || !mouse.just_pressed(MouseButton::Left) {
         return;
     }
     // Ignore clicks on UI widgets (e.g. the mode buttons).

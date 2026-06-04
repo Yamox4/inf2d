@@ -12,7 +12,7 @@ use bevy_voxel_world::prelude::*;
 use inf3d_core::QualitySettings;
 use inf3d_worldgen::{
     build_noise_lod, sample_height, ColumnKind, Terrain, VoxelEdit, VoxelOverrideSnapshot,
-    VoxelOverrides,
+    VoxelOverrides, WorldGen, FLAT_SURFACE_HEIGHT,
 };
 
 pub mod terrain_material;
@@ -200,6 +200,11 @@ pub struct MainWorld {
     /// shared instance into all three. `Default` makes a *separate* empty store
     /// (fine for standalone/test use, but it would not see the live edits).
     pub overrides: VoxelOverrides,
+    /// Shared flat-vs-procedural selector the mesher consults so the meshed
+    /// surface matches the [`Terrain`] oracle in both the flat test world and the
+    /// procedural world. **Must be the same flag** handed to [`Terrain`] and
+    /// exposed as the [`WorldGen`] resource (`WorldPlugin::build` shares one).
+    pub world_gen: WorldGen,
 }
 
 impl Default for MainWorld {
@@ -209,6 +214,7 @@ impl Default for MainWorld {
             lod_focus_xz: None,
             terrain_lod_distance: DEFAULT_TERRAIN_LOD_DISTANCE,
             overrides: VoxelOverrides::default(),
+            world_gen: WorldGen::default(),
         }
     }
 }
@@ -374,7 +380,13 @@ impl VoxelWorldConfig for MainWorld {
         // exactly as placed/removed. The snapshot is empty until the first edit,
         // so this is free for the common case.
         let overrides = self.overrides.clone();
-        Box::new(move |_chunk_pos, lod, _previous| get_voxel_fn(lod, overrides.snapshot()))
+        let world_gen = self.world_gen.clone();
+        // Read the flat flag per meshing job (not once at config build) so a New
+        // Game / Load that flips it, then re-meshes, regenerates with the new
+        // surface. Cheap: one relaxed atomic load per chunk job.
+        Box::new(move |_chunk_pos, lod, _previous| {
+            get_voxel_fn(lod, overrides.snapshot(), world_gen.is_flat())
+        })
     }
 
     fn texture_index_mapper(&self) -> Arc<dyn Fn(Self::MaterialIndex) -> [u32; 3] + Send + Sync> {
@@ -410,12 +422,22 @@ impl Plugin for WorldPlugin {
         // oracle (`Terrain`), and — as the `VoxelOverrides` resource — the block
         // place/break module (yet to be built) and anything else that needs it.
         let overrides = VoxelOverrides::new();
+        // ONE shared flat-vs-procedural flag, cloned into the mesher (via
+        // MainWorld), the gameplay oracle (`Terrain`), and the `WorldGen` resource
+        // (so New Game / Load can flip it).
+        let world_gen = WorldGen::new();
+        // Boot the FLAT test world (this build's focus) so the menu's backdrop and
+        // the first game are the lab level — not procedural terrain the player
+        // appears "spawned into". New Game stamps the test map onto it; Load may
+        // switch the flag. Procedural terrain stays available via the flag.
+        world_gen.set_flat(true);
 
         let main_world = MainWorld {
             render_distance_chunks,
             lod_focus_xz: None,
             terrain_lod_distance,
             overrides: overrides.clone(),
+            world_gen: world_gen.clone(),
         };
 
         // Build the custom voxel terrain material (procedural texture array
@@ -435,10 +457,14 @@ impl Plugin for WorldPlugin {
         let terrain_material = install_terrain_material(app);
 
         app.add_plugins(VoxelWorldPlugin::with_config(main_world).with_material(terrain_material))
-            .insert_resource(Terrain::with_overrides(overrides.clone()))
+            // Oracle shares BOTH the edit store and the flat flag with the mesher.
+            .insert_resource(Terrain::with_shared(overrides.clone(), world_gen.clone()))
             // The shared edit store, exposed so the block module can place/remove
-            // voxels and so save/load can persist edits later.
+            // voxels and so save/load can persist edits.
             .insert_resource(overrides)
+            // The shared flat-world selector, exposed so the menu's New Game / Load
+            // can switch worlds (then re-mesh).
+            .insert_resource(world_gen)
             .insert_resource(DirectionalLightShadowMap { size: 4096 })
             .add_systems(Startup, setup_lighting);
     }
@@ -495,6 +521,7 @@ fn setup_lighting(mut commands: Commands) {
 fn get_voxel_fn(
     lod: u8,
     overrides: VoxelOverrideSnapshot,
+    flat: bool,
 ) -> Box<dyn FnMut(IVec3, Option<WorldVoxel>) -> WorldVoxel + Send + Sync> {
     let noise = build_noise_lod(lod);
     let mut cache = HashMap::<(i32, i32), f64>::new();
@@ -519,17 +546,24 @@ fn get_voxel_fn(
             }
         }
 
-        let key = (pos.x, pos.z);
-        let surface = match cache.get(&key) {
-            Some(&h) => h,
-            None => {
-                // Evict everything before we exceed the cap (cheap, amortized).
-                if cache.len() >= CACHE_CAP {
-                    cache.clear();
+        // Flat test world: every column is the SAME constant surface — skip the
+        // noise sample entirely and feed the shared flat height to the identical
+        // solid/classify logic below, so the mesh matches the `Terrain` oracle.
+        let surface = if flat {
+            FLAT_SURFACE_HEIGHT
+        } else {
+            let key = (pos.x, pos.z);
+            match cache.get(&key) {
+                Some(&h) => h,
+                None => {
+                    // Evict everything before we exceed the cap (cheap, amortized).
+                    if cache.len() >= CACHE_CAP {
+                        cache.clear();
+                    }
+                    let h = sample_height(&noise, pos.x, pos.z);
+                    cache.insert(key, h);
+                    h
                 }
-                let h = sample_height(&noise, pos.x, pos.z);
-                cache.insert(key, h);
-                h
             }
         };
 
@@ -597,8 +631,9 @@ mod tests {
         let high = IVec3::new(3, 90, 3); // above all terrain → base air
         let low = IVec3::new(3, 0, 3); // deep underground → base solid
 
-        // Baseline with an empty snapshot (taken before any edit).
-        let mut base = get_voxel_fn(0, store.snapshot());
+        // Baseline with an empty snapshot (taken before any edit). `flat = false`
+        // exercises the procedural path this test asserts against.
+        let mut base = get_voxel_fn(0, store.snapshot(), false);
         assert!(matches!(base(high, None), WorldVoxel::Air), "high voxel is air by default");
         assert!(
             matches!(base(low, None), WorldVoxel::Solid(_)),
@@ -608,7 +643,7 @@ mod tests {
         // Edit, then re-mesh from a fresh snapshot.
         store.place(high, TerrainMaterialId::Stone as u8);
         store.remove(low);
-        let mut edited = get_voxel_fn(0, store.snapshot());
+        let mut edited = get_voxel_fn(0, store.snapshot(), false);
         assert!(
             matches!(edited(high, None), WorldVoxel::Solid(m) if m == TerrainMaterialId::Stone as u8),
             "placed block is meshed as the chosen material"

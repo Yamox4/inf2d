@@ -8,6 +8,7 @@ use inf3d_audio::AudioPlugin;
 use inf3d_camera::IsoCameraPlugin;
 use inf3d_core::CorePlugin;
 use inf3d_gameplay::PlayerPlugin;
+use inf3d_menu::MenuPlugin;
 use inf3d_pathfinding::PathfindPlugin;
 use inf3d_physics::PhysicsGamePlugin;
 use inf3d_render::{
@@ -63,6 +64,10 @@ fn main() {
         .add_plugins(DustPlugin)
         .add_plugins(FogPlugin)
         .add_plugins(HudPlugin)
+        // Front-end shell: main menu, pause menu, settings, 3-slot save/load, and
+        // the flat test-world stamper. Drives the `AppState`/`Pause` states
+        // `CorePlugin` registered; the game boots into the main menu.
+        .add_plugins(MenuPlugin)
         .add_plugins(AudioPlugin)
         .add_plugins(WaterPlugin)
         .add_plugins(FoliagePlugin);

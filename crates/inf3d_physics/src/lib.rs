@@ -31,7 +31,7 @@ use avian3d::prelude::*;
 use bevy::prelude::*;
 
 use inf3d_camera::IsoCamera;
-use inf3d_core::GameSet;
+use inf3d_core::{AppState, GameSet, Pause};
 use inf3d_worldgen::Terrain;
 
 /// Collision membership layers.
@@ -179,9 +179,16 @@ impl Plugin for PhysicsGamePlugin {
         // fixed delta + interpolation removes the variable-timestep jitter the
         // old `PostUpdate` controller fought. It still consumes the latest
         // `DesiredMove` written by gameplay's per-frame `follow_path` (Update).
+        // Gated to un-paused play: the controller runs in `FixedPostUpdate` (not a
+        // `GameSet`), so the core gating lever does NOT cover it. Without this it
+        // would keep integrating the player (gravity, ground-follow, the last
+        // `DesiredMove`) while the menu/pause is up. The menu also pauses
+        // `Time<Physics>` so avian's own solver freezes; this stops OUR integrator.
         app.add_systems(
             FixedPostUpdate,
-            player_controller.after(PhysicsSystems::Writeback),
+            player_controller
+                .after(PhysicsSystems::Writeback)
+                .run_if(in_state(AppState::InGame).and(in_state(Pause::Running))),
         );
     }
 }
@@ -303,6 +310,7 @@ fn player_controller(
             transform.translation.x,
             transform.translation.z,
             PLAYER_RADIUS,
+            feet_y,
             feet_y + STEP_HEIGHT,
             |cx, cz| terrain.surface_y_near(cx, cz, ref_y),
             |cx, cz| terrain.is_land(cx, cz),
@@ -340,19 +348,30 @@ fn player_controller(
 /// height *above* the player — could neither ease them up onto it (out of step
 /// range) nor clamp them down (the rest is above their centre), so a player
 /// carrying any downward velocity would fall through the floor forever. Excluding
-/// walls keeps `support` to ground the player can rest on; if every overlapped
-/// cell is a wall (degenerate: boxed in), fall back to the centre column so they
-/// still rest on the ground directly beneath them.
+/// walls keeps `support` to ground the player can rest on.
+///
+/// BOXED-IN FALLBACK: if every overlapped cell is a wall above the step cap there
+/// is nothing here to stand on. This is reachable when the player digs a niche
+/// into a wall and caps their own headroom — `surface_y_near` then disqualifies
+/// the floor under their feet (no standing headroom) and reports the wall TOP far
+/// above as the column's nearest standable floor. Returning that unclimbable top
+/// would let [`resolve_ground`]'s landing clamp **teleport the player up onto the
+/// wall** (the 10-voxel-wall climb bug). Instead we report support at the player's
+/// `feet_y`, so a squished/boxed-in player stays grounded in place and is never
+/// lifted — upholding the "support is always climbable" contract `resolve_ground`
+/// relies on.
 ///
 /// This samples the cells the disc *actually overlaps* regardless of sub-cell
 /// position: a capsule at a cell centre still picks up a taller (but climbable)
 /// cell across the boundary. Each voxel `(x,y,z)` spans world `[y, y+1]`, so its
 /// top face is `surface_y + 1`. `surface_y` maps a column to its topmost-solid
-/// index — production passes [`Terrain::surface_y`]; tests pass a synthetic field.
+/// index — production passes [`Terrain::surface_y_near`]; tests pass a synthetic
+/// field.
 fn footprint_surface(
     x: f32,
     z: f32,
     radius: f32,
+    feet_y: f32,
     max_climb_y: f32,
     surface_y: impl Fn(i32, i32) -> i32,
     is_land: impl Fn(i32, i32) -> bool,
@@ -362,7 +381,6 @@ fn footprint_surface(
     let z_min = (z - radius).floor() as i32;
     let z_max = (z + radius).floor() as i32;
 
-    let center_top = surface_y(x.floor() as i32, z.floor() as i32) as f32 + 1.0;
     let mut best = f32::NEG_INFINITY;
     for cx in x_min..=x_max {
         for cz in z_min..=z_max {
@@ -380,7 +398,9 @@ fn footprint_surface(
         }
     }
     if best == f32::NEG_INFINITY {
-        center_top
+        // Boxed in — nothing climbable under the footprint. Hold at the feet so the
+        // player is never launched onto an unclimbable wall (see BOXED-IN FALLBACK).
+        feet_y
     } else {
         best
     }
@@ -531,9 +551,10 @@ mod tests {
         // Cell 1 is a 5-voxel wall (top 11); cell 0 is the flat ground (top 6).
         let field = |cx: i32, _cz: i32| if cx >= 1 { 10 } else { 5 };
         // Player on cell 0 (feet at top face 6); ceiling = feet + STEP_HEIGHT.
-        let ceiling = 6.0 + STEP_HEIGHT;
+        let feet = 6.0;
+        let ceiling = feet + STEP_HEIGHT;
         // Centre near the +x boundary so the footprint AABB reaches the wall cell.
-        let s = footprint_surface(0.7, 0.5, PLAYER_RADIUS, ceiling, field, |_, _| true);
+        let s = footprint_surface(0.7, 0.5, PLAYER_RADIUS, feet, ceiling, field, |_, _| true);
         assert_eq!(
             s, 6.0,
             "an unclimbable wall in the footprint is excluded; support is the ground"
@@ -604,8 +625,9 @@ mod tests {
         // Cell 1 (in x) is one voxel taller than cell 0; everything else flat.
         let field = |cx: i32, _cz: i32| if cx >= 1 { 6 } else { 5 };
         // Centre at x = 0.7: disc spans [0.3, 1.1] → cells 0 and 1 in x.
-        // INFINITY ceiling: this test exercises AABB sampling, not the climb cap.
-        let s = footprint_surface(0.7, 0.5, PLAYER_RADIUS, f32::INFINITY, field, |_, _| true);
+        // INFINITY ceiling: this test exercises AABB sampling, not the climb cap
+        // (so `feet` is irrelevant here — a finite placeholder).
+        let s = footprint_surface(0.7, 0.5, PLAYER_RADIUS, 5.0, f32::INFINITY, field, |_, _| true);
         assert_eq!(
             s, 7.0,
             "footprint must rest on the taller adjacent cell's top face (6+1)"
@@ -617,7 +639,7 @@ mod tests {
     #[test]
     fn footprint_uniform_terrain_is_flat_top_face() {
         let field = |_cx: i32, _cz: i32| 5;
-        let s = footprint_surface(10.5, -3.5, PLAYER_RADIUS, f32::INFINITY, field);
+        let s = footprint_surface(10.5, -3.5, PLAYER_RADIUS, 5.0, f32::INFINITY, field, |_, _| true);
         assert_eq!(s, 6.0, "uniform terrain yields surface_y + 1");
     }
 
@@ -629,8 +651,37 @@ mod tests {
         // Only the diagonal cell (1, 1) is taller.
         let field = |cx: i32, cz: i32| if cx >= 1 && cz >= 1 { 6 } else { 5 };
         // Centre near the +x/+z corner so the disc's AABB reaches cell (1, 1).
-        let s = footprint_surface(0.7, 0.7, PLAYER_RADIUS, f32::INFINITY, field);
+        let s = footprint_surface(0.7, 0.7, PLAYER_RADIUS, 5.0, f32::INFINITY, field, |_, _| true);
         assert_eq!(s, 7.0, "diagonal corner of the footprint must be sampled");
+    }
+
+    // REGRESSION (the 10-voxel wall climb): a player boxed in by walls all taller
+    // than the step cap — e.g. they dug a niche into a wall and capped their own
+    // headroom, so even their own column resolves to the wall TOP far above — must
+    // NOT be lifted. The old fallback returned the (unclimbable) center-column
+    // surface, which `resolve_ground`'s landing clamp then teleported the player up
+    // onto. The fallback must instead report support at the feet (hold in place).
+    #[test]
+    fn footprint_boxed_in_holds_at_feet_not_wall_top() {
+        // Every cell is a 10-high wall (top 11); the player's feet are at 2, so the
+        // step cap (3.1) excludes all of them — the boxed-in fallback path.
+        let field = |_cx: i32, _cz: i32| 10;
+        let feet = 2.0;
+        let s = footprint_surface(0.5, 0.5, PLAYER_RADIUS, feet, feet + STEP_HEIGHT, field, |_, _| true);
+        assert_eq!(
+            s, feet,
+            "a boxed-in player must hold at their feet, never be lifted onto the wall top"
+        );
+        // Feeding that support to the resolver keeps them exactly in place
+        // (grounded, no upward teleport) instead of clamping up to the wall.
+        let center = feet + FOOT_OFFSET;
+        let (new_y, grounded, vv) = resolve_ground(feet, center, s, FOOT_OFFSET, 0.0, DT);
+        assert!(grounded, "the squished player stays grounded");
+        assert_eq!(vv, 0.0);
+        assert!(
+            (new_y - center).abs() < 1e-3,
+            "the player must not be teleported up the wall (new_y {new_y}, center {center})"
+        );
     }
 
     // (e) While falling, the gravity integration never sinks the feet below the

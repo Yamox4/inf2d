@@ -4,6 +4,7 @@
 use bevy::prelude::*;
 use noise::{HybridMulti, NoiseFn, Perlin};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// World-space height of the water surface (the `bevy_water` plane). The lowest
@@ -15,6 +16,47 @@ pub const WATER_HEIGHT: f32 = 1.6;
 
 /// Canonical octave count at full (LOD 0) detail.
 pub const TERRAIN_OCTAVES: usize = 5;
+
+/// Topmost-solid Y of every column in the **flat test world** (the lab level used
+/// by the test map). High enough to stand well above [`WATER_HEIGHT`] and leave
+/// room to dig a water basin below the feet, low enough to keep stacked test
+/// structures on-screen.
+pub const FLAT_SURFACE_Y: i32 = 8;
+
+/// Continuous surface height the flat world feeds to the SAME `surface < y` /
+/// [`ColumnKind::from_height`] logic the procedural path uses, so the oracle and
+/// the mesher agree. The `+ 0.5` keeps it off the integer boundary so
+/// `floor()` lands cleanly on [`FLAT_SURFACE_Y`] (a solid at exactly `y` would be
+/// ambiguous under `y < surface`).
+pub const FLAT_SURFACE_HEIGHT: f64 = FLAT_SURFACE_Y as f64 + 0.5;
+
+/// Shared, cheap-to-clone toggle selecting the **flat test world** (no noise) vs
+/// the procedural terrain. Mirrors the [`VoxelOverrides`] sharing pattern: ONE
+/// flag is cloned into the [`Terrain`] oracle, the meshing config, and exposed as
+/// a resource, so the surface the oracle reports and the surface the mesher builds
+/// can never disagree. `New Game` sets it (flat), `Load` restores the saved world
+/// kind; after either, all resident chunks must be re-meshed for the change to
+/// show. `Relaxed` ordering is fine — a one-frame stale read across the
+/// flag-flip/remesh boundary is harmless (the remesh re-reads it).
+#[derive(Resource, Clone, Default)]
+pub struct WorldGen(Arc<AtomicBool>);
+
+impl WorldGen {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the world is the flat test world (`true`) rather than procedural.
+    pub fn is_flat(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Select the flat test world (`true`) or procedural terrain (`false`). The
+    /// caller must re-mesh resident chunks afterwards for the new surface to show.
+    pub fn set_flat(&self, flat: bool) {
+        self.0.store(flat, Ordering::Relaxed);
+    }
+}
 
 /// Build the terrain noise with the canonical parameters. Used in two places:
 /// the meshing delegate (per worker thread) and the [`Terrain`] gameplay oracle.
@@ -132,7 +174,7 @@ const STAND_HEADROOM: i32 = 2;
 /// (a `u8`) so this upstream crate stays free of `inf3d_world`'s palette enum;
 /// the mesher in `inf3d_world` interprets it (and its texture mapper already
 /// falls back gracefully for an unknown index).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VoxelEdit {
     /// The player placed a solid block of this material here (overrides whatever
     /// the procedural terrain had — air or a different material).
@@ -280,6 +322,36 @@ impl VoxelOverrides {
         VoxelOverrideSnapshot { edits }
     }
 
+    /// Every live edit as a flat `(pos, edit)` list — the form save/load
+    /// serializes. Order is unspecified (HashMap iteration). Empty when there are
+    /// no edits.
+    pub fn export(&self) -> Vec<(IVec3, VoxelEdit)> {
+        self.0
+            .read()
+            .map(|d| d.edits.iter().map(|(&p, &e)| (p, e)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Drop ALL edits, reverting the whole world to its procedural/flat base.
+    /// Used by New Game (before stamping the test map) and as the first step of
+    /// Load. Every previously-edited chunk must be re-meshed afterwards.
+    pub fn clear_all(&self) {
+        if let Ok(mut data) = self.0.write() {
+            data.edits.clear();
+            data.columns.clear();
+        }
+    }
+
+    /// Replace all edits with `edits` (clears first, then re-applies through
+    /// [`set`](Self::set) so the per-column index rebuilds correctly). Used by
+    /// Load. Every affected chunk must be re-meshed afterwards.
+    pub fn import(&self, edits: &[(IVec3, VoxelEdit)]) {
+        self.clear_all();
+        for &(pos, edit) in edits {
+            self.set(pos, edit);
+        }
+    }
+
     /// Topmost solid voxel in column `(x, z)` **given the edits**, or `None` when
     /// the column has no edits (the caller then keeps the base surface — the
     /// zero-cost fast path). Done under a single read lock.
@@ -362,6 +434,9 @@ pub struct Terrain {
     /// oracle reports — and therefore physics ground + pathfinding, which read
     /// through this oracle — always matches the edited, meshed geometry.
     overrides: VoxelOverrides,
+    /// Shared flat-vs-procedural selector (see [`WorldGen`]). Shared with the
+    /// mesher so the oracle's surface and the meshed surface agree in both worlds.
+    world_gen: WorldGen,
 }
 
 impl Terrain {
@@ -372,16 +447,31 @@ impl Terrain {
         Self {
             noise: build_noise(),
             overrides: VoxelOverrides::default(),
+            world_gen: WorldGen::default(),
         }
     }
 
-    /// Construct the oracle sharing an existing [`VoxelOverrides`] store. This is
-    /// how the live game keeps the oracle, the mesher, and the block module all
-    /// reading/writing the *same* edits.
+    /// Construct the oracle sharing an existing [`VoxelOverrides`] store, with its
+    /// own (default, procedural) [`WorldGen`] flag. Convenient for tests; the live
+    /// game uses [`Terrain::with_shared`] so the oracle, the mesher, and the block
+    /// module all read/write the *same* edits AND the *same* flat flag.
     pub fn with_overrides(overrides: VoxelOverrides) -> Self {
         Self {
             noise: build_noise(),
             overrides,
+            world_gen: WorldGen::default(),
+        }
+    }
+
+    /// Construct the live oracle sharing BOTH the edit store and the flat-world
+    /// flag with the mesher (and the resources exposed for save/load), so the
+    /// surface the oracle reports can never disagree with the meshed geometry in
+    /// either the procedural or the flat test world.
+    pub fn with_shared(overrides: VoxelOverrides, world_gen: WorldGen) -> Self {
+        Self {
+            noise: build_noise(),
+            overrides,
+            world_gen,
         }
     }
 
@@ -395,8 +485,27 @@ impl Terrain {
     ///
     /// Unedited columns (the overwhelming majority) hit the [`VoxelOverrides`]
     /// fast path and cost exactly what they did before edits existed.
+    /// The flat-or-procedural classification of a column BEFORE player edits — the
+    /// SINGLE flat-aware base that BOTH [`Terrain::column`] and
+    /// [`Terrain::surface_y_near`] build on, so the oracle's reported surface (and
+    /// therefore physics ground + pathfinding) can never disagree with the meshed
+    /// world in either the flat test world or procedural terrain.
+    ///
+    /// Flat test world: every column is the same constant surface (no noise),
+    /// classified through the exact same helper as procedural so edits, water, and
+    /// standing heights behave identically. (Regression guard: `surface_y_near`
+    /// once sampled the procedural noise directly here, so under a flat-meshed
+    /// world the player walked/pathfound on invisible procedural hills.)
+    fn base_kind(&self, x: i32, z: i32) -> ColumnKind {
+        if self.world_gen.is_flat() {
+            ColumnKind::from_height(FLAT_SURFACE_HEIGHT)
+        } else {
+            column_kind(&self.noise, x, z)
+        }
+    }
+
     fn column(&self, x: i32, z: i32) -> ColumnKind {
-        let base = column_kind(&self.noise, x, z);
+        let base = self.base_kind(x, z);
         let Some(surface_y) = self.overrides.resolved_surface_y(x, z, base.surface_y) else {
             return base;
         };
@@ -429,7 +538,9 @@ impl Terrain {
     /// player navigates / stands at their *current* level instead of being snapped
     /// to the very top of the column.
     pub fn surface_y_near(&self, x: i32, z: i32, ref_y: i32) -> i32 {
-        let base = column_kind(&self.noise, x, z).surface_y;
+        // Flat-aware base (NOT the raw procedural noise) so a flat world's walking
+        // surface matches its flat mesh — see [`Terrain::base_kind`].
+        let base = self.base_kind(x, z).surface_y;
         self.overrides
             .standing_floor_near(x, z, base, ref_y)
             .unwrap_or(base)
@@ -600,5 +711,29 @@ mod tests {
         assert!(store.is_empty());
         // Back on the fast path: column no longer in the edit index.
         assert_eq!(store.resolved_surface_y(c.x, c.y, base), None);
+    }
+
+    // REGRESSION (the flat-world "invisible hills"): in flat mode EVERY oracle
+    // accessor — including `surface_y_near`, which the physics controller and
+    // pathfinder use for the WALKING surface — must report the constant flat
+    // surface, NOT the procedural noise. The bug was `surface_y_near` sampling the
+    // noise directly while `surface_y`/`column` honored the flat flag, so the
+    // player walked on invisible procedural hills under a flat-meshed world.
+    #[test]
+    fn flat_world_surface_is_constant_for_all_accessors() {
+        let store = VoxelOverrides::default();
+        let world_gen = WorldGen::new();
+        let t = Terrain::with_shared(store, world_gen.clone());
+        world_gen.set_flat(true);
+
+        for (x, z) in [(0, 0), (37, -12), (-100, 250), (5, 5)] {
+            assert_eq!(t.surface_y(x, z), FLAT_SURFACE_Y, "flat surface_y at ({x},{z})");
+            assert_eq!(
+                t.surface_y_near(x, z, FLAT_SURFACE_Y + 1),
+                FLAT_SURFACE_Y,
+                "flat surface_y_near must equal surface_y at ({x},{z}) — the invisible-hills bug"
+            );
+            assert!(t.is_land(x, z), "flat world stands above the water line at ({x},{z})");
+        }
     }
 }

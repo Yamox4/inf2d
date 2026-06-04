@@ -9,3 +9,4 @@ rust-version.workspace = true
 [dependencies]
 bevy = { workspace = true }
 noise = { workspace = true }
+serde = { workspace = true }

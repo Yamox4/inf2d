@@ -185,18 +185,44 @@ pub struct FrameStats {
     pub ms_p95: f32,
 }
 
-/// What a left-click does, chosen by the player via the HUD mode buttons. The
+/// What the mouse does, chosen by the player via the HUD mode buttons. The
 /// block-edit system and the pathfinder both read this so exactly one of them
-/// acts on a click: editing in `Build`/`Destroy`, click-to-move in `Off`.
-#[derive(Resource, Default, Clone, Copy, PartialEq, Eq, Debug)]
+/// acts on a click: editing in `Build`, click-to-move in `Walk`.
+#[derive(
+    Resource, Default, Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize,
+)]
 pub enum EditMode {
     /// Normal play — left-click pathfinds (click-to-move). The default.
     #[default]
-    Off,
-    /// Left-click places a block on the face of the hovered voxel.
+    Walk,
+    /// Editing — left-click places a block on the hovered face, right-click
+    /// removes the hovered voxel.
     Build,
-    /// Left-click removes the hovered voxel.
-    Destroy,
+}
+
+/// Top-level application state. The game boots into [`AppState::MainMenu`] — the
+/// world, player, and camera spawn at `Startup` as a live menu backdrop — and
+/// enters [`AppState::InGame`] when the player starts or loads a game. The
+/// gameplay `GameSet` phases and the fixed-step movement/physics systems run only
+/// in `InGame` (and only while not paused); the menu systems run outside that.
+#[derive(States, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum AppState {
+    #[default]
+    MainMenu,
+    InGame,
+}
+
+/// In-game pause — a sub-state that exists only while [`AppState::InGame`].
+/// `Running` is normal play; `Paused` freezes gameplay (the gated `GameSet`
+/// phases and the fixed-step systems stop, and avian's `Time<Physics>` is paused)
+/// and shows the pause menu. Toggled with Esc. When `AppState` is not `InGame`
+/// this sub-state does not exist, and `in_state(Pause::…)` simply reads `false`.
+#[derive(SubStates, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+#[source(AppState = AppState::InGame)]
+pub enum Pause {
+    #[default]
+    Running,
+    Paused,
 }
 
 /// Relative to `inf3d_core`'s manifest, the live asset tree is one crate over.
@@ -231,6 +257,113 @@ fn load_quality_settings() -> QualitySettings {
     }
 }
 
+/// Persist [`QualitySettings`] back to the same `quality.ron` [`load_quality_settings`]
+/// reads, so changes made in the in-game settings menu survive a restart.
+/// Best-effort: a serialize or write failure is a `warn!`, never a panic — the
+/// live settings still apply for the current session regardless.
+pub fn save_quality_settings(settings: &QualitySettings) {
+    let pretty = ron::ser::PrettyConfig::default();
+    match ron::ser::to_string_pretty(settings, pretty) {
+        Ok(text) => {
+            if let Err(err) = std::fs::write(QUALITY_CONFIG_PATH, text) {
+                warn!("inf3d_core: could not write quality.ron ({err}); settings apply this session only");
+            } else {
+                info!("inf3d_core: saved quality settings to quality.ron");
+            }
+        }
+        Err(err) => warn!("inf3d_core: could not serialize quality settings ({err})"),
+    }
+}
+
+/// User-facing graphics tiers for the settings menu. Each maps to a bundle of
+/// [`QualitySettings`] visual knobs via [`QualityPreset::apply`].
+/// `render_distance_chunks` is intentionally NOT touched (it is read once at world
+/// build, so changing it needs a restart) — the settings menu surfaces it
+/// separately. `water_enabled` is also left on (toggling the water plane fully off
+/// needs a restart; presets only vary its amplitude), so a preset never half-
+/// disables a build-time system.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum QualityPreset {
+    Potato,
+    Low,
+    Medium,
+    High,
+}
+
+impl QualityPreset {
+    /// The four presets in display order (lowest → highest).
+    pub const ALL: [QualityPreset; 4] = [
+        QualityPreset::Potato,
+        QualityPreset::Low,
+        QualityPreset::Medium,
+        QualityPreset::High,
+    ];
+
+    /// Short label for a settings button.
+    pub fn label(self) -> &'static str {
+        match self {
+            QualityPreset::Potato => "Potato",
+            QualityPreset::Low => "Low",
+            QualityPreset::Medium => "Medium",
+            QualityPreset::High => "High",
+        }
+    }
+
+    /// Apply this preset's visual knobs onto `q`, leaving `render_distance_chunks`
+    /// (restart-only) untouched.
+    pub fn apply(self, q: &mut QualitySettings) {
+        // Common to all tiers: the water plane stays registered (build-time), only
+        // its amplitude varies below.
+        q.water_enabled = true;
+        match self {
+            QualityPreset::Potato => {
+                q.foliage_enabled = false;
+                q.grass_radius_world = 0.0;
+                q.dof_enabled = false;
+                q.bloom_enabled = false;
+                q.ssao_enabled = false;
+                q.motion_blur_enabled = false;
+                q.water_amplitude = 0.0;
+                q.foliage_ring_max = 4;
+                q.terrain_lod_distance = 90.0;
+            }
+            QualityPreset::Low => {
+                q.foliage_enabled = true;
+                q.grass_radius_world = 24.0;
+                q.dof_enabled = false;
+                q.bloom_enabled = true;
+                q.ssao_enabled = false;
+                q.motion_blur_enabled = false;
+                q.water_amplitude = 0.25;
+                q.foliage_ring_max = 6;
+                q.terrain_lod_distance = 120.0;
+            }
+            QualityPreset::Medium => {
+                q.foliage_enabled = true;
+                q.grass_radius_world = 42.0;
+                q.dof_enabled = true;
+                q.bloom_enabled = true;
+                q.ssao_enabled = true;
+                q.motion_blur_enabled = false;
+                q.water_amplitude = 0.35;
+                q.foliage_ring_max = 8;
+                q.terrain_lod_distance = 150.0;
+            }
+            QualityPreset::High => {
+                q.foliage_enabled = true;
+                q.grass_radius_world = 60.0;
+                q.dof_enabled = true;
+                q.bloom_enabled = true;
+                q.ssao_enabled = true;
+                q.motion_blur_enabled = true;
+                q.water_amplitude = 0.45;
+                q.foliage_ring_max = 9;
+                q.terrain_lod_distance = 165.0;
+            }
+        }
+    }
+}
+
 /// Registers all engine-wide resources. **Add this plugin first** so other
 /// plugins (`WorldPlugin`, `GrassPlugin`, …) see `QualitySettings` at their
 /// own `build` time.
@@ -238,22 +371,31 @@ pub struct CorePlugin;
 
 impl Plugin for CorePlugin {
     fn build(&self, app: &mut App) {
-        app.configure_sets(
-            Update,
-            (
-                GameSet::Input,
-                GameSet::Logic,
-                GameSet::Streaming,
-                GameSet::Fx,
+        app.init_state::<AppState>()
+            .add_sub_state::<Pause>()
+            // Gameplay phases run only during un-paused play. Gating the three
+            // gameplay phases here — one lever — stops camera input, pathfinding,
+            // streaming, edits, and animation in the menu and when paused.
+            //
+            // `Fx` is deliberately LEFT UNGATED (only ordered after `Streaming`)
+            // so end-of-frame change-detection keeps firing while paused: the
+            // settings menu mutates `QualitySettings`, and `apply_quality_to_camera`
+            // / `apply_water_quality` / `update_mode_buttons` (gated on
+            // `is_changed` / `resource_changed`) live in `Fx`. If they were gated
+            // off too, a settings change would only take effect on resume.
+            .configure_sets(
+                Update,
+                (GameSet::Input, GameSet::Logic, GameSet::Streaming)
+                    .chain()
+                    .run_if(in_state(AppState::InGame).and(in_state(Pause::Running))),
             )
-                .chain(),
-        )
-        .insert_resource(load_quality_settings())
-        .init_resource::<GrassStats>()
-        .init_resource::<FrameStats>()
-        .init_resource::<EditMode>()
-        .init_resource::<BlockedCells>()
-        .init_resource::<PathTarget>();
+            .configure_sets(Update, GameSet::Fx.after(GameSet::Streaming))
+            .insert_resource(load_quality_settings())
+            .init_resource::<GrassStats>()
+            .init_resource::<FrameStats>()
+            .init_resource::<EditMode>()
+            .init_resource::<BlockedCells>()
+            .init_resource::<PathTarget>();
     }
 }
 
