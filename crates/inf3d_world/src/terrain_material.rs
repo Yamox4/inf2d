@@ -85,7 +85,7 @@
 //! `VoxelWorldMaterialHandle` insertion after the texture finishes loading.
 
 use bevy::asset::{load_internal_asset, uuid_handle};
-use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
+use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::mesh::{MeshVertexBufferLayoutRef, VertexAttributeDescriptor};
 use bevy::pbr::{
     ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
@@ -243,13 +243,21 @@ fn build_terrain_texture(images: &mut Assets<Image>) -> Handle<Image> {
     let bytes_per_layer = pixels_per_layer * 4;
     let mut data = Vec::with_capacity(bytes_per_layer * LAYERS as usize);
 
+    // Procedural per-texel detail so voxel faces read as TEXTURED surfaces instead
+    // of flat color fills. `texel_brightness` mixes a coarse blotch + fine grain
+    // into a brightness multiplier around each layer's base color (deterministic —
+    // byte-identical every run). The linear sampler below smooths it into soft
+    // shading variation rather than hard pixels.
     for layer in 0..LAYERS as usize {
         let [r, g, b] = palette[layer];
-        for _ in 0..pixels_per_layer {
-            data.push(r);
-            data.push(g);
-            data.push(b);
-            data.push(0xff);
+        for py in 0..LAYER_SIZE {
+            for px in 0..LAYER_SIZE {
+                let f = texel_brightness(px, py, layer as u32);
+                data.push((r as f32 * f).clamp(0.0, 255.0) as u8);
+                data.push((g as f32 * f).clamp(0.0, 255.0) as u8);
+                data.push((b as f32 * f).clamp(0.0, 255.0) as u8);
+                data.push(0xff);
+            }
         }
     }
 
@@ -257,6 +265,13 @@ fn build_terrain_texture(images: &mut Assets<Image>) -> Handle<Image> {
         address_mode_u: ImageAddressMode::Repeat,
         address_mode_v: ImageAddressMode::Repeat,
         address_mode_w: ImageAddressMode::Repeat,
+        // Linear filtering so the per-texel detail reads as smooth surface shading,
+        // not aliased pixels. (Mipmaps would further cut far-distance shimmer, but
+        // Bevy 0.18 has no `Image::generate_mipmaps`; the detail amplitude is kept
+        // low so this is acceptable — see BACKLOG for a mipmap follow-up.)
+        mag_filter: ImageFilterMode::Linear,
+        min_filter: ImageFilterMode::Linear,
+        mipmap_filter: ImageFilterMode::Linear,
         ..default()
     });
 
@@ -291,6 +306,25 @@ fn build_terrain_texture(images: &mut Assets<Image>) -> Handle<Image> {
     }
 
     images.add(image)
+}
+
+/// Deterministic per-texel brightness multiplier (~0.88..1.12) for the procedural
+/// terrain layers, so each voxel face reads as a textured surface instead of a flat
+/// color. Combines a coarse blotch (low frequency → broad soft patches) with fine
+/// per-texel grain. Pure integer hash, so the texture is byte-identical every run.
+fn texel_brightness(px: u32, py: u32, layer: u32) -> f32 {
+    fn hash01(x: u32, y: u32, l: u32) -> f32 {
+        let mut h =
+            x.wrapping_mul(0x27d4_eb2d) ^ y.wrapping_mul(0x1656_67b1) ^ l.wrapping_mul(0x9e37_79b1);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x2c1b_3c6d);
+        h ^= h >> 12;
+        (h & 0xffff) as f32 / 65535.0
+    }
+    let coarse = hash01(px / 8, py / 8, layer); // broad soft patches
+    let fine = hash01(px, py, layer.wrapping_add(101)); // fine grain
+    let n = coarse * 0.7 + fine * 0.3; // 0..1, coarse-dominated
+    0.88 + n * 0.24 // 0.88..1.12 — subtle, surface texture not visual noise
 }
 
 /// Register the terrain shader and `MaterialPlugin`, build the procedural

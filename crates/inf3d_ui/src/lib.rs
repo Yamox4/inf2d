@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use bevy::diagnostic::{
     Diagnostic, DiagnosticPath, Diagnostics, DiagnosticsStore, EntityCountDiagnosticsPlugin,
@@ -8,6 +9,7 @@ use bevy::diagnostic::{
 #[cfg(debug_assertions)]
 use bevy::diagnostic::LogDiagnosticsPlugin;
 use bevy::prelude::*;
+use bevy::time::common_conditions::on_timer;
 use bevy_voxel_world::prelude::Chunk;
 
 use inf3d_core::{FrameStats, GameSet, QualitySettings};
@@ -63,9 +65,19 @@ impl Plugin for HudPlugin {
             // Graphics settings are currently fixed high; runtime settings UI will
             // be reintroduced later. Everything below is read-only diagnostics /
             // presentation and belongs in `Fx` (end of the frame).
+            // `update_frame_stats` samples frame-time EVERY frame so the rolling p95
+            // stays accurate. The entity-counting + text rebuild
+            // (`measure_diagnostics` → `update_hud`) only need a few Hz for a
+            // readout, so throttle them off the per-frame path — they were scanning
+            // every `Mesh3d`/`Chunk` entity 60×/s (thousands of entities) just for
+            // the HUD numbers.
+            .add_systems(Update, update_frame_stats.in_set(GameSet::Fx))
             .add_systems(
                 Update,
-                (measure_diagnostics, update_frame_stats, update_hud).in_set(GameSet::Fx),
+                (measure_diagnostics, update_hud)
+                    .chain()
+                    .in_set(GameSet::Fx)
+                    .run_if(on_timer(Duration::from_millis(150))),
             );
     }
 }

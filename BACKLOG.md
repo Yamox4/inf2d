@@ -10,18 +10,21 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
 ## Phase A — Engine & graphics polish (current focus)
 
-- [~] **A1 (#10a) Camera color grading.** Add a `ColorGrading` component to the iso
+- [x] **A1 (#10a) Camera color grading.** Add a `ColorGrading` component to the iso
   camera (subtle contrast + saturation) for a graded "AAA" tone. *File:*
   `inf3d_camera/src/lib.rs`. *Risk:* none (purely tonemapping output).
 
-- [ ] **A2 (#8 + #10b) Terrain texture upgrade.** (a) Linear filtering + mipmaps on the
-  terrain texture array so it won't shimmer/seam once real textures are added; (b) bake
-  subtle value-noise + a derived normal into the procedural layers so the flat ground
-  gains micro-detail under SSAO/shadows. *File:* `inf3d_world/src/terrain_material.rs`.
+- [x] **A2 (#8 + #10b) Terrain texture upgrade.** Linear filtering + procedural per-texel
+  detail (coarse blotch + fine grain) baked into the layers so flat faces read as textured
+  surfaces under SSAO/shadows. *Mipmaps deferred:* Bevy 0.18 has no `Image::generate_mipmaps`;
+  detail amplitude kept low so it's acceptable — revisit with manual mip-gen or real textures.
+  *File:* `inf3d_world/src/terrain_material.rs`.
 
-- [ ] **A3 (#7) Throttle HUD + monitor per-frame scans.** The HUD (and monitor) iterate
-  every entity each frame just to count chunks/meshes/entities. Throttle to a few Hz.
-  *Files:* `inf3d_ui/src/lib.rs`, `inf3d_monitor/src/lib.rs`.
+- [x] **A3 (#7) Throttle HUD per-frame scans.** `measure_diagnostics`/`update_hud` (which
+  scan every Mesh3d/Chunk entity for the readout) now run at ~6.6 Hz via `on_timer`;
+  `update_frame_stats` stays per-frame so p95 is accurate. *Monitor kept per-frame* (its
+  counts feed per-frame spike deltas; its sort is already `select_nth`, not a full sort).
+  *File:* `inf3d_ui/src/lib.rs`.
 
 - [ ] **A4 (#9) Harden `footprint_surface` vs water.** Pass an `is_land` check so the
   controller never seats the player on submerged seafloor (latent edge case). *File:*
