@@ -26,7 +26,7 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
   counts feed per-frame spike deltas; its sort is already `select_nth`, not a full sort).
   *File:* `inf3d_ui/src/lib.rs`.
 
-- [ ] **A4 (#9) Harden `footprint_surface` vs water.** Pass an `is_land` check so the
+- [x] **A4 (#9) Harden `footprint_surface` vs water.** Pass an `is_land` check so the
   controller never seats the player on submerged seafloor (latent edge case). *File:*
   `inf3d_physics/src/lib.rs`.
 

@@ -300,6 +300,7 @@ fn player_controller(
             PLAYER_RADIUS,
             feet_y + STEP_HEIGHT,
             |cx, cz| terrain.surface_y(cx, cz),
+            |cx, cz| terrain.is_land(cx, cz),
         );
 
         let (new_y, grounded, new_vv) = resolve_ground(
@@ -349,6 +350,7 @@ fn footprint_surface(
     radius: f32,
     max_climb_y: f32,
     surface_y: impl Fn(i32, i32) -> i32,
+    is_land: impl Fn(i32, i32) -> bool,
 ) -> f32 {
     let x_min = (x - radius).floor() as i32;
     let x_max = (x + radius).floor() as i32;
@@ -359,6 +361,12 @@ fn footprint_surface(
     let mut best = f32::NEG_INFINITY;
     for cx in x_min..=x_max {
         for cz in z_min..=z_max {
+            // Submerged water columns (seafloor) are NOT standable support — only
+            // dry land counts, so the controller is never seated on a seafloor that
+            // a footprint happened to overlap near a shoreline.
+            if !is_land(cx, cz) {
+                continue;
+            }
             let top = surface_y(cx, cz) as f32 + 1.0;
             // Climbable cells only — a wall above the step cap is not support.
             if top <= max_climb_y {
@@ -520,7 +528,7 @@ mod tests {
         // Player on cell 0 (feet at top face 6); ceiling = feet + STEP_HEIGHT.
         let ceiling = 6.0 + STEP_HEIGHT;
         // Centre near the +x boundary so the footprint AABB reaches the wall cell.
-        let s = footprint_surface(0.7, 0.5, PLAYER_RADIUS, ceiling, field);
+        let s = footprint_surface(0.7, 0.5, PLAYER_RADIUS, ceiling, field, |_, _| true);
         assert_eq!(
             s, 6.0,
             "an unclimbable wall in the footprint is excluded; support is the ground"
@@ -592,7 +600,7 @@ mod tests {
         let field = |cx: i32, _cz: i32| if cx >= 1 { 6 } else { 5 };
         // Centre at x = 0.7: disc spans [0.3, 1.1] → cells 0 and 1 in x.
         // INFINITY ceiling: this test exercises AABB sampling, not the climb cap.
-        let s = footprint_surface(0.7, 0.5, PLAYER_RADIUS, f32::INFINITY, field);
+        let s = footprint_surface(0.7, 0.5, PLAYER_RADIUS, f32::INFINITY, field, |_, _| true);
         assert_eq!(
             s, 7.0,
             "footprint must rest on the taller adjacent cell's top face (6+1)"
