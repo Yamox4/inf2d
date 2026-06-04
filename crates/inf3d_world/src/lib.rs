@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use bevy::{
-    light::CascadeShadowConfigBuilder,
+    light::{CascadeShadowConfigBuilder, DirectionalLightShadowMap},
     platform::collections::HashMap,
     prelude::*,
 };
@@ -358,6 +358,11 @@ impl Plugin for WorldPlugin {
             VoxelWorldPlugin::with_config(main_world).with_material(terrain_material),
         )
         .insert_resource(Terrain::new())
+        // Higher-res directional shadow map (default is 2048). This is what lets
+        // the cascade reach grow to 160 units (see `setup_lighting`) without the
+        // grid-speckle a long reach produces at 2048. Overrides the default the
+        // PBR plugin inserted earlier in the chain.
+        .insert_resource(DirectionalLightShadowMap { size: 4096 })
         .add_systems(Startup, setup_lighting);
     }
 }
@@ -365,20 +370,25 @@ impl Plugin for WorldPlugin {
 fn setup_lighting(mut commands: Commands) {
     info!("inf3d: left-click the ground to move the player (A* over the voxel surface).");
 
-    // Cascade max_distance was 700 — at that range each shadow texel covers many
-    // world units and produces a grid-like speckle pattern on the voxel terrain
-    // (visible as a "second grey layer" over the green), and the shadow pass
-    // itself becomes very expensive. 120 is plenty for the iso view.
+    // Shadow cascades sized to the orthographic iso view. The camera eye sits
+    // ~53 units from the player (ORBIT_RADIUS 39.6 + ORBIT_HEIGHT 36) and the
+    // view zooms out to a ~90-unit-tall slice, so the visible ground sweeps well
+    // past ~150 units. The old 80-unit reach only shadowed a band near the
+    // camera, so far terrain was unlit AND shadows visibly "blinked" in/out as
+    // the camera orbited (the camera-relative cascade box swept across the
+    // world). 160 covers the zoomed-out diagonal with headroom so shadows stay
+    // put. The higher-res shadow map (`DirectionalLightShadowMap { size: 4096 }`,
+    // set in `WorldPlugin::build`) is what lets the reach grow this far without
+    // the grid-speckle the old long reach produced at 2048; `overlap_proportion`
+    // blends the cascade seam so there's no hard boundary line.
     // PERF: the directional shadow re-renders every visible chunk once PER
-    // CASCADE, so both the cascade reach and the cascade count multiply the
-    // shadow pass cost. For this shallow iso view the camera only ever sees a
-    // few chunks, so we trim conservatively: 80 world units still extends well
-    // beyond the visible area (the camera sits ~40 units out and looks down a
-    // shallow slope), and 2 cascades keep near-detail crisp without paying for
-    // the default 4 cascades' worth of extra terrain re-renders.
+    // CASCADE, so reach × cascade-count is the cost. 3 cascades is the ceiling
+    // here — if FPS suffers, lower `maximum_distance` or the render/LOD distances
+    // rather than adding cascades.
     let cascade_shadow_config = CascadeShadowConfigBuilder {
-        maximum_distance: 80.0,
-        num_cascades: 2,
+        maximum_distance: 160.0,
+        num_cascades: 3,
+        overlap_proportion: 0.2,
         ..default()
     }
     .build();

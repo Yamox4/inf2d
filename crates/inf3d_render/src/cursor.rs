@@ -63,9 +63,11 @@ fn build_cursor_image() -> Image {
         (6.0, 11.0),  // inner, back up to the body
         (12.0, 11.0), // right wing tip
     ];
-    // 1.12 ≈ 1.6 × 0.7, i.e. 30% smaller than the original arrow.
+    // 0.952 = 1.12 × 0.85 — 15% smaller than the previous arrow (≈40% below the
+    // original 1.6× full size). Tip stays ~1 px from the canvas edge so the (1,1)
+    // hotspot still lands on the arrow tip.
     let verts: Vec<(f32, f32)> =
-        BASE.iter().map(|&(x, y)| (x * 1.12 + 1.0, y * 1.12 + 1.0)).collect();
+        BASE.iter().map(|&(x, y)| (x * 0.952 + 1.0, y * 0.952 + 1.0)).collect();
 
     // Dark outer rim width, in 32-px space.
     let outline_w = 1.3_f32;
