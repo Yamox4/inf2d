@@ -115,7 +115,12 @@ pub struct Rock;
 /// `render_distance_chunks` is read once at world-plugin build, while
 /// `terrain_lod_distance` is raised dynamically by the camera so LOD transitions
 /// stay outside the current orthographic footprint.
-#[derive(Resource, Clone, Debug)]
+#[derive(Resource, Clone, Debug, serde::Serialize, serde::Deserialize)]
+// `#[serde(default)]` makes every field optional in the RON: the file overrides
+// only the knobs it lists, and any field omitted (or a future field added after
+// the file was written) falls back to `Default`. So an old/partial `quality.ron`
+// never breaks the load, and tuning one value means writing one line.
+#[serde(default)]
 pub struct QualitySettings {
     pub render_distance_chunks: u32,
     /// World-space radius around the player within which dense grass spawns,
@@ -180,6 +185,38 @@ pub struct FrameStats {
     pub ms_p95: f32,
 }
 
+/// Relative to `inf3d_core`'s manifest, the live asset tree is one crate over.
+/// Baked at compile time (dev/`cargo run` workflow), same hop the foliage loader
+/// uses. A missing file is normal (not an error) — the built-in defaults apply.
+const QUALITY_CONFIG_PATH: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../inf3d_app/assets/config/quality.ron");
+
+/// Load [`QualitySettings`] from `assets/config/quality.ron`, falling back to the
+/// built-in [`Default`] when the file is absent or malformed.
+///
+/// This is the project's **first data-driven config** — the streaming / foliage /
+/// water / post-FX knobs can now be tuned by editing the `.ron` and re-running, no
+/// recompile. It also sets the pattern later content (block/material defs, etc.)
+/// follows: one typed struct, `#[serde(default)]` for forward-compatible partial
+/// files, and a graceful fallback so a bad file degrades to defaults instead of a
+/// crash. A parse error is surfaced as a `warn!` so a typo doesn't fail silently.
+fn load_quality_settings() -> QualitySettings {
+    let Ok(text) = std::fs::read_to_string(QUALITY_CONFIG_PATH) else {
+        // No file → defaults. Common and expected; nothing to report.
+        return QualitySettings::default();
+    };
+    match ron::from_str::<QualitySettings>(&text) {
+        Ok(settings) => {
+            info!("inf3d_core: loaded quality settings from quality.ron");
+            settings
+        }
+        Err(err) => {
+            warn!("inf3d_core: quality.ron parse error ({err}); using defaults");
+            QualitySettings::default()
+        }
+    }
+}
+
 /// Registers all engine-wide resources. **Add this plugin first** so other
 /// plugins (`WorldPlugin`, `GrassPlugin`, …) see `QualitySettings` at their
 /// own `build` time.
@@ -197,7 +234,7 @@ impl Plugin for CorePlugin {
             )
                 .chain(),
         )
-        .init_resource::<QualitySettings>()
+        .insert_resource(load_quality_settings())
         .init_resource::<GrassStats>()
         .init_resource::<FrameStats>()
         .init_resource::<BlockedCells>()

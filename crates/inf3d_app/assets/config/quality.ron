@@ -1,0 +1,42 @@
+// inf3d quality / streaming config — data-driven QualitySettings.
+//
+// Edit a value and re-run the game; no recompile needed. Every field is OPTIONAL:
+// delete any line to fall back to the built-in default, or keep only the few you
+// want to override. If this file is missing or has a typo, the game logs a warning
+// and uses the built-in defaults (it never fails to start).
+//
+// Loaded by inf3d_core::load_quality_settings → CorePlugin. The values below are
+// the current built-in defaults; tweak away.
+(
+    // Chunk render radius. Read ONCE at world-plugin build (bevy_voxel_world can't
+    // re-register), so changing this needs a restart, not just a re-run mid-session.
+    // The iso view is shallow, so larger isn't always better — this is the dominant
+    // perf cost. Lower it (e.g. 8) if you hitch; raise it for longer sightlines.
+    render_distance_chunks: 10,
+
+    // World-space radius of the dense grass carpet around the player. Caps zoom-out
+    // cost (trees/rocks still fill the view via the foliage ring; only grass is
+    // bounded here). 0.0 disables grass entirely.
+    grass_radius_world: 60.0,
+
+    // Master foliage toggle (trees / rocks / grass / props).
+    foliage_enabled: true,
+
+    // Post-processing toggles.
+    dof_enabled: true,          // depth of field
+    bloom_enabled: true,        // HDR bloom (needs Hdr on the camera)
+    ssao_enabled: true,         // screen-space ambient occlusion (forces Msaa::Off)
+    motion_blur_enabled: true,  // per-object + camera motion blur
+
+    // Animated water surface.
+    water_enabled: true,
+    water_amplitude: 0.45,      // wave height; 0.0 = flat
+
+    // Max foliage tile-ring radius (tiles). Clamps the zoom-driven ring.
+    foliage_ring_max: 9,
+
+    // Width (world units) of each terrain LOD band; LOD level n starts at
+    // n * this distance from the focus. The camera raises this at runtime from the
+    // zoom footprint, so this is mainly the startup value.
+    terrain_lod_distance: 165.0,
+)

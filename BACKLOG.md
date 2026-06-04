@@ -39,17 +39,19 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
   missing layer fails loudly at test time instead of silently mis-texturing.
   *Files:* `inf3d_world/src/lib.rs`, `inf3d_world/src/terrain_material.rs`.
 
-- [ ] **B2 (#4) Data-driven config: land one RON registry.** Use the already-declared
-  `serde` to load one config from a `.ron` (start with graphics settings and/or quality
-  presets) so values can be tuned without a recompile — establishes the pattern + speeds
-  up visual iteration. *Files:* `inf3d_core`, an `assets/config/*.ron`.
+- [x] **B2 (#4) Data-driven config: land one RON registry.** `QualitySettings` now loads
+  from `assets/config/quality.ron` (serde + `ron`, `#[serde(default)]` for partial/forward-
+  compatible files) with a graceful fallback to built-in defaults on missing/bad file. Tune
+  render distance / foliage / water / post-FX by editing the `.ron` and re-running — no
+  recompile. Establishes the data-driven pattern future block/material defs follow.
+  *Files:* `inf3d_core` (`load_quality_settings`), `Cargo.toml` (+`ron`), `quality.ron`.
 
 ## Phase C — Block-system prerequisites & deferred content
 
-- [ ] **C1 (#6b) Wire the orphaned foliage.** Bushes/Corn/Flowers/Plants `.vox` (18
-  models) currently sit only in the dead root `assets/` and load nowhere. Move into the
-  live asset dir and add foliage categories so they appear in-world.
-  *Files:* `inf3d_render/src/foliage/*`, assets.
+- [x] **C1 (#6b) ~~Wire~~ Remove the orphaned foliage.** Decided against wiring them in —
+  the Bushes/Corn/Flowers/Plants `.vox` (18 models) were referenced by no code (loader only
+  reads `Trees`/`Rocks`/`Grass`), so the four unused directories were deleted from
+  `crates/inf3d_app/assets/foliage/vox/`. No source change. *Files:* assets only.
 
 - [ ] **C2 (#5) `VoxelOverride` store.** The foundation for block place/break: a sparse
   map of player-edited voxels that the mesher (`get_voxel_fn`), the `Terrain` oracle,
