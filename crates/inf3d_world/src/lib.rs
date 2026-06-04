@@ -10,7 +10,10 @@ use bevy::{
 };
 use bevy_voxel_world::prelude::*;
 use inf3d_core::QualitySettings;
-use inf3d_worldgen::{build_noise_lod, sample_height, ColumnKind, Terrain};
+use inf3d_worldgen::{
+    build_noise_lod, sample_height, ColumnKind, Terrain, VoxelEdit, VoxelOverrideSnapshot,
+    VoxelOverrides,
+};
 
 pub mod terrain_material;
 
@@ -62,6 +65,13 @@ impl TerrainMaterialId {
         // Derived from the single PALETTE table (indexed by discriminant), so a
         // material's label can never desync from its texture / index — see PALETTE.
         PALETTE[self as usize].label
+    }
+
+    /// This material's base RGB (from the single PALETTE), for UI / FX that need
+    /// the block's color without sampling the texture array (e.g. the place/break
+    /// particle + cube effects).
+    pub const fn color(self) -> [u8; 3] {
+        PALETTE[self as usize].color
     }
 
     /// Map a raw `MainWorld::MaterialIndex` (`u8`) back to its
@@ -184,6 +194,12 @@ pub struct MainWorld {
     /// [`QualitySettings::terrain_lod_distance`]). Each subsequent LOD band is
     /// this distance wide, so LOD `n` starts at `n * terrain_lod_distance`.
     pub terrain_lod_distance: f32,
+    /// Player voxel edits the mesher consults so an edited block is meshed exactly
+    /// as placed/removed. **Must be the same store** handed to [`Terrain`] and
+    /// exposed as the [`VoxelOverrides`] resource — `WorldPlugin::build` clones one
+    /// shared instance into all three. `Default` makes a *separate* empty store
+    /// (fine for standalone/test use, but it would not see the live edits).
+    pub overrides: VoxelOverrides,
 }
 
 impl Default for MainWorld {
@@ -192,6 +208,7 @@ impl Default for MainWorld {
             render_distance_chunks: DEFAULT_RENDER_DISTANCE_CHUNKS,
             lod_focus_xz: None,
             terrain_lod_distance: DEFAULT_TERRAIN_LOD_DISTANCE,
+            overrides: VoxelOverrides::default(),
         }
     }
 }
@@ -351,7 +368,13 @@ impl VoxelWorldConfig for MainWorld {
         // positions handed to the closure are already spaced by the LOD's
         // voxel scale (the library derives that from `chunk_data_shape`), so
         // we don't rescale coordinates here.
-        Box::new(move |_chunk_pos, lod, _previous| get_voxel_fn(lod))
+        //
+        // Snapshot the player edits ONCE per chunk-meshing job (a single read
+        // lock, lock-free per voxel after that), so an edited block is meshed
+        // exactly as placed/removed. The snapshot is empty until the first edit,
+        // so this is free for the common case.
+        let overrides = self.overrides.clone();
+        Box::new(move |_chunk_pos, lod, _previous| get_voxel_fn(lod, overrides.snapshot()))
     }
 
     fn texture_index_mapper(&self) -> Arc<dyn Fn(Self::MaterialIndex) -> [u32; 3] + Send + Sync> {
@@ -382,10 +405,17 @@ impl Plugin for WorldPlugin {
             .map(|q| (q.render_distance_chunks, q.terrain_lod_distance))
             .unwrap_or((DEFAULT_RENDER_DISTANCE_CHUNKS, DEFAULT_TERRAIN_LOD_DISTANCE));
 
+        // ONE shared player-edit store, cloned into every consumer below so they
+        // all read/write the same edits: the mesher (via the config), the gameplay
+        // oracle (`Terrain`), and — as the `VoxelOverrides` resource — the block
+        // place/break module (yet to be built) and anything else that needs it.
+        let overrides = VoxelOverrides::new();
+
         let main_world = MainWorld {
             render_distance_chunks,
             lod_focus_xz: None,
             terrain_lod_distance,
+            overrides: overrides.clone(),
         };
 
         // Build the custom voxel terrain material (procedural texture array
@@ -405,7 +435,10 @@ impl Plugin for WorldPlugin {
         let terrain_material = install_terrain_material(app);
 
         app.add_plugins(VoxelWorldPlugin::with_config(main_world).with_material(terrain_material))
-            .insert_resource(Terrain::new())
+            .insert_resource(Terrain::with_overrides(overrides.clone()))
+            // The shared edit store, exposed so the block module can place/remove
+            // voxels and so save/load can persist edits later.
+            .insert_resource(overrides)
             .insert_resource(DirectionalLightShadowMap { size: 4096 })
             .add_systems(Startup, setup_lighting);
     }
@@ -459,9 +492,15 @@ fn setup_lighting(mut commands: Commands) {
 ///     far chunk's *visual* coastline can shift slightly from the full-res one.
 ///     The gameplay oracle ([`Terrain`]) always samples LOD-0 noise, so
 ///     navigation stays consistent with the finest (near-camera) geometry.
-fn get_voxel_fn(lod: u8) -> Box<dyn FnMut(IVec3, Option<WorldVoxel>) -> WorldVoxel + Send + Sync> {
+fn get_voxel_fn(
+    lod: u8,
+    overrides: VoxelOverrideSnapshot,
+) -> Box<dyn FnMut(IVec3, Option<WorldVoxel>) -> WorldVoxel + Send + Sync> {
     let noise = build_noise_lod(lod);
     let mut cache = HashMap::<(i32, i32), f64>::new();
+    // Captured once: skip the per-voxel edit lookup entirely while there are no
+    // edits (the common case), so meshing keeps its original cost.
+    let has_overrides = !overrides.is_empty();
 
     // Bound the per-worker column cache so it can't grow without limit over a
     // long session. A single chunk column spans 32x32 = 1024 entries; we allow
@@ -471,6 +510,15 @@ fn get_voxel_fn(lod: u8) -> Box<dyn FnMut(IVec3, Option<WorldVoxel>) -> WorldVox
     const CACHE_CAP: usize = CHUNK_INTERIOR as usize * CHUNK_INTERIOR as usize * 4;
 
     Box::new(move |pos: IVec3, _previous| {
+        // Player edits override the procedural terrain at this exact voxel.
+        if has_overrides {
+            match overrides.get(pos) {
+                Some(VoxelEdit::Placed(mat)) => return WorldVoxel::Solid(mat),
+                Some(VoxelEdit::Removed) => return WorldVoxel::Air,
+                None => {}
+            }
+        }
+
         let key = (pos.x, pos.z);
         let surface = match cache.get(&key) {
             Some(&h) => h,
@@ -538,5 +586,33 @@ mod tests {
         }
         // Out-of-range indices have no material.
         assert_eq!(TerrainMaterialId::from_index(PALETTE.len() as u8), None);
+    }
+
+    /// The mesher must honor player edits: a `Placed` block appears where the
+    /// procedural terrain was air, a `Removed` block disappears where it was
+    /// solid — and the empty-snapshot path is unchanged.
+    #[test]
+    fn overrides_flip_meshed_voxels() {
+        let store = VoxelOverrides::new();
+        let high = IVec3::new(3, 90, 3); // above all terrain → base air
+        let low = IVec3::new(3, 0, 3); // deep underground → base solid
+
+        // Baseline with an empty snapshot (taken before any edit).
+        let mut base = get_voxel_fn(0, store.snapshot());
+        assert!(matches!(base(high, None), WorldVoxel::Air), "high voxel is air by default");
+        assert!(
+            matches!(base(low, None), WorldVoxel::Solid(_)),
+            "low voxel is solid by default"
+        );
+
+        // Edit, then re-mesh from a fresh snapshot.
+        store.place(high, TerrainMaterialId::Stone as u8);
+        store.remove(low);
+        let mut edited = get_voxel_fn(0, store.snapshot());
+        assert!(
+            matches!(edited(high, None), WorldVoxel::Solid(m) if m == TerrainMaterialId::Stone as u8),
+            "placed block is meshed as the chosen material"
+        );
+        assert!(matches!(edited(low, None), WorldVoxel::Air), "removed block is meshed as air");
     }
 }

@@ -12,7 +12,9 @@ mod voxel_world;
 mod voxel_world_internal;
 
 pub mod prelude {
-    pub use crate::chunk::{Chunk, NeedsDespawn};
+    // `NeedsRemesh` re-exported (inf3d fork) so downstream block-edit code can mark
+    // a chunk dirty after editing the voxel-lookup source, forcing a regenerate.
+    pub use crate::chunk::{Chunk, NeedsDespawn, NeedsRemesh};
     pub use crate::configuration::*;
     pub use crate::plugin::VoxelWorldPlugin;
     pub use crate::voxel::{VoxelFace, WorldVoxel, VOXEL_SIZE};

@@ -136,6 +136,29 @@ pub(super) fn stream_solid(
     start_solid_tasks(&assets, &terrain, &mut field, center, spawn_ring);
 }
 
+/// React to player block edits by despawning the grass blade(s) on the edited
+/// cell(s) — and ONLY those. Grass blades are individual entities (one per cell),
+/// so this leaves the rest of the tile completely untouched: no flicker, no
+/// re-scatter, nothing shifts on far cells. A tile that later reloads also won't
+/// re-add the grass, because [`scatter_grass`] skips edited cells
+/// (`Terrain::column_edited`).
+pub(super) fn invalidate_grass_on_edit(
+    mut commands: Commands,
+    mut edits: MessageReader<crate::edit::BlockEdited>,
+    blades: Query<(Entity, &super::spawn::GrassBlade)>,
+) {
+    // Usually one edit per frame; a small Vec scan is cheaper than a HashSet.
+    let edited: Vec<IVec2> = edits.read().map(|e| e.cell).collect();
+    if edited.is_empty() {
+        return;
+    }
+    for (entity, blade) in &blades {
+        if edited.contains(&blade.cell) {
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
 /// Stream the GRASS layer in/out as the player moves. Grass rings a fixed-size
 /// player-centered disc ([`grass_ring_tiles`]); it records no blocked cells and
 /// gets no collider, so leaving the disc just cascade-despawns the tile parent.

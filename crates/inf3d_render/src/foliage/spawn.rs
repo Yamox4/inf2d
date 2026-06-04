@@ -26,6 +26,14 @@ use super::{footprint_radius, FoliageAssets, FoliageVariant, ScatterCategory, Sc
 #[derive(Component)]
 pub struct FoliageTile;
 
+/// Marker on an individual grass blade, tagged with the voxel column it sits on.
+/// Lets a block edit despawn exactly the blade on that cell (grass blades are
+/// separate entities, so this touches nothing else in the tile).
+#[derive(Component)]
+pub(super) struct GrassBlade {
+    pub cell: IVec2,
+}
+
 /// Which kind of static collider a solid prop requests. Grass is represented by
 /// `None` at the call site and gets no collider at all.
 #[derive(Clone, Copy)]
@@ -109,6 +117,11 @@ fn spawn_prop(
                 },
             ));
         }
-        None => {}
+        // Grass: tag with its cell so a block edit can despawn just this blade.
+        None => {
+            entity.insert(GrassBlade {
+                cell: IVec2::new(pos.x.floor() as i32, pos.z.floor() as i32),
+            });
+        }
     }
 }

@@ -230,7 +230,14 @@ impl Plugin for FoliagePlugin {
             .add_systems(Startup, setup_foliage)
             .add_systems(
                 Update,
-                (stream::stream_solid, stream::stream_grass).in_set(GameSet::Streaming),
+                (
+                    stream::stream_solid,
+                    stream::stream_grass,
+                    // Despawn grass blades on player-edited cells (order-independent
+                    // — it only touches the edited cell's own blade entity).
+                    stream::invalidate_grass_on_edit,
+                )
+                    .in_set(GameSet::Streaming),
             );
     }
 }

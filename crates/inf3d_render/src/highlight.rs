@@ -49,6 +49,9 @@ const OUTLINE_THICKNESS: f32 = 0.16;
 pub struct Hover {
     pub voxel: Option<IVec3>,
     pub material: Option<u8>,
+    /// Outward normal of the hovered face (the side the cursor is over), so the
+    /// block-edit system knows which adjacent cell to fill when placing a block.
+    pub normal: Option<IVec3>,
 }
 
 pub struct HighlightPlugin;
@@ -118,11 +121,13 @@ fn update_highlight(
                 WorldVoxel::Solid(m) => Some(m),
                 _ => None,
             };
+            hover.normal = hit.voxel_normal();
         }
         None => {
             *visibility = Visibility::Hidden;
             hover.voxel = None;
             hover.material = None;
+            hover.normal = None;
         }
     }
 }

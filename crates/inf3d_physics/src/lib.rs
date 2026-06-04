@@ -294,12 +294,17 @@ fn player_controller(
         // `[y, y+1]`, so the top face is `surface_y + 1`.
         let foot_offset = PLAYER_HALF_HEIGHT + PLAYER_RADIUS; // capsule centre → feet
         let feet_y = transform.translation.y - foot_offset;
+        // Resolve ground at the player's CURRENT level: in a tunnel / under a built
+        // overhang the player must rest on the floor nearest their feet, not the
+        // topmost voxel (which would pop them onto the ceiling). On normal terrain
+        // and single-layer columns this is identical to `surface_y`.
+        let ref_y = feet_y.round() as i32;
         let support_surface_y = footprint_surface(
             transform.translation.x,
             transform.translation.z,
             PLAYER_RADIUS,
             feet_y + STEP_HEIGHT,
-            |cx, cz| terrain.surface_y(cx, cz),
+            |cx, cz| terrain.surface_y_near(cx, cz, ref_y),
             |cx, cz| terrain.is_land(cx, cz),
         );
 

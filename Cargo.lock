@@ -3063,6 +3063,8 @@ name = "inf3d_core"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "ron",
+ "serde",
 ]
 
 [[package]]

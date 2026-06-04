@@ -114,10 +114,11 @@ pub(super) fn scatter_solid(
 /// [`ScatterItem`]s only — no collider, no blocked cells, no inter-prop overlap
 /// test (grass may overlap freely).
 ///
-/// Determinism: seeded from the SAME [`tile_seed`] as [`scatter_solid`] but with
-/// its own independent `StdRng`, so a tile's grass is stable run to run and never
-/// shifts when the solid layer's eligibility changes. `variant_count` is the
-/// number of loaded grass variants; `0` (no grass assets) yields an empty vec.
+/// Determinism: each cell seeds its OWN `StdRng` from its coords (via
+/// [`tile_seed`] of the cell), so grass is stable run to run AND fully independent
+/// per cell — removing one cell's grass (a player edit) can't shift what spawns on
+/// any other cell. `variant_count` is the number of loaded grass variants; `0`
+/// (no grass assets) yields an empty vec.
 pub(super) fn scatter_grass(
     terrain: &Terrain,
     tile: IVec2,
@@ -126,7 +127,6 @@ pub(super) fn scatter_grass(
     if variant_count == 0 {
         return Vec::new();
     }
-    let mut rng = StdRng::seed_from_u64(tile_seed(tile));
 
     let base_x = tile.x * TILE;
     let base_z = tile.y * TILE;
@@ -137,6 +137,16 @@ pub(super) fn scatter_grass(
         for lz in 0..TILE {
             let x = base_x + lx;
             let z = base_z + lz;
+            // Per-CELL rng (seed = the cell's coords): each cell's grass is fully
+            // independent, so dropping one cell's grass (a player edit) never
+            // shifts what spawns on any other cell — no "sliding" to neighbors.
+            let mut rng = StdRng::seed_from_u64(tile_seed(IVec2::new(x, z)));
+            // No grass on player-edited cells: placing/breaking a block clears the
+            // grass on/under it. The live blade is also despawned immediately on
+            // edit; this keeps it gone if the tile later reloads.
+            if terrain.column_edited(x, z) {
+                continue;
+            }
             let pos = terrain.stand_pos(x, z);
             if pos.y <= WATER_HEIGHT {
                 continue;

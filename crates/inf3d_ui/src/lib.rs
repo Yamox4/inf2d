@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
 use bevy_voxel_world::prelude::Chunk;
 
-use inf3d_core::{FrameStats, GameSet, QualitySettings};
+use inf3d_core::{EditMode, FrameStats, GameSet, QualitySettings};
 use inf3d_world::{MainWorld, TerrainMaterialId};
 
 /// Live-monitor metrics, logged each second by `LogDiagnosticsPlugin` alongside
@@ -61,7 +61,15 @@ impl Plugin for HudPlugin {
         app.register_diagnostic(Diagnostic::new(DIAG_CHUNKS))
             .register_diagnostic(Diagnostic::new(DIAG_MESHES))
             .init_resource::<HudStats>()
-            .add_systems(Startup, spawn_hud)
+            .add_systems(Startup, (spawn_hud, spawn_mode_buttons))
+            // Mode buttons: press handling in Input, restyle in Fx.
+            .add_systems(Update, mode_button_system.in_set(GameSet::Input))
+            .add_systems(
+                Update,
+                update_mode_buttons
+                    .in_set(GameSet::Fx)
+                    .run_if(resource_changed::<EditMode>),
+            )
             // Graphics settings are currently fixed high; runtime settings UI will
             // be reintroduced later. Everything below is read-only diagnostics /
             // presentation and belongs in `Fx` (end of the frame).
@@ -244,4 +252,108 @@ fn update_hud(
         on_off(settings.motion_blur_enabled),
         hover_line,
     );
+}
+
+/// One of the three voxel-edit mode buttons on the right edge of the screen.
+/// Carries its [`EditMode`] plus the two background colors used to show whether
+/// it is the active mode (vivid) or not (dim).
+#[derive(Component, Clone, Copy)]
+struct ModeButton {
+    mode: EditMode,
+    active: Color,
+    inactive: Color,
+}
+
+/// Spawn the Build (`+`), Destroy (`x`), Off (`o`) buttons in a vertical stack on
+/// the far-right edge, color-coded (green / red / grey). The active mode is
+/// highlighted by [`update_mode_buttons`]; clicks are handled by
+/// [`mode_button_system`].
+fn spawn_mode_buttons(mut commands: Commands) {
+    // (mode, glyph, active color, inactive color)
+    let modes = [
+        (
+            EditMode::Build,
+            "+",
+            Color::srgb(0.32, 0.66, 0.34),
+            Color::srgb(0.19, 0.33, 0.20),
+        ),
+        (
+            EditMode::Destroy,
+            "x",
+            Color::srgb(0.74, 0.28, 0.26),
+            Color::srgb(0.38, 0.20, 0.19),
+        ),
+        (
+            EditMode::Off,
+            "o",
+            Color::srgb(0.47, 0.51, 0.57),
+            Color::srgb(0.26, 0.28, 0.32),
+        ),
+    ];
+
+    commands
+        .spawn(Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(10.0),
+            top: Val::Percent(34.0),
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(8.0),
+            ..default()
+        })
+        .with_children(|stack| {
+            for (mode, glyph, active, inactive) in modes {
+                stack
+                    .spawn((
+                        Button,
+                        Interaction::default(),
+                        Node {
+                            width: Val::Px(42.0),
+                            height: Val::Px(42.0),
+                            justify_content: JustifyContent::Center,
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        BackgroundColor(inactive),
+                        ModeButton {
+                            mode,
+                            active,
+                            inactive,
+                        },
+                    ))
+                    .with_children(|b| {
+                        b.spawn((
+                            Text::new(glyph),
+                            TextFont {
+                                font_size: 24.0,
+                                ..default()
+                            },
+                            TextColor(Color::srgb(0.96, 0.98, 1.0)),
+                        ));
+                    });
+            }
+        });
+}
+
+/// Switch [`EditMode`] when a mode button is pressed.
+fn mode_button_system(
+    buttons: Query<(&Interaction, &ModeButton), Changed<Interaction>>,
+    mut mode: ResMut<EditMode>,
+) {
+    for (interaction, button) in &buttons {
+        if *interaction == Interaction::Pressed && *mode != button.mode {
+            *mode = button.mode;
+        }
+    }
+}
+
+/// Highlight the active mode button and dim the others. Runs whenever
+/// [`EditMode`] changes (including the first frame, so the default `Off` lights up).
+fn update_mode_buttons(mode: Res<EditMode>, mut buttons: Query<(&ModeButton, &mut BackgroundColor)>) {
+    for (button, mut bg) in &mut buttons {
+        bg.0 = if button.mode == *mode {
+            button.active
+        } else {
+            button.inactive
+        };
+    }
 }

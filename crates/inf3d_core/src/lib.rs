@@ -185,6 +185,20 @@ pub struct FrameStats {
     pub ms_p95: f32,
 }
 
+/// What a left-click does, chosen by the player via the HUD mode buttons. The
+/// block-edit system and the pathfinder both read this so exactly one of them
+/// acts on a click: editing in `Build`/`Destroy`, click-to-move in `Off`.
+#[derive(Resource, Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EditMode {
+    /// Normal play — left-click pathfinds (click-to-move). The default.
+    #[default]
+    Off,
+    /// Left-click places a block on the face of the hovered voxel.
+    Build,
+    /// Left-click removes the hovered voxel.
+    Destroy,
+}
+
 /// Relative to `inf3d_core`'s manifest, the live asset tree is one crate over.
 /// Baked at compile time (dev/`cargo run` workflow), same hop the foliage loader
 /// uses. A missing file is normal (not an error) — the built-in defaults apply.
@@ -237,6 +251,7 @@ impl Plugin for CorePlugin {
         .insert_resource(load_quality_settings())
         .init_resource::<GrassStats>()
         .init_resource::<FrameStats>()
+        .init_resource::<EditMode>()
         .init_resource::<BlockedCells>()
         .init_resource::<PathTarget>();
     }

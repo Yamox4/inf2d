@@ -17,7 +17,7 @@ use bevy::{
 use bevy_voxel_world::prelude::*;
 
 use inf3d_camera::IsoCamera;
-use inf3d_core::{BlockedCells, GameSet, PathTarget};
+use inf3d_core::{BlockedCells, EditMode, GameSet, PathTarget};
 use inf3d_gameplay::{MovePath, Player};
 use inf3d_world::MainWorld;
 use inf3d_worldgen::Terrain;
@@ -32,6 +32,12 @@ pub const MAX_EXPANSIONS: usize = 60_000;
 /// Max ring radius (in cells) the goal-snap spiral searches before giving up.
 /// Bounds the cost of snapping a click on water/props to a reachable cell.
 pub const MAX_GOAL_SNAP: i32 = 32;
+/// How far (in voxels) a column's resolved floor may sit from the clicked level
+/// and still count as "at that level" for goal snapping. Beyond this the goal is
+/// snapped to the nearest cell that IS at the clicked level, so a click on a
+/// too-small / unenterable tunnel stops at the entrance instead of routing over
+/// the surface above it.
+pub const LEVEL_TOLERANCE: i32 = 2;
 
 pub struct PathfindPlugin;
 
@@ -61,6 +67,12 @@ impl Plugin for PathfindPlugin {
 pub struct PathRequest {
     pub start: IVec2,
     pub goal: IVec2,
+    /// The world Y the player **clicked at** — the target *level*. The search
+    /// resolves each column's floor nearest this height, so clicking into a tunnel
+    /// routes along the tunnel floor instead of snapping to the surface above it.
+    /// Using the clicked level (not the player's) is what makes it work when you
+    /// dig from outside/above the tunnel. No effect on unedited terrain.
+    pub ref_y: i32,
 }
 
 /// A path the worker found, as world-space standing waypoints (no start cell).
@@ -98,19 +110,29 @@ struct PathSearchResult {
     /// derive standing positions for the waypoints so we don't pay a second
     /// clone (and so positions stay deterministic with the search).
     terrain: Terrain,
+    /// Reference level the search used (see [`PathRequest::ref_y`]); reused to
+    /// derive level-aware waypoint heights.
+    ref_y: i32,
 }
 
 /// On left click, raycast the cursor into the voxel world and queue an A*
 /// search. Pathfinding itself runs on a worker (see [`dispatch_path_task`]).
 fn handle_click(
     mouse: Res<ButtonInput<MouseButton>>,
+    mode: Res<EditMode>,
     window: Query<&Window, With<PrimaryWindow>>,
     cam: Query<(&Camera, &GlobalTransform), With<IsoCamera>>,
     voxel_world: VoxelWorld<MainWorld>,
     query: Query<&Transform, With<Player>>,
+    interactions: Query<&Interaction>,
     mut requests: MessageWriter<PathRequest>,
 ) {
-    if !mouse.just_pressed(MouseButton::Left) {
+    // Click-to-move only in normal mode; Build/Destroy clicks are the editor's.
+    if *mode != EditMode::Off || !mouse.just_pressed(MouseButton::Left) {
+        return;
+    }
+    // Ignore clicks on UI widgets (e.g. the mode buttons).
+    if interactions.iter().any(|i| !matches!(i, Interaction::None)) {
         return;
     }
 
@@ -131,6 +153,11 @@ fn handle_click(
         return;
     };
     let goal = IVec2::new(hit.position.x.floor() as i32, hit.position.z.floor() as i32);
+    // Reference LEVEL = the height the cursor hit. Resolving each column's floor
+    // nearest this routes a click into a tunnel along the tunnel floor instead of
+    // the surface above it — and works regardless of where the player is standing
+    // (you dig tunnels from outside, so the player's own height is the wrong ref).
+    let ref_y = hit.position.y.round() as i32;
 
     let Ok(t) = query.single() else {
         return;
@@ -140,7 +167,7 @@ fn handle_click(
         t.translation.z.floor() as i32,
     );
 
-    requests.write(PathRequest { start, goal });
+    requests.write(PathRequest { start, goal, ref_y });
 }
 
 /// Spawn an A* worker for the most recent [`PathRequest`] this frame, cancelling
@@ -163,19 +190,28 @@ fn dispatch_path_task(
     // treat them as impassable. The resident set is bounded by the foliage ring,
     // so this clone is small.
     let blocked_snapshot: HashSet<IVec2> = blocked.iter().collect();
+    let ref_y = req.ref_y;
     let pool = AsyncComputeTaskPool::get();
     let task = pool.spawn(async move {
         let started = Instant::now();
+        // Level-aware view of the terrain: every surface query resolves the floor
+        // nearest the player's level, so the route follows them into a tunnel /
+        // built structure instead of climbing to the topmost voxel. Unedited
+        // columns are unaffected.
+        let leveled = LeveledTerrain {
+            terrain: terrain_snapshot.clone(),
+            ref_y,
+        };
         // Snap the goal to the nearest walkable, unblocked cell so clicking a
         // tree/rock walks to a reachable spot beside it and clicking water walks
         // to the shore. If nothing suitable is in range, fall back to the raw
         // goal — A* will then report no path (existing behavior).
-        let goal = snap_goal(&terrain_snapshot, req.goal, &blocked_snapshot).unwrap_or(req.goal);
-        let (cells, expansions) = astar(&terrain_snapshot, req.start, goal, &blocked_snapshot);
+        let goal = snap_goal(&leveled, req.goal, &blocked_snapshot).unwrap_or(req.goal);
+        let (cells, expansions) = astar(&leveled, req.start, goal, &blocked_snapshot);
         // String-pull the blocky 8-connected route into long straight diagonals
         // (Diablo feel) while keeping every dropped corner's clearance. No-op for
         // `None`/empty routes.
-        let cells = cells.map(|route| smooth_path(&terrain_snapshot, &route, &blocked_snapshot));
+        let cells = cells.map(|route| smooth_path(&leveled, &route, &blocked_snapshot));
         let elapsed_ms = started.elapsed().as_secs_f32() * 1000.0;
         PathSearchResult {
             cells,
@@ -183,6 +219,7 @@ fn dispatch_path_task(
             expansions,
             elapsed_ms,
             terrain: terrain_snapshot,
+            ref_y,
         }
     });
 
@@ -231,7 +268,7 @@ fn poll_path_task(
     let waypoints: Vec<Vec3> = cells
         .into_iter()
         .skip(1)
-        .map(|c| result.terrain.stand_pos(c.x, c.y))
+        .map(|c| result.terrain.stand_pos_near(c.x, c.y, result.ref_y))
         .collect();
 
     if waypoints.is_empty() {
@@ -311,6 +348,13 @@ fn octile(a: IVec2, b: IVec2) -> f32 {
 trait SurfaceOracle {
     fn surface_y(&self, x: i32, z: i32) -> i32;
     fn is_land(&self, x: i32, z: i32) -> bool;
+    /// Whether column `(x, z)` has a standable floor at ~the search's target level.
+    /// Default `true` (level-agnostic oracles / tests); the leveled oracle
+    /// overrides it so a goal can't snap to a surface far above/below the clicked
+    /// level (e.g. the mountain top over a tunnel too short to enter).
+    fn near_target_level(&self, _x: i32, _z: i32) -> bool {
+        true
+    }
 }
 
 impl SurfaceOracle for Terrain {
@@ -319,6 +363,28 @@ impl SurfaceOracle for Terrain {
     }
     fn is_land(&self, x: i32, z: i32) -> bool {
         Terrain::is_land(self, x, z)
+    }
+}
+
+/// A [`Terrain`] view that resolves each column's surface at a fixed reference
+/// level (`ref_y`), so the A* search follows the player's current height into
+/// tunnels / built structures rather than always taking the topmost voxel.
+/// Unedited columns ignore `ref_y`, so normal-terrain navigation is unchanged.
+struct LeveledTerrain {
+    terrain: Terrain,
+    ref_y: i32,
+}
+
+impl SurfaceOracle for LeveledTerrain {
+    fn surface_y(&self, x: i32, z: i32) -> i32 {
+        self.terrain.surface_y_near(x, z, self.ref_y)
+    }
+    fn is_land(&self, x: i32, z: i32) -> bool {
+        self.terrain.is_land(x, z)
+    }
+    fn near_target_level(&self, x: i32, z: i32) -> bool {
+        // Stand height of the resolved floor (`surface_y + 1`) vs the clicked level.
+        (self.terrain.surface_y_near(x, z, self.ref_y) + 1 - self.ref_y).abs() <= LEVEL_TOLERANCE
     }
 }
 
@@ -336,7 +402,14 @@ fn snap_goal<O: SurfaceOracle>(
     goal: IVec2,
     blocked: &HashSet<IVec2>,
 ) -> Option<IVec2> {
-    let suitable = |c: IVec2| terrain.is_land(c.x, c.y) && !blocked.contains(&c);
+    let suitable = |c: IVec2| {
+        terrain.is_land(c.x, c.y)
+            && !blocked.contains(&c)
+            // Must have a floor at ~the clicked level, so a click on a too-small /
+            // unenterable tunnel snaps to the nearest cell that IS at that level
+            // (the entrance) rather than the surface above it.
+            && terrain.near_target_level(c.x, c.y)
+    };
     if suitable(goal) {
         return Some(goal);
     }
@@ -408,10 +481,24 @@ fn astar<O: SurfaceOracle>(
 
     let mut expansions = 0usize;
 
+    // Best-effort target: the reachable cell that ends up closest to the goal.
+    // If the goal itself can't be reached (e.g. a tunnel too small to enter), we
+    // route here instead so a click always walks the player as close as possible
+    // — stopping at the entrance rather than going nowhere.
+    let mut best = start;
+    let mut best_h = octile(start, goal);
+
     while let Some(Reverse((_, cx, cy))) = open.pop() {
         let current = IVec2::new(cx, cy);
         if current == goal {
             return (Some(reconstruct(&came_from, current)), expansions);
+        }
+
+        // `current` is reached; track it if it's the closest-to-goal so far.
+        let h = octile(current, goal);
+        if h < best_h {
+            best_h = h;
+            best = current;
         }
 
         expansions += 1;
@@ -482,7 +569,15 @@ fn astar<O: SurfaceOracle>(
         }
     }
 
-    (None, expansions)
+    // Open set drained without reaching the goal: route to the closest reachable
+    // cell instead of giving up, so the player still walks toward what they
+    // clicked (e.g. up to a tunnel mouth too small to enter). `None` only if no
+    // progress past `start` was possible at all.
+    if best == start {
+        (None, expansions)
+    } else {
+        (Some(reconstruct(&came_from, best)), expansions)
+    }
 }
 
 /// String-pull a blocky 8-connected cell route into one with long straight
