@@ -1,15 +1,11 @@
 // Voxel terrain material — forward path only.
 //
-// This shader is used ONLY for the forward (main) pass. The prepass uses
-// Bevy's stock `pbr_prepass.wgsl` (via `ExtendedMaterial<StandardMaterial, _>`'s
-// default delegation), which means depth + normal prepass output, alpha
-// discard, and motion vectors all work the same as any StandardMaterial.
-// That in turn means `DistanceFog`, `VolumetricFog`, SSAO, motion blur, water
-// SSR, and anything else that samples the depth/normal prepass textures will
-// see the voxel terrain. The previous `voxel_texture.wgsl` (which this
-// supersedes) declared a `#ifdef PREPASS_PIPELINE` branch in its vertex stage
-// emitting a custom struct that did not match `prepass_io::VertexOutput`; we
-// avoid that bug by not overriding the prepass shaders at all.
+// This shader is the FORWARD (main) pass. The prepass is a separate custom shader
+// (`terrain_prepass.wgsl`) that writes the same depth + normal + motion outputs as a
+// StandardMaterial prepass — so SSAO, motion blur, water depth, DoF, etc. all still
+// see the voxel terrain — but ALSO removes the player-built voxels this pass cuts (the
+// see-through cutaway), so the prepass depth can't re-occlude the player. Both passes
+// call the shared `inf3d::terrain_xray::xray_should_discard`, keeping the cut identical.
 //
 // The forward fragment logic is identical to upstream
 // `bevy_voxel_world::shaders::voxel_texture.wgsl`: pick a texture face from
@@ -26,6 +22,7 @@
 }
 #import bevy_pbr::pbr_bindings
 #import bevy_render::instance_index::get_instance_index
+#import inf3d::terrain_xray::xray_should_discard
 
 @group(#{MATERIAL_BIND_GROUP}) @binding(100)
 var mat_array_texture: texture_2d_array<f32>;
@@ -33,29 +30,9 @@ var mat_array_texture: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101)
 var mat_array_texture_sampler: sampler;
 
-// See-through ("x-ray") parameters, fed each frame by `inf3d_render::xray`. Layout
-// matches the `XrayParams` Rust struct (two vec4s, binding 102).
-struct XrayParams {
-    screen: vec4<f32>, // xy = player px, z = fade radius px, w = enabled (>0.5)
-    depth: vec4<f32>,  // reserved
-}
-@group(#{MATERIAL_BIND_GROUP}) @binding(102)
-var<uniform> xray: XrayParams;
-
-// First material index that counts as a player BUILD (vs terrain) — keep in sync
-// with `inf3d_world::BUILT_MATERIAL_BASE` (= `TerrainMaterialId::BuiltStone`).
-const BUILT_MATERIAL_BASE: u32 = 10u;
-
-// 4×4 ordered (Bayer) dither threshold in [0,1) for screen-door transparency.
-fn bayer4(px: u32, py: u32) -> f32 {
-    var m = array<f32, 16>(
-        0.0, 8.0, 2.0, 10.0,
-        12.0, 4.0, 14.0, 6.0,
-        3.0, 11.0, 1.0, 9.0,
-        15.0, 7.0, 13.0, 5.0,
-    );
-    return m[(py & 3u) * 4u + (px & 3u)] / 16.0;
-}
+// The see-through cutaway (binding 102 `xray` uniform + `xray_should_discard`) lives
+// in the shared `inf3d::terrain_xray` module so the forward + prepass passes share one
+// definition and cut the identical voxels.
 
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
@@ -188,20 +165,12 @@ fn fragment(
     // fragment stage no longer does a fragile float-equality test.
     let tex_face = in.tex_face;
 
-    // See-through cutout: dither-discard player-built faces near the player on
-    // screen so you can build inside walls/houses. Terrain (material index below
-    // BUILT_MATERIAL_BASE) is never touched. NOTE: this is the FORWARD half — the
-    // matching prepass discard (which punches the depth holes that fully reveal the
-    // player) is the next step; until then the holes show what's behind the wall.
-    if xray.screen.w > 0.5 && in.tex_idx[tex_face] >= BUILT_MATERIAL_BASE {
-        let d = distance(in.position.xy, xray.screen.xy);
-        let radius = xray.screen.z;
-        if d < radius {
-            let fade = 1.0 - d / radius; // 1 at the player, 0 at the fade edge
-            if fade > bayer4(u32(in.position.x), u32(in.position.y)) {
-                discard;
-            }
-        }
+    // See-through cutaway: remove whole player-built voxels that sit between the
+    // camera and the player (world-space, block-based — see `inf3d::terrain_xray`).
+    // The prepass (`terrain_prepass.wgsl`) runs the SAME test so the wall's depth is
+    // gone too and the player behind shows through. Terrain/city is never touched.
+    if xray_should_discard(in.world_position.xyz, in.world_normal, in.tex_idx[tex_face]) {
+        discard;
     }
 
 #ifdef VERTEX_UVS

@@ -19,13 +19,16 @@ use inf3d_worldgen::{VoxelOverrides, FLAT_SURFACE_Y};
 /// Topmost solid Y of the flat ground (the player stands on `TOP + 1`).
 const TOP: i32 = FLAT_SURFACE_Y;
 
-/// Structures are stamped as `BuiltStone` (player-build material) so they exercise
-/// the see-through cutout — terrain stays solid.
+/// Structures are stamped as `Built*` (player-build) materials, never natural terrain
+/// ones, so the whole test layout reads as player-placed: it exercises the see-through
+/// cutout (material index >= `BUILT_MATERIAL_BASE`) and stays distinct from the flat
+/// ground. `BuiltStone`/`BuiltDirt` look like stone/dirt but are the placeable
+/// variants the picker also uses.
 fn stone() -> u8 {
     TerrainMaterialId::BuiltStone as u8
 }
 fn dirt() -> u8 {
-    TerrainMaterialId::Dirt as u8
+    TerrainMaterialId::BuiltDirt as u8
 }
 
 /// Place a solid box (inclusive ranges) of `mat`.

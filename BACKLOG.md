@@ -117,9 +117,29 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
   - [x] **Save/load persists edits** — already done in `inf3d_menu` (3-slot RON via
     `VoxelOverrides::export()/import()`, + player/camera/edit-mode); now also stores
     the picker's `selected_material` (serde-default for old saves).
-  - [ ] **Next:** re-enable the see-through cutout (needs the matching prepass-discard
-    shader in `terrain_material.wgsl`; CPU feed in `xray.rs` is ready). Then harvesting
-    (Tree/Rock/`InteractionTarget` hooks exist), inventory/items, foliage wind.
+  - [x] **See-through cutout (player builds only)** — custom terrain PREPASS
+    (`terrain_prepass.wgsl`) discards the same player-built fragments the forward pass
+    dithers, so the depth prepass no longer occludes the player behind your walls.
+    Only `Built*` materials (index ≥ `BUILT_MATERIAL_BASE`) are affected — terrain /
+    city / natural blocks stay solid (cave opacity is a separate future thing). Gated
+    in `xray.rs` to presets whose prepass has a fragment (normal/motion), so depth-only
+    presets just leave walls opaque instead of punching black holes. Test-map structures
+    now stamp `BuiltStone`/`BuiltDirt` so the whole lab reads as player-placed.
+    *Files:* `inf3d_world/{terrain_material.rs,terrain_prepass.wgsl,terrain_material.wgsl}`,
+    `inf3d_render/xray.rs`, `inf3d_menu/testmap.rs`.
+  - [x] **Cutaway is now world-space + block-based** — the screen-space dither circle
+    (which caught bystander blocks and looked mushy) is gone. The shared
+    `inf3d::terrain_xray::xray_should_discard` removes WHOLE player-built voxels whose
+    CENTER sits on the camera→player line (world-space): in front of the player
+    (`dot(Δ, view) < 0`) and within `CUT_RADIUS` of the player's vertical segment. Snaps
+    to voxel center (stepping inside along the face normal) so blocks cut as a unit, and
+    only the blocks actually occluding the character open up — side/back/standing-in-front
+    walls stay solid. Forward + prepass call the same fn (deterministic, no dither). Knobs:
+    `CUT_RADIUS` (≈0.95 blocks), `PLAYER_HALF_HEIGHT` (1.1) in `xray.rs`.
+  - [ ] **Next:** perf in dense areas (rd=10 + foliage is the dominant cost; the prepass
+    discard also disables terrain early-z); horizontal collision for placed voxels (you
+    can still walk through their sides); then harvesting (Tree/Rock/`InteractionTarget`
+    hooks exist), inventory/items, foliage wind.
 
 ---
 

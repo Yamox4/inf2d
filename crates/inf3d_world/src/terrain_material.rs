@@ -96,7 +96,7 @@ use bevy::render::render_resource::{
     TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
 };
 use bevy::shader::{ShaderDefVal, ShaderRef};
-use bevy_voxel_world::rendering::vertex_layout;
+use bevy_voxel_world::rendering::{vertex_layout, ATTRIBUTE_TEX_INDEX};
 
 /// Stable, type-checked handle to the terrain shader. `uuid_handle!` produces
 /// a `Handle::Uuid` whose AssetId is determined entirely by the literal — the
@@ -104,6 +104,21 @@ use bevy_voxel_world::rendering::vertex_layout;
 /// slot that `load_internal_asset!` writes to.
 const TERRAIN_MATERIAL_SHADER_HANDLE: Handle<Shader> =
     uuid_handle!("0c4dfc1c-7b39-4f0a-93a3-2b8f6d18a16e");
+
+/// Stable handle to the custom terrain PREPASS shader
+/// ([`terrain_prepass.wgsl`](./terrain_prepass.wgsl)). Replaces the stock
+/// StandardMaterial prepass so the depth/normal/motion prepass can DISCARD the same
+/// player-built fragments the forward pass dithers away — the half that actually makes
+/// the see-through cutout reveal the player (see that file's header).
+const TERRAIN_PREPASS_SHADER_HANDLE: Handle<Shader> =
+    uuid_handle!("9f3b2a1c-7d4e-4c8a-b6f1-3e2d1c0a9b8e");
+
+/// Stable handle to the shared see-through module
+/// ([`terrain_xray.wgsl`](./terrain_xray.wgsl), `#define_import_path inf3d::terrain_xray`).
+/// Both the forward shader and the prepass `#import` its `xray_should_discard` so they
+/// cut the identical set of voxels for the cutaway.
+const TERRAIN_XRAY_SHADER_HANDLE: Handle<Shader> =
+    uuid_handle!("5c8e4a2d-9b1f-4e3a-a7d2-6f0b1c9e8d34");
 
 /// Public type alias for the full material
 /// (`ExtendedMaterial<StandardMaterial, VoxelTerrainExtension>`). Downstream
@@ -140,24 +155,27 @@ impl Default for VoxelTerrainExtension {
     }
 }
 
-/// Parameters the terrain shader uses to dither away player-built faces (material
-/// index `>= `[`crate::BUILT_MATERIAL_BASE`]) that sit between the camera and the
-/// player. Two `vec4`s keep the std140 uniform layout trivially correct.
+/// Parameters the terrain shaders use to cut away player-built voxels (material index
+/// `>= `[`crate::BUILT_MATERIAL_BASE`]) that sit between the camera and the player.
+/// The cutaway is computed in WORLD space and per-voxel — see
+/// [`terrain_xray.wgsl`](crate::terrain_material). Three `vec4`s keep the std140
+/// uniform layout trivially correct. Fed each frame by `inf3d_render::xray`.
 #[derive(Clone, Copy, Debug, ShaderType)]
 pub struct XrayParams {
-    /// `xy` = player position in framebuffer pixels; `z` = fade radius (px);
-    /// `w` = enabled (`> 0.5` turns the cutout on).
-    pub screen: Vec4,
-    /// `x` = player framebuffer depth (reverse-z: larger = nearer the camera);
-    /// `yzw` reserved.
-    pub depth: Vec4,
+    /// `xyz` = player body center (world); `w` = enabled (`> 0.5` turns the cutaway on).
+    pub player: Vec4,
+    /// `xyz` = camera forward (unit, into the scene); `w` = cut radius (world units).
+    pub view: Vec4,
+    /// `x` = player half-height (world units); `yzw` reserved.
+    pub extra: Vec4,
 }
 
 impl Default for XrayParams {
     fn default() -> Self {
         Self {
-            screen: Vec4::ZERO,
-            depth: Vec4::ZERO,
+            player: Vec4::ZERO,
+            view: Vec4::ZERO,
+            extra: Vec4::ZERO,
         }
     }
 }
@@ -181,48 +199,56 @@ impl MaterialExtension for VoxelTerrainExtension {
         true
     }
 
-    /// `ShaderRef::Default` chains through `ExtendedMaterial` into
-    /// `StandardMaterial::prepass_vertex_shader()` — also `ShaderRef::Default`
-    /// — and finally resolves to Bevy's bundled `prepass.wgsl`. That shader
-    /// builds its own vertex layout from POSITION/UV_0/NORMAL/COLOR — all of
-    /// which the voxel mesher produces.
+    /// Custom prepass (see [`terrain_prepass.wgsl`](./terrain_prepass.wgsl)) instead
+    /// of the stock `ShaderRef::Default` chain (which would resolve to
+    /// `pbr_prepass.wgsl`). It writes the same depth/normal/motion outputs but ALSO
+    /// discards player-built fragments near the player, so the prepass doesn't claim
+    /// those pixels' depth and the see-through cutout actually reveals the player.
+    /// `specialize` adds our `tex_idx` attribute to the prepass vertex layout so this
+    /// shader can read the per-voxel material.
     fn prepass_vertex_shader() -> ShaderRef {
-        ShaderRef::Default
+        ShaderRef::Handle(TERRAIN_PREPASS_SHADER_HANDLE)
     }
 
-    /// Same chain as `prepass_vertex_shader`: delegate to
-    /// `StandardMaterial::prepass_fragment_shader` → `pbr_prepass.wgsl`. That
-    /// shader writes depth, the world-space normal target when
-    /// `NORMAL_PREPASS` is set, and motion vectors — everything any
-    /// downstream consumer of prepass textures could want.
+    /// Same custom prepass shader as [`prepass_vertex_shader`](Self::prepass_vertex_shader)
+    /// — it defines both the `vertex` and (under `PREPASS_FRAGMENT`) `fragment` entry
+    /// points.
     fn prepass_fragment_shader() -> ShaderRef {
-        ShaderRef::Default
+        ShaderRef::Handle(TERRAIN_PREPASS_SHADER_HANDLE)
     }
 
-    /// Same as upstream `StandardVoxelMaterial::specialize`: install the
-    /// extended vertex layout (with `tex_idx` at shader location 8) on the
-    /// **forward** pipeline only. The prepass pipeline is specialized in
-    /// `bevy_pbr::prepass::PrepassPipeline::specialize` and builds its own
-    /// vertex layout from the standard mesh attributes; the extension's
-    /// `specialize` hook is never reached on that path, but we keep the
-    /// `PREPASS_PIPELINE` early-out as a defensive guard against future
-    /// Bevy refactors.
+    /// Install the vertex buffer layout with our per-voxel `tex_idx` attribute on
+    /// BOTH pipelines — the forward shader samples the texture array with it, and the
+    /// custom prepass uses it to identify (and discard) player builds.
+    ///
+    /// `PrepassPipelineSpecializer::specialize` DOES reach this hook in Bevy 0.18
+    /// (verified against `bevy_pbr::prepass`), contrary to an earlier assumption. The
+    /// two pipelines need DIFFERENT attribute sets at different shader locations: the
+    /// forward pass uses the full voxel layout (`vertex_layout()`), while the prepass
+    /// only needs position + normal + `tex_idx` at the prepass-convention locations
+    /// (matching `terrain_prepass.wgsl`'s `PrepassVertex`). `get_layout` reads the
+    /// mesh's real interleaved offsets/stride, so requesting a subset is correct.
     fn specialize(
         _pipeline: &MaterialExtensionPipeline,
         descriptor: &mut RenderPipelineDescriptor,
         layout: &MeshVertexBufferLayoutRef,
         _key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
-        if descriptor
+        let is_prepass = descriptor
             .vertex
             .shader_defs
-            .contains(&ShaderDefVal::Bool("PREPASS_PIPELINE".into(), true))
-        {
-            return Ok(());
-        }
+            .contains(&ShaderDefVal::Bool("PREPASS_PIPELINE".into(), true));
 
-        let layout_with_tex_idx: Vec<VertexAttributeDescriptor> = vertex_layout();
-        let vertex_buffer_layout = layout.0.get_layout(&layout_with_tex_idx)?;
+        let attrs: Vec<VertexAttributeDescriptor> = if is_prepass {
+            vec![
+                Mesh::ATTRIBUTE_POSITION.at_shader_location(0),
+                Mesh::ATTRIBUTE_NORMAL.at_shader_location(3),
+                ATTRIBUTE_TEX_INDEX.at_shader_location(8),
+            ]
+        } else {
+            vertex_layout()
+        };
+        let vertex_buffer_layout = layout.0.get_layout(&attrs)?;
         descriptor.vertex.buffers = vec![vertex_buffer_layout];
         Ok(())
     }
@@ -366,6 +392,26 @@ pub fn install_terrain_material(app: &mut App) -> TerrainMaterial {
         app,
         TERRAIN_MATERIAL_SHADER_HANDLE,
         "terrain_material.wgsl",
+        Shader::from_wgsl
+    );
+
+    // The matching custom PREPASS shader (depth/normal/motion + the see-through
+    // discard). Registered the same way as the forward shader so it's available
+    // synchronously on the first frame.
+    load_internal_asset!(
+        app,
+        TERRAIN_PREPASS_SHADER_HANDLE,
+        "terrain_prepass.wgsl",
+        Shader::from_wgsl
+    );
+
+    // Shared see-through module (`#define_import_path inf3d::terrain_xray`) that both
+    // shaders above `#import`. Must be registered too so naga_oil can resolve the
+    // import when their pipelines compile.
+    load_internal_asset!(
+        app,
+        TERRAIN_XRAY_SHADER_HANDLE,
+        "terrain_xray.wgsl",
         Shader::from_wgsl
     );
 
