@@ -63,10 +63,11 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
   re-calls the delegate → re-reads the store); that kick is the block module's job. Tests
   in both crates. *Files:* `inf3d_worldgen/src/lib.rs`, `inf3d_world/src/lib.rs`.
 
-- [ ] **C3 (#6a) Content systems (large, sequence as needed).** Game-state machine
-  (`bevy_state`), inventory + items, save/load (`serde`/`bincode`). Each is its own
-  multi-step effort; pull them in when the block module needs them (e.g. save must
-  persist `VoxelOverride`).
+- [~] **C3 (#6a) Content systems (large, sequence as needed).** Game-state machine
+  (`bevy_state`) **done** — `AppState{MainMenu,InGame}` + `Pause{Running,Paused}` in
+  `inf3d_core`, driven by `inf3d_menu`. Save/load **done** (`ron`, `inf3d_menu/save.rs`,
+  persists `VoxelOverrides` + player/camera/edit-mode/selected-material). Still TODO:
+  inventory + items, harvesting (Tree/Rock/`InteractionTarget` hooks exist, unwired).
 
 ## Next feature (after the above)
 - [~] **Block placing & breaking module** — built on B1 (material table), C2
@@ -101,8 +102,24 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
     surface above. A* is now **best-effort** — if the goal is unreachable it routes to the
     nearest reachable cell, so a click always walks you as close as possible.
     *File:* `inf3d_pathfinding/src/lib.rs`.
-  - [ ] **Next:** material picker (Build currently hardcodes Stone), edit SFX
-    (`inf3d_audio` ready), and save/load persisting `VoxelOverrides`.
+  - [x] **Material picker** — 8 buildable blocks (Stone/Dirt/Grass/Concrete/Glass +
+    Neon Cyan/Magenta/Yellow), each a distinct `Built*` material (index ≥
+    `BUILT_MATERIAL_BASE`) so player builds stay separable from terrain and pick up
+    the see-through cutout once that shader lands. Bottom-center hotbar (click or
+    number keys 1–8), gold-ringed selected swatch; gated to Build mode via
+    `Display::None` so it never eats Walk-mode clicks. `SelectedMaterial` (`inf3d_core`)
+    is the picked block; `BUILDABLE` (`inf3d_world`) is the single source of truth
+    for the set. *Files:* `inf3d_world`, `inf3d_core`, `inf3d_ui`, `inf3d_render/edit.rs`.
+  - [x] **Edit SFX** — `inf3d_audio` plays a "thunk" on place / "crumble" on break
+    (pitch+volume jitter, self-cleaning), driven by the now-public+enriched
+    `inf3d_render::BlockEdited` message (`placed`/`material`). Clips are synthesized
+    placeholder `.ogg`s under `sfx/world/` (swap in real ones any time).
+  - [x] **Save/load persists edits** — already done in `inf3d_menu` (3-slot RON via
+    `VoxelOverrides::export()/import()`, + player/camera/edit-mode); now also stores
+    the picker's `selected_material` (serde-default for old saves).
+  - [ ] **Next:** re-enable the see-through cutout (needs the matching prepass-discard
+    shader in `terrain_material.wgsl`; CPU feed in `xray.rs` is ready). Then harvesting
+    (Tree/Rock/`InteractionTarget` hooks exist), inventory/items, foliage wind.
 
 ---
 

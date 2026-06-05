@@ -231,12 +231,17 @@ impl Plugin for FoliagePlugin {
             .add_systems(
                 Update,
                 (
+                    // FIRST: if the world backend switched, wipe all foliage so the
+                    // streamers below re-scatter it at the new world's heights this
+                    // same frame (kills the "props carry over / float" bug).
+                    stream::clear_foliage_on_world_change,
                     stream::stream_solid,
                     stream::stream_grass,
                     // Despawn grass blades on player-edited cells (order-independent
                     // — it only touches the edited cell's own blade entity).
                     stream::invalidate_grass_on_edit,
                 )
+                    .chain()
                     .in_set(GameSet::Streaming),
             );
     }

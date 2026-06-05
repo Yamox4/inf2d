@@ -361,8 +361,7 @@ fn record_frame(
                     .unwrap_or_else(|| "off".to_string()),
                 dof.map(|d| format!("on(fd={:.0},f{:.0})", d.focal_distance, d.aperture_f_stops))
                     .unwrap_or_else(|| "off".to_string()),
-                ssao
-                    .map(|s| format!("on({:?})", s.quality_level))
+                ssao.map(|s| format!("on({:?})", s.quality_level))
                     .unwrap_or_else(|| "off".to_string()),
                 mb.map(|m| format!("on(sa={:.2},n={})", m.shutter_angle, m.samples))
                     .unwrap_or_else(|| "off".to_string()),

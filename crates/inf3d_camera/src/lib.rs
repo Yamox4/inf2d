@@ -1,7 +1,7 @@
 //! Orthographic isometric follow camera (Diablo-style 3/4 view) with springy
 //! follow, scroll-wheel zoom, and Q/E orbit.
 
-use bevy::camera::{OrthographicProjection, Projection, ScalingMode};
+use bevy::camera::{OrthographicProjection, PerspectiveProjection, Projection, ScalingMode};
 use bevy::core_pipeline::prepass::{DepthPrepass, MotionVectorPrepass, NormalPrepass};
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceAmbientOcclusionQualityLevel};
@@ -12,7 +12,7 @@ use bevy::prelude::*;
 use bevy::render::view::{ColorGrading, Hdr, Msaa};
 use bevy_voxel_world::prelude::*;
 
-use inf3d_core::{FollowTarget, GameSet, QualitySettings};
+use inf3d_core::{FollowTarget, FpsMoveIntent, GameSet, QualitySettings};
 use inf3d_world::MainWorld;
 
 /// Horizontal (XZ-plane) distance from the player to the camera.
@@ -44,6 +44,11 @@ const ORBIT_SPEED: f32 = 1.8;
 const DRAG_SENS: f32 = 0.008;
 /// Exponential smoothing rate for follow/zoom/orbit. Higher = snappier.
 const SMOOTH: f32 = 12.0;
+const FREE_FLY_SPEED: f32 = 34.0;
+const FREE_FLY_FAST_MULT: f32 = 3.0;
+const FREE_FLY_LOOK_SENS: f32 = 0.003;
+const FPS_LOOK_SENS: f32 = 0.0025;
+const FPS_EYE_HEIGHT: f32 = 0.75;
 
 // ── Zoom-scaled chunk render distance (the "half terrain culled" fix) ────────
 // Voxel terrain only streams within `MainWorld::render_distance_chunks` of the
@@ -83,6 +88,68 @@ const TERRAIN_LOD_SCREEN_MARGIN: f32 = 64.0;
 #[derive(Component)]
 pub struct IsoCamera;
 
+/// Runtime camera mode. `F` toggles free-fly in every world; `G` toggles a
+/// player-mounted FPS camera. The menu can also force free-fly for visual/debug
+/// worlds like Cyberpunk City.
+#[derive(Resource, Default)]
+pub struct CameraMode {
+    mode: CameraViewMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CameraViewMode {
+    #[default]
+    Iso,
+    FreeFly,
+    Fps,
+}
+
+impl CameraMode {
+    fn is_iso(&self) -> bool {
+        self.mode == CameraViewMode::Iso
+    }
+
+    pub fn is_free_fly(&self) -> bool {
+        self.mode == CameraViewMode::FreeFly
+    }
+
+    fn is_fps(&self) -> bool {
+        self.mode == CameraViewMode::Fps
+    }
+
+    pub fn set_free_fly(&mut self, enabled: bool) {
+        self.mode = if enabled {
+            CameraViewMode::FreeFly
+        } else {
+            CameraViewMode::Iso
+        };
+    }
+
+    fn toggle_free_fly(&mut self) {
+        self.mode = if self.is_free_fly() {
+            CameraViewMode::Iso
+        } else {
+            CameraViewMode::FreeFly
+        };
+    }
+
+    fn toggle_fps(&mut self) {
+        self.mode = if self.is_fps() {
+            CameraViewMode::Iso
+        } else {
+            CameraViewMode::Fps
+        };
+    }
+
+    fn label(&self) -> &'static str {
+        match self.mode {
+            CameraViewMode::Iso => "isometric",
+            CameraViewMode::FreeFly => "free-fly",
+            CameraViewMode::Fps => "FPS",
+        }
+    }
+}
+
 /// Smoothed camera state: orbit yaw around the player and orthographic zoom,
 /// each easing toward a target the input system sets.
 #[derive(Component)]
@@ -91,6 +158,8 @@ pub struct CameraRig {
     yaw_target: f32,
     zoom: f32,
     zoom_target: f32,
+    fps_yaw: f32,
+    fps_pitch: f32,
 }
 
 impl CameraRig {
@@ -123,8 +192,21 @@ impl Plugin for IsoCameraPlugin {
         // `QualitySettings` is a shared resource owned solely by `CorePlugin`; we
         // only read it here. `camera_input` is raw-input (Input phase);
         // `apply_quality_to_camera` reconfigures post-FX (Fx phase).
-        app.add_systems(Startup, spawn_camera)
-            .add_systems(Update, camera_input.in_set(GameSet::Input))
+        app.init_resource::<CameraMode>()
+            .add_systems(Startup, spawn_camera)
+            .add_systems(
+                Update,
+                (
+                    toggle_camera_mode,
+                    apply_camera_mode,
+                    camera_input,
+                    free_fly_input,
+                    fps_input,
+                    write_fps_move_intent,
+                )
+                    .chain()
+                    .in_set(GameSet::Input),
+            )
             // Drive the voxel chunk render distance from zoom (Input phase, before
             // streaming) so a zoomed-out view loads enough terrain to fill it.
             .add_systems(Update, scale_voxel_render_distance.in_set(GameSet::Input))
@@ -151,6 +233,10 @@ fn orbit_offset(yaw: f32) -> Vec3 {
     )
 }
 
+fn fps_eye(player_translation: Vec3) -> Vec3 {
+    player_translation + Vec3::Y * FPS_EYE_HEIGHT
+}
+
 /// Drive camera-dependent voxel streaming and terrain LOD.
 ///
 /// Streaming still needs a camera-centered disc large enough to cover max zoom.
@@ -159,7 +245,9 @@ fn orbit_offset(yaw: f32) -> Vec3 {
 /// at the screen edge. Settings provide floors only — the current camera footprint
 /// is the source of truth.
 fn scale_voxel_render_distance(
+    mode: Res<CameraMode>,
     rig: Query<&CameraRig, With<IsoCamera>>,
+    cam_q: Query<&Transform, With<IsoCamera>>,
     player_q: Query<&Transform, (With<FollowTarget>, Without<IsoCamera>)>,
     quality: Res<QualitySettings>,
     mut world: ResMut<MainWorld>,
@@ -168,7 +256,11 @@ fn scale_voxel_render_distance(
     let Ok(rig) = rig.single() else {
         return;
     };
-    if let Ok(player) = player_q.single() {
+    if mode.is_free_fly() {
+        if let Ok(cam) = cam_q.single() {
+            world.lod_focus_xz = Some(Vec2::new(cam.translation.x, cam.translation.z));
+        }
+    } else if let Ok(player) = player_q.single() {
         world.lod_focus_xz = Some(Vec2::new(player.translation.x, player.translation.z));
     }
 
@@ -283,6 +375,8 @@ fn spawn_camera(mut commands: Commands, quality: Res<QualitySettings>) {
             yaw_target: yaw,
             zoom: ZOOM_DEFAULT,
             zoom_target: ZOOM_DEFAULT,
+            fps_yaw: 0.0,
+            fps_pitch: 0.0,
         },
         // HDR is the color pipeline contract regardless of post-FX quality.
         Hdr,
@@ -323,6 +417,60 @@ fn spawn_camera(mut commands: Commands, quality: Res<QualitySettings>) {
     if motion_blur_enabled {
         // Motion blur additionally needs the motion-vector prepass.
         entity.insert((motion_blur_component(), MotionVectorPrepass));
+    }
+}
+
+fn toggle_camera_mode(keys: Res<ButtonInput<KeyCode>>, mut mode: ResMut<CameraMode>) {
+    if keys.just_pressed(KeyCode::KeyF) {
+        mode.toggle_free_fly();
+        info!("inf3d_camera: {} camera", mode.label());
+    }
+    if keys.just_pressed(KeyCode::KeyG) {
+        mode.toggle_fps();
+        info!("inf3d_camera: {} camera", mode.label());
+    }
+}
+
+fn apply_camera_mode(
+    mode: Res<CameraMode>,
+    player_q: Query<&Transform, (With<FollowTarget>, Without<IsoCamera>)>,
+    mut cam_q: Query<(&mut Transform, &mut Projection, &mut CameraRig), With<IsoCamera>>,
+) {
+    if !mode.is_changed() {
+        return;
+    }
+    let Ok((mut cam_t, mut projection, mut rig)) = cam_q.single_mut() else {
+        return;
+    };
+    if mode.is_free_fly() || mode.is_fps() {
+        *projection = Projection::Perspective(PerspectiveProjection {
+            fov: std::f32::consts::FRAC_PI_3,
+            near: 0.1,
+            far: ORTHO_FAR,
+            ..default()
+        });
+        if mode.is_fps() {
+            if let Ok(player) = player_q.single() {
+                let (yaw, _, _) = player.rotation.to_euler(EulerRot::YXZ);
+                rig.fps_yaw = yaw;
+                rig.fps_pitch = 0.0;
+                cam_t.translation = fps_eye(player.translation);
+                cam_t.rotation = Quat::from_euler(EulerRot::YXZ, rig.fps_yaw, rig.fps_pitch, 0.0);
+            }
+        }
+    } else {
+        *projection = Projection::Orthographic(OrthographicProjection {
+            scaling_mode: ScalingMode::FixedVertical {
+                viewport_height: rig.zoom,
+            },
+            near: ORTHO_NEAR,
+            far: ORTHO_FAR,
+            ..OrthographicProjection::default_3d()
+        });
+        if let Ok(player) = player_q.single() {
+            cam_t.translation = player.translation + orbit_offset(rig.yaw);
+            *cam_t = cam_t.looking_at(player.translation, Vec3::Y);
+        }
     }
 }
 
@@ -442,6 +590,7 @@ fn apply_quality_to_camera(
 
 /// Scroll wheel zooms; Q/E orbit the view around the player.
 fn camera_input(
+    mode: Res<CameraMode>,
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
@@ -449,6 +598,12 @@ fn camera_input(
     mut motion: MessageReader<MouseMotion>,
     mut rig_q: Query<&mut CameraRig>,
 ) {
+    if !mode.is_iso() {
+        // Drain scroll for the iso zoom reader so stale wheel events do not apply
+        // when toggling back, but leave mouse motion for debug/FPS readers below.
+        for _ in scroll.read() {}
+        return;
+    }
     let Ok(mut rig) = rig_q.single_mut() else {
         return;
     };
@@ -480,18 +635,155 @@ fn camera_input(
     }
 }
 
+fn free_fly_input(
+    mode: Res<CameraMode>,
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    mut motion: MessageReader<MouseMotion>,
+    mut cam_q: Query<&mut Transform, With<IsoCamera>>,
+) {
+    if !mode.is_free_fly() {
+        return;
+    }
+    let Ok(mut t) = cam_q.single_mut() else {
+        return;
+    };
+
+    if mouse_buttons.pressed(MouseButton::Right) {
+        let mut delta = Vec2::ZERO;
+        for ev in motion.read() {
+            delta += ev.delta;
+        }
+        if delta.length_squared() > 0.0 {
+            let (mut yaw, mut pitch, _) = t.rotation.to_euler(EulerRot::YXZ);
+            yaw -= delta.x * FREE_FLY_LOOK_SENS;
+            pitch = (pitch - delta.y * FREE_FLY_LOOK_SENS).clamp(-1.5, 1.5);
+            t.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
+        }
+    } else {
+        motion.clear();
+    }
+
+    let mut dir = Vec3::ZERO;
+    if keys.pressed(KeyCode::KeyW) {
+        dir += t.forward().as_vec3();
+    }
+    if keys.pressed(KeyCode::KeyS) {
+        dir -= t.forward().as_vec3();
+    }
+    if keys.pressed(KeyCode::KeyD) {
+        dir += t.right().as_vec3();
+    }
+    if keys.pressed(KeyCode::KeyA) {
+        dir -= t.right().as_vec3();
+    }
+    if keys.pressed(KeyCode::Space) {
+        dir += Vec3::Y;
+    }
+    if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
+        dir -= Vec3::Y;
+    }
+    let speed = if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+        FREE_FLY_SPEED * FREE_FLY_FAST_MULT
+    } else {
+        FREE_FLY_SPEED
+    };
+    t.translation += dir.normalize_or_zero() * speed * time.delta_secs();
+}
+
+fn fps_input(
+    mode: Res<CameraMode>,
+    mut motion: MessageReader<MouseMotion>,
+    mut rig_q: Query<&mut CameraRig, With<IsoCamera>>,
+) {
+    if !mode.is_fps() {
+        return;
+    }
+    let Ok(mut rig) = rig_q.single_mut() else {
+        return;
+    };
+    let mut delta = Vec2::ZERO;
+    for ev in motion.read() {
+        delta += ev.delta;
+    }
+    if delta.length_squared() > 0.0 {
+        rig.fps_yaw -= delta.x * FPS_LOOK_SENS;
+        rig.fps_pitch = (rig.fps_pitch - delta.y * FPS_LOOK_SENS).clamp(-1.5, 1.5);
+    }
+}
+
+fn write_fps_move_intent(
+    mode: Res<CameraMode>,
+    keys: Res<ButtonInput<KeyCode>>,
+    rig_q: Query<&CameraRig, With<IsoCamera>>,
+    mut intent: ResMut<FpsMoveIntent>,
+) {
+    if !mode.is_fps() {
+        if intent.active {
+            *intent = FpsMoveIntent::default();
+        }
+        return;
+    }
+    let Ok(rig) = rig_q.single() else {
+        *intent = FpsMoveIntent::default();
+        return;
+    };
+
+    // Horizontal camera-relative movement. With Bevy cameras looking down -Z, the
+    // forward vector for yaw 0 is world -Z.
+    let forward = Vec3::new(-rig.fps_yaw.sin(), 0.0, -rig.fps_yaw.cos());
+    let right = Vec3::new(rig.fps_yaw.cos(), 0.0, -rig.fps_yaw.sin());
+    let mut direction = Vec3::ZERO;
+    if keys.pressed(KeyCode::KeyW) {
+        direction += forward;
+    }
+    if keys.pressed(KeyCode::KeyS) {
+        direction -= forward;
+    }
+    if keys.pressed(KeyCode::KeyD) {
+        direction += right;
+    }
+    if keys.pressed(KeyCode::KeyA) {
+        direction -= right;
+    }
+
+    intent.active = true;
+    intent.direction = direction.normalize_or_zero();
+    intent.jump = keys.pressed(KeyCode::Space);
+    intent.sprint = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+}
+
 /// Smoothly chase the player at the orbit offset, applying smoothed zoom/orbit.
 fn follow_player(
+    mode: Res<CameraMode>,
     time: Res<Time>,
     player_q: Query<&Transform, (With<FollowTarget>, Without<IsoCamera>)>,
     mut cam_q: Query<(&mut Transform, &mut Projection, &mut CameraRig), With<IsoCamera>>,
 ) {
+    if mode.is_free_fly() {
+        return;
+    }
     let Ok(player) = player_q.single() else {
         return;
     };
     let Ok((mut cam_t, mut proj, mut rig)) = cam_q.single_mut() else {
         return;
     };
+
+    if mode.is_fps() {
+        cam_t.translation = fps_eye(player.translation);
+        cam_t.rotation = Quat::from_euler(EulerRot::YXZ, rig.fps_yaw, rig.fps_pitch, 0.0);
+        if !matches!(&*proj, Projection::Perspective(_)) {
+            *proj = Projection::Perspective(PerspectiveProjection {
+                fov: std::f32::consts::FRAC_PI_3,
+                near: 0.1,
+                far: ORTHO_FAR,
+                ..default()
+            });
+        }
+        return;
+    }
 
     // Frame-rate-independent exponential smoothing factor.
     let k = 1.0 - (-SMOOTH * time.delta_secs()).exp();

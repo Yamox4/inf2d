@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use avian3d::prelude::*;
 use bevy::prelude::*;
 
-use inf3d_core::{AppState, FollowTarget, GameSet, PathTarget, Pause};
+use inf3d_core::{AppState, FollowTarget, FpsMoveIntent, GameSet, PathTarget, Pause};
 use inf3d_physics::{CharacterController, DesiredMove, GameLayer, PLAYER_DIMS};
 use inf3d_worldgen::Terrain;
 
@@ -77,6 +77,7 @@ const ANIM_EASE: f32 = 12.0; // ease-to-rest / smoothing rate
 const STEP_SWING: f32 = 0.18; // fore/aft foot swing amplitude
 const STEP_LIFT: f32 = 0.12; // foot lift on the forward swing
 const ARM_SWING: f32 = 0.14; // hand fore/aft swing amplitude
+const FPS_SPRINT_MULT: f32 = 1.75;
 
 pub struct PlayerPlugin;
 
@@ -102,7 +103,8 @@ impl Plugin for PlayerPlugin {
             // `DesiredMove` is gated identically in `inf3d_physics`.)
             .add_systems(
                 FixedUpdate,
-                follow_path
+                (follow_path, apply_fps_move)
+                    .chain()
                     .run_if(in_state(AppState::InGame).and(in_state(Pause::Running))),
             )
             // `animate_player` is per-frame VISUAL only (hop/feet/dust; reads the
@@ -273,6 +275,7 @@ fn follow_path(
     let Some(&waypoint) = move_path.waypoints.front() else {
         // Idle: no horizontal intent (controller keeps applying gravity/snap).
         desired.velocity = Vec3::ZERO;
+        desired.jump = false;
         // Arrived (or never moving): clear the destination highlight. Only
         // touches change-detection when it was actually set.
         if target.0.is_some() {
@@ -295,9 +298,39 @@ fn follow_path(
     if distance <= 0.1 {
         move_path.waypoints.pop_front();
         desired.velocity = Vec3::ZERO;
+        desired.jump = false;
     } else {
         let dir = to_target / distance;
         desired.velocity = Vec3::new(dir.x * player.speed, 0.0, dir.y * player.speed);
+        desired.jump = false;
+    }
+}
+
+fn apply_fps_move(
+    intent: Res<FpsMoveIntent>,
+    mut target: ResMut<PathTarget>,
+    mut query: Query<(&Transform, &mut Player, &mut MovePath, &mut DesiredMove)>,
+) {
+    if !intent.active {
+        return;
+    }
+    let Ok((transform, mut player, mut move_path, mut desired)) = query.single_mut() else {
+        return;
+    };
+
+    player.cell = cell_of(transform.translation);
+    move_path.waypoints.clear();
+    target.0 = None;
+
+    let speed = if intent.sprint {
+        player.speed * FPS_SPRINT_MULT
+    } else {
+        player.speed
+    };
+    desired.velocity = Vec3::new(intent.direction.x * speed, 0.0, intent.direction.z * speed);
+    desired.jump = intent.jump;
+    if intent.direction.length_squared() > 1e-4 {
+        player.facing = intent.direction.x.atan2(intent.direction.z);
     }
 }
 
@@ -310,20 +343,23 @@ fn animate_player(
     time: Res<Time>,
     mut dust: MessageWriter<inf3d_render::DustBurst>,
     mut footstep: MessageWriter<Footstep>,
-    state_q: Query<(&Transform, &MovePath, &Player), (Without<CharacterRoot>, Without<Part>)>,
+    state_q: Query<
+        (&Transform, &MovePath, &Player, &DesiredMove),
+        (Without<CharacterRoot>, Without<Part>),
+    >,
     mut root_q: Query<&mut Transform, (With<CharacterRoot>, Without<Part>, Without<Player>)>,
     mut part_q: Query<(&mut Transform, &Part, &RestPos), (Without<CharacterRoot>, Without<Player>)>,
     mut phase: Local<f32>,
     mut walk_accum: Local<f32>,
 ) {
-    let Ok((p_tf, move_path, player)) = state_q.single() else {
+    let Ok((p_tf, move_path, player, desired)) = state_q.single() else {
         return;
     };
     let Ok(mut root) = root_q.single_mut() else {
         return;
     };
     let dt = time.delta_secs();
-    let moving = !move_path.waypoints.is_empty();
+    let moving = !move_path.waypoints.is_empty() || desired.velocity.length_squared() > 0.01;
     let feet = p_tf.translation - Vec3::Y * VISUAL_ROOT_OFFSET;
 
     // Face travel direction (yaw only, no tilt).

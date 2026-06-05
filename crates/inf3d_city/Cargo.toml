@@ -1,5 +1,5 @@
 [package]
-name = "inf3d_worldgen"
+name = "inf3d_city"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -8,6 +8,3 @@ rust-version.workspace = true
 
 [dependencies]
 bevy = { workspace = true }
-noise = { workspace = true }
-serde = { workspace = true }
-inf3d_city = { workspace = true }

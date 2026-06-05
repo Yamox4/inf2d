@@ -52,6 +52,19 @@ one variant per surface; add `_02`…`_04` later for variety:
 If a surface has no file yet, the engine just stays silent for it — add files
 incrementally, nothing breaks.
 
+## Also wired — block edit SFX (placeholders in place)
+Build mode plays a sound on every voxel edit, driven by `inf3d_render::BlockEdited`:
+
+| File in `sfx/world/` | When it plays |
+|---|---|
+| `world_block_place_01.ogg` | a block is placed (left-click in Build) |
+| `world_block_break_01.ogg` | a block is broken (right-click in Build) |
+
+These currently ship as **synthesized placeholder** clips (a short "thunk" / "crumble"
+made with ffmpeg). Drop better-sounding `.ogg`s at the same paths to replace them, or
+add `_02`…`_NN` variants once the loader is extended to pick variants at random (it
+loads the single `_01` today, like footsteps).
+
 ### Nice-to-have next (optional, same drill)
 - `sfx/ui/ui_click_01.ogg` — plays when you click-to-move (the destination ping).
 - `sfx/world/world_water_lap_01.ogg` — near-shore water lapping.

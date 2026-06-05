@@ -3046,6 +3046,7 @@ dependencies = [
  "bevy",
  "inf3d_core",
  "inf3d_gameplay",
+ "inf3d_render",
  "rand 0.9.4",
 ]
 
@@ -3057,6 +3058,13 @@ dependencies = [
  "bevy_voxel_world",
  "inf3d_core",
  "inf3d_world",
+]
+
+[[package]]
+name = "inf3d_city"
+version = "0.1.0"
+dependencies = [
+ "bevy",
 ]
 
 [[package]]
@@ -3171,6 +3179,7 @@ version = "0.1.0"
 dependencies = [
  "bevy",
  "bevy_voxel_world",
+ "inf3d_city",
  "inf3d_core",
  "inf3d_worldgen",
  "noise",
@@ -3181,6 +3190,7 @@ name = "inf3d_worldgen"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "inf3d_city",
  "noise",
  "serde",
 ]

@@ -70,6 +70,8 @@ pub enum SolidPropCollider {
 pub struct DesiredMove {
     /// Desired horizontal (XZ) velocity in world units per second.
     pub velocity: Vec3,
+    /// Request a jump this fixed step. The controller only honors it while grounded.
+    pub jump: bool,
 }
 
 /// Marker for the kinematic player capsule the controller drives.
@@ -115,13 +117,16 @@ pub struct PlayerDims {
     pub visual_root_offset: f32,
 }
 
-/// Canonical player dimensions. `visual_root_offset` equals the capsule
-/// center→feet distance (`half_height + radius`) so the figure's feet sit on the
-/// capsule's feet.
+/// Canonical player dimensions: a **1 voxel wide × 2 voxels tall** capsule
+/// (diameter `2*radius = 1.0`, height `2*(half_height + radius) = 2.0`), so the
+/// body fully occupies a voxel column and can't slip between/through blocks.
+/// `visual_root_offset` equals the capsule center→feet distance (`half_height +
+/// radius`) so the figure's feet sit on the capsule's feet — kept at `1.0` (same
+/// as before) so the visual + spawn alignment is unchanged by the width change.
 pub const PLAYER_DIMS: PlayerDims = PlayerDims {
-    radius: 0.4,
-    half_height: 0.6,
-    visual_root_offset: 0.4 + 0.6,
+    radius: 0.5,
+    half_height: 0.5,
+    visual_root_offset: 0.5 + 0.5,
 };
 
 /// The prop the interaction hook currently has targeted (camera ray pick).
@@ -143,6 +148,8 @@ pub const PLAYER_RADIUS: f32 = PLAYER_DIMS.radius;
 pub const PLAYER_HALF_HEIGHT: f32 = PLAYER_DIMS.half_height;
 /// Gravity acceleration (world units / s²), applied only while airborne.
 pub const GRAVITY: f32 = 24.0;
+/// Initial upward velocity for FPS/manual jumps.
+pub const JUMP_SPEED: f32 = 9.0;
 /// Max height (above the **feet**) the player will step up onto in one go. Set
 /// just above 1.0 so a single 1-unit voxel step is climbed smoothly while a
 /// 2-voxel cliff is rejected — this mirrors pathfinding's `MAX_STEP = 1` voxel
@@ -270,10 +277,43 @@ fn player_controller(
     }
 
     for (entity, mut transform, mut cc, desired, collider) in &mut q {
-        // --- HORIZONTAL: blocked by solid props only ---
+        // The player's `y` is untouched by the horizontal move, so compute the
+        // foot level once here and reuse it for both the horizontal wall-block and
+        // the vertical resolution below.
+        let foot_offset = PLAYER_HALF_HEIGHT + PLAYER_RADIUS; // capsule centre → feet
+        let feet_y = transform.translation.y - foot_offset;
+        // Resolve ground at the player's CURRENT level: in a tunnel / under a built
+        // overhang the player must rest on the floor nearest their feet, not the
+        // topmost voxel. On normal terrain / single-layer columns this == surface_y.
+        let ref_y = feet_y.round() as i32;
+        // A terrain cell is a WALL the player can't enter when its top face is above
+        // the step cap (feet + STEP_HEIGHT). A 1-voxel rise is at/below the cap and
+        // stays walkable (you climb it); a 2-high wall is above it and blocks. Water
+        // columns are never walls here.
+        let wall_cap = feet_y + STEP_HEIGHT;
+        // Whether terrain cell `(cx, cz)` is a WALL: dry land whose top face is above
+        // the step cap (a 2-high wall blocks; a 1-voxel rise stays walkable).
+        let is_wall = |cx: i32, cz: i32| {
+            terrain.is_land(cx, cz)
+                && (terrain.surface_y_near(cx, cz, ref_y) as f32 + 1.0) > wall_cap
+        };
+        // Integer cell range the capsule (radius `PLAYER_RADIUS`) spans about `v`.
+        let cell_span =
+            |v: f32| ((v - PLAYER_RADIUS).floor() as i32, (v + PLAYER_RADIUS).floor() as i32);
+
+        // --- HORIZONTAL: blocked by solid props (move_and_slide) AND by terrain
+        // walls taller than the step cap. Without the terrain block the player walks
+        // straight INTO a 2-high wall and phases into the terrain (terrain is not a
+        // physics collider). The terrain block keeps the capsule CENTRE — the cell
+        // that would swallow the player — out of wall cells, axis-separated so you
+        // still SLIDE along a wall and step smoothly up 1-voxel rises. While
+        // airborne (e.g. mid-jump) `feet_y` rises, so a wall the feet have cleared
+        // stops counting as one and you can move over it. ---
         let prop_filter =
             SpatialQueryFilter::from_mask([GameLayer::Solid]).with_excluded_entities([entity]);
         let h_velocity = Vec3::new(desired.velocity.x, 0.0, desired.velocity.z);
+        let old_xz = transform.translation;
+        let mut new_pos = old_xz;
         if h_velocity.length_squared() > 1e-6 {
             let out = move_and_slide.move_and_slide(
                 collider,
@@ -285,27 +325,43 @@ fn player_controller(
                 &prop_filter,
                 |_hit| MoveAndSlideHitResponse::Accept,
             );
-            transform.translation = out.position;
+            new_pos = out.position;
         }
+        // Block each axis when the capsule's LEADING EDGE crosses into a wall cell
+        // that wasn't a wall at the old edge — so the body stops at the wall FACE
+        // (no penetration, even at the full 1-voxel-wide hitbox) yet still slides
+        // along a wall it's already beside.
+        let dx = new_pos.x - old_xz.x;
+        if dx.abs() > 1e-6 {
+            let new_edge = (new_pos.x + PLAYER_RADIUS * dx.signum()).floor() as i32;
+            let old_edge = (old_xz.x + PLAYER_RADIUS * dx.signum()).floor() as i32;
+            let (z0, z1) = cell_span(old_xz.z);
+            let into_wall = new_edge != old_edge
+                && (z0..=z1).any(|cz| is_wall(new_edge, cz))
+                && !(z0..=z1).any(|cz| is_wall(old_edge, cz));
+            if into_wall {
+                new_pos.x = old_xz.x;
+            }
+        }
+        let dz = new_pos.z - old_xz.z;
+        if dz.abs() > 1e-6 {
+            let new_edge = (new_pos.z + PLAYER_RADIUS * dz.signum()).floor() as i32;
+            let old_edge = (old_xz.z + PLAYER_RADIUS * dz.signum()).floor() as i32;
+            let (x0, x1) = cell_span(new_pos.x);
+            let into_wall = new_edge != old_edge
+                && (x0..=x1).any(|cx| is_wall(cx, new_edge))
+                && !(x0..=x1).any(|cx| is_wall(cx, old_edge));
+            if into_wall {
+                new_pos.z = old_xz.z;
+            }
+        }
+        transform.translation = new_pos;
 
         // --- VERTICAL: analytic ground from the Terrain heightfield ---
-        // The capsule footprint (radius 0.4) spans more than its centre column,
-        // so on cliff edges / shorelines a single centre sample leaves the
-        // overhanging side unsupported. Sample the analytic top face over every
-        // cell the footprint disc's AABB overlaps and rest on the highest one
-        // that is actually CLIMBABLE (top within STEP_HEIGHT of the feet). A
-        // taller neighbour beyond step height is a WALL the player walks into,
-        // not ground they stand on — feeding it to the resolver as "support"
-        // would (with any downward velocity) drop the player into a never-landing
-        // fall past a surface sitting above them. Voxel `(x,y,z)` spans world
-        // `[y, y+1]`, so the top face is `surface_y + 1`.
-        let foot_offset = PLAYER_HALF_HEIGHT + PLAYER_RADIUS; // capsule centre → feet
-        let feet_y = transform.translation.y - foot_offset;
-        // Resolve ground at the player's CURRENT level: in a tunnel / under a built
-        // overhang the player must rest on the floor nearest their feet, not the
-        // topmost voxel (which would pop them onto the ceiling). On normal terrain
-        // and single-layer columns this is identical to `surface_y`.
-        let ref_y = feet_y.round() as i32;
+        // Sample the analytic top face over every cell the footprint disc overlaps
+        // and rest on the highest CLIMBABLE one (top within STEP_HEIGHT of the feet);
+        // a taller neighbour is a wall, excluded from support. Voxel `(x,y,z)` spans
+        // world `[y, y+1]`, so its top face is `surface_y + 1`.
         let support_surface_y = footprint_surface(
             transform.translation.x,
             transform.translation.z,
@@ -316,17 +372,23 @@ fn player_controller(
             |cx, cz| terrain.is_land(cx, cz),
         );
 
-        let (new_y, grounded, new_vv) = resolve_ground(
-            feet_y,
-            transform.translation.y,
-            support_surface_y,
-            foot_offset,
-            cc.vertical_velocity,
-            dt_s,
-        );
-        transform.translation.y = new_y;
-        cc.grounded = grounded;
-        cc.vertical_velocity = new_vv;
+        if desired.jump && cc.grounded {
+            cc.grounded = false;
+            cc.vertical_velocity = JUMP_SPEED - GRAVITY * dt_s;
+            transform.translation.y += JUMP_SPEED * dt_s;
+        } else {
+            let (new_y, grounded, new_vv) = resolve_ground(
+                feet_y,
+                transform.translation.y,
+                support_surface_y,
+                foot_offset,
+                cc.vertical_velocity,
+                dt_s,
+            );
+            transform.translation.y = new_y;
+            cc.grounded = grounded;
+            cc.vertical_velocity = new_vv;
+        }
     }
 }
 
@@ -627,7 +689,15 @@ mod tests {
         // Centre at x = 0.7: disc spans [0.3, 1.1] → cells 0 and 1 in x.
         // INFINITY ceiling: this test exercises AABB sampling, not the climb cap
         // (so `feet` is irrelevant here — a finite placeholder).
-        let s = footprint_surface(0.7, 0.5, PLAYER_RADIUS, 5.0, f32::INFINITY, field, |_, _| true);
+        let s = footprint_surface(
+            0.7,
+            0.5,
+            PLAYER_RADIUS,
+            5.0,
+            f32::INFINITY,
+            field,
+            |_, _| true,
+        );
         assert_eq!(
             s, 7.0,
             "footprint must rest on the taller adjacent cell's top face (6+1)"
@@ -639,7 +709,15 @@ mod tests {
     #[test]
     fn footprint_uniform_terrain_is_flat_top_face() {
         let field = |_cx: i32, _cz: i32| 5;
-        let s = footprint_surface(10.5, -3.5, PLAYER_RADIUS, 5.0, f32::INFINITY, field, |_, _| true);
+        let s = footprint_surface(
+            10.5,
+            -3.5,
+            PLAYER_RADIUS,
+            5.0,
+            f32::INFINITY,
+            field,
+            |_, _| true,
+        );
         assert_eq!(s, 6.0, "uniform terrain yields surface_y + 1");
     }
 
@@ -651,7 +729,15 @@ mod tests {
         // Only the diagonal cell (1, 1) is taller.
         let field = |cx: i32, cz: i32| if cx >= 1 && cz >= 1 { 6 } else { 5 };
         // Centre near the +x/+z corner so the disc's AABB reaches cell (1, 1).
-        let s = footprint_surface(0.7, 0.7, PLAYER_RADIUS, 5.0, f32::INFINITY, field, |_, _| true);
+        let s = footprint_surface(
+            0.7,
+            0.7,
+            PLAYER_RADIUS,
+            5.0,
+            f32::INFINITY,
+            field,
+            |_, _| true,
+        );
         assert_eq!(s, 7.0, "diagonal corner of the footprint must be sampled");
     }
 
@@ -667,7 +753,15 @@ mod tests {
         // step cap (3.1) excludes all of them — the boxed-in fallback path.
         let field = |_cx: i32, _cz: i32| 10;
         let feet = 2.0;
-        let s = footprint_surface(0.5, 0.5, PLAYER_RADIUS, feet, feet + STEP_HEIGHT, field, |_, _| true);
+        let s = footprint_surface(
+            0.5,
+            0.5,
+            PLAYER_RADIUS,
+            feet,
+            feet + STEP_HEIGHT,
+            field,
+            |_, _| true,
+        );
         assert_eq!(
             s, feet,
             "a boxed-in player must hold at their feet, never be lifted onto the wall top"

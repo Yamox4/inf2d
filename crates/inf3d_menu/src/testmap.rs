@@ -19,8 +19,10 @@ use inf3d_worldgen::{VoxelOverrides, FLAT_SURFACE_Y};
 /// Topmost solid Y of the flat ground (the player stands on `TOP + 1`).
 const TOP: i32 = FLAT_SURFACE_Y;
 
+/// Structures are stamped as `BuiltStone` (player-build material) so they exercise
+/// the see-through cutout — terrain stays solid.
 fn stone() -> u8 {
-    TerrainMaterialId::Stone as u8
+    TerrainMaterialId::BuiltStone as u8
 }
 fn dirt() -> u8 {
     TerrainMaterialId::Dirt as u8

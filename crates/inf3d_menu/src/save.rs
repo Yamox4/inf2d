@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bevy::prelude::*;
-use inf3d_core::EditMode;
-use inf3d_worldgen::VoxelEdit;
+use inf3d_core::{EditMode, DEFAULT_BUILD_MATERIAL};
+use inf3d_worldgen::{VoxelEdit, WorldKind};
 use serde::{Deserialize, Serialize};
 
 /// Number of save slots the Load/Save menus show.
@@ -20,6 +20,10 @@ pub const SLOT_COUNT: u8 = 3;
 /// edit, the player's position/facing, the edit mode, and the camera view.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SaveGame {
+    /// Selected base world backend. Old saves did not have this field; load code
+    /// normalizes them from `flat` below.
+    #[serde(default)]
+    pub world_kind: WorldKind,
     /// `true` = the flat test world; `false` = procedural terrain.
     pub flat: bool,
     /// Every player voxel edit as `([x,y,z], edit)`.
@@ -30,11 +34,22 @@ pub struct SaveGame {
     pub facing: f32,
     /// Walk/Build mode at save time.
     pub edit_mode: EditMode,
+    /// The picker's selected build material (raw material index). Saves written
+    /// before the picker existed lack this field; they fall back to the default
+    /// buildable via [`default_selected_material`].
+    #[serde(default = "default_selected_material")]
+    pub selected_material: u8,
     /// Camera orbit yaw + orthographic zoom, restored on load.
     pub camera_yaw: f32,
     pub camera_zoom: f32,
     /// Seconds-since-epoch the save was written, for the slot list.
     pub saved_at: u64,
+}
+
+/// Serde fallback for [`SaveGame::selected_material`] on saves predating the
+/// material picker — the default buildable (`BuiltStone`).
+fn default_selected_material() -> u8 {
+    DEFAULT_BUILD_MATERIAL
 }
 
 /// The `saves/` directory (relative to the working dir, like the existing

@@ -14,16 +14,12 @@
 use bevy::prelude::*;
 use bevy_voxel_world::prelude::{Chunk, NeedsRemesh};
 
-use inf3d_core::{EditMode, GameSet};
+use inf3d_core::{EditMode, GameSet, SelectedMaterial};
 use inf3d_world::{MainWorld, TerrainMaterialId};
 use inf3d_worldgen::VoxelOverrides;
 
 use crate::dust::DustBurst;
 use crate::Hover;
-
-/// Material placed in [`EditMode::Build`]. Stone reads clearly as "placed" against
-/// the grass terrain. Placeholder until a material picker exists.
-const BUILD_MATERIAL: u8 = TerrainMaterialId::Stone as u8;
 
 /// Voxel side length of a chunk, matching `bevy_voxel_world` (chunks are 32³).
 const CHUNK: i32 = 32;
@@ -32,12 +28,23 @@ const CHUNK: i32 = 32;
 const PLACE_FX_LIFE: f32 = 0.26;
 const BREAK_FX_LIFE: f32 = 0.34;
 
-/// Emitted whenever the player edits a voxel, carrying the affected column. Other
-/// systems react to it without depending on the editor's internals — e.g. the
-/// foliage streamer re-streams the grass tile so grass drops off edited cells.
+/// Emitted whenever the player edits a voxel. Downstream sinks react to it without
+/// depending on the editor's internals: the foliage streamer reads [`cell`](Self::cell)
+/// to drop grass off edited cells, and `inf3d_audio` reads [`placed`](Self::placed)
+/// to play the place vs. break SFX. Public + registered here (the source), mirroring
+/// how `inf3d_gameplay::Footstep` is owned by its emitter and consumed by the audio
+/// sink.
 #[derive(Message)]
-pub(crate) struct BlockEdited {
+pub struct BlockEdited {
+    /// The edited column `(x, z)` — the cell whose grass blade should clear.
     pub cell: IVec2,
+    /// `true` = a block was placed, `false` = a block was removed.
+    pub placed: bool,
+    /// Material involved: the placed material on a place, or the removed voxel's
+    /// material on a break (the terrain fallback index `0` if it can't be resolved).
+    /// Lets sinks vary the effect per material later (the audio sink only uses
+    /// [`placed`](Self::placed) today).
+    pub material: u8,
 }
 
 pub struct EditPlugin;
@@ -87,6 +94,7 @@ struct BlockFx {
 fn block_edit(
     mouse: Res<ButtonInput<MouseButton>>,
     mode: Res<EditMode>,
+    selected: Res<SelectedMaterial>,
     hover: Res<Hover>,
     overrides: Res<VoxelOverrides>,
     interactions: Query<&Interaction>,
@@ -117,40 +125,53 @@ fn block_edit(
     };
 
     // Edit the store and gather what the effect needs: the touched cell, the
-    // block's color (to tint the puff/cube), and whether it was a place or break.
-    let (edited, color, place) = if place {
+    // block's color (to tint the puff/cube), whether it was a place or break, and
+    // the material involved (for the edit message's downstream sinks).
+    let (edited, color, place, material) = if place {
         // Place into the cell on the hovered face. Without a normal there's no
         // unambiguous side to build on, so do nothing.
         let Some(normal) = hover.normal else {
             return;
         };
         let target = voxel + normal;
-        overrides.place(target, BUILD_MATERIAL);
-        let color = TerrainMaterialId::from_index(BUILD_MATERIAL)
+        // The player's currently-picked build material (defaults to BuiltStone;
+        // set by the picker / number keys in `inf3d_ui`).
+        let mat = selected.0;
+        overrides.place(target, mat);
+        let color = TerrainMaterialId::from_index(mat)
             .map(|id| id.color())
             .unwrap_or(NEUTRAL_DEBRIS);
-        (target, color, true)
+        (target, color, true, mat)
     } else {
         // Right-click: remove the hovered voxel.
         overrides.remove(voxel);
-        let color = hover
-            .material
-            .and_then(TerrainMaterialId::from_index)
+        let mat = hover.material.unwrap_or(0);
+        let color = TerrainMaterialId::from_index(mat)
             .map(|id| id.color())
             .unwrap_or(NEUTRAL_DEBRIS);
-        (voxel, color, false)
+        (voxel, color, false, mat)
     };
 
     mark_chunks_dirty(&mut commands, &chunks, edited);
-    // Tell the foliage streamer to clear grass off this cell.
+    // Notify downstream sinks: the foliage streamer clears grass off this cell,
+    // the audio sink plays the place/break SFX.
     edited_events.write(BlockEdited {
         cell: IVec2::new(edited.x, edited.z),
+        placed: place,
+        material,
     });
 
     // Juice: a tinted pop-in (place) / crumble (break) cube + a dust puff — the
     // same particle system as footsteps, a bigger cloud on break.
     let center = edited.as_vec3() + Vec3::splat(0.5);
-    spawn_block_fx(&mut commands, &mut materials, &fx_assets.cube, center, color, place);
+    spawn_block_fx(
+        &mut commands,
+        &mut materials,
+        &fx_assets.cube,
+        center,
+        color,
+        place,
+    );
     // Place: the block center is now solid, so a puff there is hidden inside it.
     // Emit from UNDER the block and fling it harder so it scatters out past the
     // edges and stays visible around the base. Break: the cell is now air, so a

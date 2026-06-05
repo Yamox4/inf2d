@@ -22,9 +22,12 @@
 //! supported for the future settings UI via `apply_water_quality`.
 
 use bevy::prelude::*;
-use bevy_water::{WaterPlugin as BevyWaterPlugin, WaterSettings};
+use bevy_water::material::StandardWaterMaterial;
+use bevy_water::{
+    WaterPlugin as BevyWaterPlugin, WaterSettings, WaterTile, WaterTiles, WATER_SIZE,
+};
 
-use inf3d_core::{GameSet, QualitySettings};
+use inf3d_core::{FollowTarget, GameSet, QualitySettings};
 use inf3d_worldgen::WATER_HEIGHT;
 
 pub struct WaterPlugin;
@@ -46,8 +49,10 @@ impl Plugin for WaterPlugin {
         app.add_systems(Startup, init_water_settings);
 
         if settings.water_enabled {
-            app.add_plugins(BevyWaterPlugin)
-                .add_systems(Update, apply_water_quality.in_set(GameSet::Fx));
+            app.add_plugins(BevyWaterPlugin).add_systems(
+                Update,
+                (apply_water_quality, follow_water).in_set(GameSet::Fx),
+            );
         }
     }
 }
@@ -81,6 +86,49 @@ fn init_water_settings(mut commands: Commands, quality: Res<QualitySettings>) {
         // detail) and `spawn_tiles` to a large grid — both kept via `..default()`.
         ..default()
     });
+}
+
+/// Make the ocean follow the player so it never runs out in the infinite world.
+///
+/// `bevy_water` spawns a fixed 6×6 grid of 256-unit tiles around the ORIGIN, so
+/// past ~768 blocks you walk off it and the water vanishes. This re-centers the
+/// whole [`WaterTiles`] grid on the player, snapped to whole 256-unit tiles (so it
+/// only jumps a tile at a time — no per-frame swim). Each tile's Gerstner waves are
+/// anchored to its `coord_offset` (its world corner), INDEPENDENT of the transform,
+/// so we also update that to the tile's new world corner — keeping the water
+/// surface continuous in world space as the grid recycles around you.
+fn follow_water(
+    player: Query<&Transform, (With<FollowTarget>, Without<WaterTiles>)>,
+    mut grid: Query<&mut Transform, With<WaterTiles>>,
+    tiles: Query<(&WaterTile, &MeshMaterial3d<StandardWaterMaterial>)>,
+    mut materials: ResMut<Assets<StandardWaterMaterial>>,
+) {
+    let Ok(player_tf) = player.single() else {
+        return;
+    };
+    let Ok(mut grid_tf) = grid.single_mut() else {
+        return;
+    };
+    let size = WATER_SIZE as f32;
+    let snapped = Vec2::new(
+        (player_tf.translation.x / size).round() * size,
+        (player_tf.translation.z / size).round() * size,
+    );
+    // Already centered on the player's tile → nothing to do (and no needless
+    // material re-upload).
+    if (grid_tf.translation.x - snapped.x).abs() < 0.5
+        && (grid_tf.translation.z - snapped.y).abs() < 0.5
+    {
+        return;
+    }
+    grid_tf.translation.x = snapped.x;
+    grid_tf.translation.z = snapped.y;
+    for (tile, mat) in &tiles {
+        if let Some(material) = materials.get_mut(&mat.0) {
+            // The tile's new world corner = grid origin + its fixed local offset.
+            material.extension.coord_offset = snapped + tile.offset;
+        }
+    }
 }
 
 /// Mirror runtime settings changes onto `WaterSettings::amplitude` so the

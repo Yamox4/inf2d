@@ -92,7 +92,7 @@ use bevy::pbr::{
 };
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    AsBindGroup, Extent3d, RenderPipelineDescriptor, SpecializedMeshPipelineError,
+    AsBindGroup, Extent3d, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
     TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
 };
 use bevy::shader::{ShaderDefVal, ShaderRef};
@@ -125,12 +125,39 @@ pub struct VoxelTerrainExtension {
     #[texture(100, dimension = "2d_array")]
     #[sampler(101)]
     pub voxels_texture: Handle<Image>,
+    /// Per-frame see-through ("x-ray") parameters at binding 102. Updated by
+    /// `inf3d_render`'s x-ray system; consumed by the shader's built-block cutout.
+    #[uniform(102)]
+    pub xray: XrayParams,
 }
 
 impl Default for VoxelTerrainExtension {
     fn default() -> Self {
         Self {
             voxels_texture: Handle::default(),
+            xray: XrayParams::default(),
+        }
+    }
+}
+
+/// Parameters the terrain shader uses to dither away player-built faces (material
+/// index `>= `[`crate::BUILT_MATERIAL_BASE`]) that sit between the camera and the
+/// player. Two `vec4`s keep the std140 uniform layout trivially correct.
+#[derive(Clone, Copy, Debug, ShaderType)]
+pub struct XrayParams {
+    /// `xy` = player position in framebuffer pixels; `z` = fade radius (px);
+    /// `w` = enabled (`> 0.5` turns the cutout on).
+    pub screen: Vec4,
+    /// `x` = player framebuffer depth (reverse-z: larger = nearer the camera);
+    /// `yzw` reserved.
+    pub depth: Vec4,
+}
+
+impl Default for XrayParams {
+    fn default() -> Self {
+        Self {
+            screen: Vec4::ZERO,
+            depth: Vec4::ZERO,
         }
     }
 }
@@ -365,6 +392,7 @@ pub fn install_terrain_material(app: &mut App) -> TerrainMaterial {
         },
         extension: VoxelTerrainExtension {
             voxels_texture: texture_handle,
+            xray: XrayParams::default(),
         },
     }
 }

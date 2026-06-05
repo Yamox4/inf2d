@@ -48,7 +48,7 @@ use bevy::tasks::{block_on, poll_once, AsyncComputeTaskPool};
 use inf3d_camera::IsoCamera;
 use inf3d_core::{BlockedCells, FollowTarget, QualitySettings};
 use inf3d_physics::PLAYER_RADIUS;
-use inf3d_worldgen::Terrain;
+use inf3d_worldgen::{Terrain, WorldGen, WorldKind};
 
 use super::scatter::{scatter_grass, scatter_solid};
 use super::spawn::spawn_tile_entities;
@@ -217,6 +217,34 @@ fn clear_solid_tiles(commands: &mut Commands, field: &mut SolidField, blocked: &
             }
         }
     }
+}
+
+/// When the base world backend switches (Test ↔ Normal ↔ City), despawn ALL
+/// streamed foliage so the streamers re-scatter it at the NEW world's surface
+/// heights this same frame. Without this, props scattered for the old world linger
+/// at stale heights — floating above the flat lab, or buried/floating on the
+/// procedural world — because the player often re-enters at the same XZ, so the
+/// tiles are still "in range" and never despawned (the "props carry over / float
+/// when switching worlds" bug). Foliage only streams in-game, so the very first
+/// observation (no previous kind) has nothing to clear — it just records the
+/// baseline.
+pub(super) fn clear_foliage_on_world_change(
+    world_gen: Res<WorldGen>,
+    mut last_kind: Local<Option<WorldKind>>,
+    mut solid: ResMut<SolidField>,
+    mut grass: ResMut<GrassField>,
+    mut blocked: ResMut<BlockedCells>,
+    mut commands: Commands,
+) {
+    let kind = world_gen.kind();
+    if *last_kind == Some(kind) {
+        return;
+    }
+    if last_kind.is_some() {
+        clear_solid_tiles(&mut commands, &mut solid, &mut blocked);
+        clear_grass_tiles(&mut commands, &mut grass);
+    }
+    *last_kind = Some(kind);
 }
 
 /// Solid phase 1: poll in-flight scatter tasks; spawn entities for any that

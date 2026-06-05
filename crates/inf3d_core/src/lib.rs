@@ -89,6 +89,18 @@ impl BlockedCells {
 #[derive(Resource, Default)]
 pub struct PathTarget(pub Option<IVec2>);
 
+/// Player movement intent produced by the FPS camera mode. Kept in `core` so the
+/// camera crate can write it and gameplay/physics-facing systems can consume it
+/// without introducing dependency cycles. `direction` is horizontal world-space
+/// input, normalized by the consumer; `jump` is an input request, not physics state.
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct FpsMoveIntent {
+    pub active: bool,
+    pub direction: Vec3,
+    pub jump: bool,
+    pub sprint: bool,
+}
+
 /// Marks the entity that camera, fog, and grass should follow/center on (the
 /// player). Lives in `inf3d_core` so render/camera can depend on it without
 /// depending on `inf3d_gameplay` — this breaks the otherwise-cyclic dependency
@@ -200,6 +212,31 @@ pub enum EditMode {
     Build,
 }
 
+/// Default placed material — the first entry of `inf3d_world::BUILDABLE`
+/// (`TerrainMaterialId::BuiltStone`, raw index 10). It lives here, not in
+/// `inf3d_world`, because [`SelectedMaterial`]'s `Default` needs it and `inf3d_core`
+/// must not depend on `inf3d_world` (which depends on core). The
+/// `inf3d_world::buildable_defaults_align` test asserts this stays equal to
+/// `BUILDABLE[0] as u8`, so the literal here can never silently desync.
+pub const DEFAULT_BUILD_MATERIAL: u8 = 10;
+
+/// The voxel material the player places in [`EditMode::Build`], chosen via the
+/// in-game material picker (`inf3d_ui`) or the number keys. Stored as the raw
+/// `MainWorld::MaterialIndex` (`u8`) so `inf3d_core` stays free of a dependency on
+/// `inf3d_world` (which owns the `TerrainMaterialId` palette + the `BUILDABLE` list).
+/// The picker writes it; the block editor (`inf3d_render`) reads it; save/load
+/// persists it. Defaults to [`DEFAULT_BUILD_MATERIAL`].
+#[derive(
+    Resource, Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize,
+)]
+pub struct SelectedMaterial(pub u8);
+
+impl Default for SelectedMaterial {
+    fn default() -> Self {
+        Self(DEFAULT_BUILD_MATERIAL)
+    }
+}
+
 /// Top-level application state. The game boots into [`AppState::MainMenu`] — the
 /// world, player, and camera spawn at `Startup` as a live menu backdrop — and
 /// enters [`AppState::InGame`] when the player starts or loads a game. The
@@ -228,8 +265,10 @@ pub enum Pause {
 /// Relative to `inf3d_core`'s manifest, the live asset tree is one crate over.
 /// Baked at compile time (dev/`cargo run` workflow), same hop the foliage loader
 /// uses. A missing file is normal (not an error) — the built-in defaults apply.
-const QUALITY_CONFIG_PATH: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../inf3d_app/assets/config/quality.ron");
+const QUALITY_CONFIG_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../inf3d_app/assets/config/quality.ron"
+);
 
 /// Load [`QualitySettings`] from `assets/config/quality.ron`, falling back to the
 /// built-in [`Default`] when the file is absent or malformed.
@@ -394,8 +433,10 @@ impl Plugin for CorePlugin {
             .init_resource::<GrassStats>()
             .init_resource::<FrameStats>()
             .init_resource::<EditMode>()
+            .init_resource::<SelectedMaterial>()
             .init_resource::<BlockedCells>()
-            .init_resource::<PathTarget>();
+            .init_resource::<PathTarget>()
+            .init_resource::<FpsMoveIntent>();
     }
 }
 

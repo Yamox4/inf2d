@@ -33,6 +33,30 @@ var mat_array_texture: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(101)
 var mat_array_texture_sampler: sampler;
 
+// See-through ("x-ray") parameters, fed each frame by `inf3d_render::xray`. Layout
+// matches the `XrayParams` Rust struct (two vec4s, binding 102).
+struct XrayParams {
+    screen: vec4<f32>, // xy = player px, z = fade radius px, w = enabled (>0.5)
+    depth: vec4<f32>,  // reserved
+}
+@group(#{MATERIAL_BIND_GROUP}) @binding(102)
+var<uniform> xray: XrayParams;
+
+// First material index that counts as a player BUILD (vs terrain) — keep in sync
+// with `inf3d_world::BUILT_MATERIAL_BASE` (= `TerrainMaterialId::BuiltStone`).
+const BUILT_MATERIAL_BASE: u32 = 10u;
+
+// 4×4 ordered (Bayer) dither threshold in [0,1) for screen-door transparency.
+fn bayer4(px: u32, py: u32) -> f32 {
+    var m = array<f32, 16>(
+        0.0, 8.0, 2.0, 10.0,
+        12.0, 4.0, 14.0, 6.0,
+        3.0, 11.0, 1.0, 9.0,
+        15.0, 7.0, 13.0, 5.0,
+    );
+    return m[(py & 3u) * 4u + (px & 3u)] / 16.0;
+}
+
 struct Vertex {
     @builtin(instance_index) instance_index: u32,
 #ifdef VERTEX_POSITIONS
@@ -163,6 +187,22 @@ fn fragment(
     // vertex stage from the axis-aligned normal and flat-interpolated, so the
     // fragment stage no longer does a fragile float-equality test.
     let tex_face = in.tex_face;
+
+    // See-through cutout: dither-discard player-built faces near the player on
+    // screen so you can build inside walls/houses. Terrain (material index below
+    // BUILT_MATERIAL_BASE) is never touched. NOTE: this is the FORWARD half — the
+    // matching prepass discard (which punches the depth holes that fully reveal the
+    // player) is the next step; until then the holes show what's behind the wall.
+    if xray.screen.w > 0.5 && in.tex_idx[tex_face] >= BUILT_MATERIAL_BASE {
+        let d = distance(in.position.xy, xray.screen.xy);
+        let radius = xray.screen.z;
+        if d < radius {
+            let fade = 1.0 - d / radius; // 1 at the player, 0 at the fade edge
+            if fade > bayer4(u32(in.position.x), u32(in.position.y)) {
+                discard;
+            }
+        }
+    }
 
 #ifdef VERTEX_UVS
     pbr_input.material.base_color = textureSample(mat_array_texture, mat_array_texture_sampler, in.uv, in.tex_idx[tex_face]);

@@ -12,7 +12,7 @@ use bevy_voxel_world::prelude::*;
 use inf3d_core::QualitySettings;
 use inf3d_worldgen::{
     build_noise_lod, sample_height, ColumnKind, Terrain, VoxelEdit, VoxelOverrideSnapshot,
-    VoxelOverrides, WorldGen, FLAT_SURFACE_HEIGHT,
+    VoxelOverrides, WorldGen, WorldKind, FLAT_SURFACE_HEIGHT,
 };
 
 pub mod terrain_material;
@@ -43,7 +43,66 @@ pub enum TerrainMaterialId {
     /// Sandy seafloor for submerged columns. All faces sample this single
     /// layer; it shows through the translucent water plane.
     Seafloor = 3,
+    /// Cyberpunk city road surface.
+    Asphalt = 4,
+    /// Cyberpunk city concrete, sidewalks, floors, and building frames.
+    Concrete = 5,
+    /// Dark city glass.
+    DarkGlass = 6,
+    /// Cyberpunk neon accents.
+    NeonCyan = 7,
+    NeonMagenta = 8,
+    NeonYellow = 9,
+    /// Player-PLACED stone. Visually identical to [`Stone`](Self::Stone) (same
+    /// tint), but a DISTINCT material/texture-array index so the terrain shader can
+    /// tell "this is a player build" and apply the see-through cutout to it (and
+    /// only it) when it occludes the player. Terrain never uses this index, so the
+    /// cutout never touches terrain. The FIRST of the contiguous `Built*` range
+    /// below; the shader treats any index `>= BuiltStone` as "built", so every
+    /// variant here is a player build the cutout can act on. The buildable set the
+    /// material picker offers is [`BUILDABLE`].
+    BuiltStone = 10,
+    /// Player-placed dirt (Dirt tint).
+    BuiltDirt = 11,
+    /// Player-placed grass (Grass tint).
+    BuiltGrass = 12,
+    /// Player-placed concrete (Concrete tint).
+    BuiltConcrete = 13,
+    /// Player-placed glass — a muted blue, lighter than terrain [`DarkGlass`](Self::DarkGlass)
+    /// so it reads as a solid build block rather than near-black.
+    BuiltGlass = 14,
+    /// Player-placed neon cyan accent.
+    BuiltNeonCyan = 15,
+    /// Player-placed neon magenta accent.
+    BuiltNeonMagenta = 16,
+    /// Player-placed neon yellow accent.
+    BuiltNeonYellow = 17,
 }
+
+/// The first material index that counts as a player BUILD (vs terrain). The
+/// terrain shader applies the see-through cutout only to faces whose texture-array
+/// index is `>= BUILT_MATERIAL_BASE`. Equal to the first `Built*` discriminant.
+pub const BUILT_MATERIAL_BASE: u32 = TerrainMaterialId::BuiltStone as u32;
+
+/// The materials the Build-mode picker offers, IN PICKER ORDER (left → right /
+/// number keys 1..8). The single source of truth for the picker UI
+/// (`inf3d_ui`), so adding/reordering a buildable block is a one-line change here.
+///
+/// Every entry MUST be a `Built*` material (index `>= `[`BUILT_MATERIAL_BASE`]) so
+/// player builds stay distinguishable from terrain and pick up the see-through
+/// cutout; `BUILDABLE[0]` MUST equal [`inf3d_core::DEFAULT_BUILD_MATERIAL`] (the
+/// resource default). Both invariants are guarded by the `buildable_defaults_align`
+/// test.
+pub const BUILDABLE: [TerrainMaterialId; 8] = [
+    TerrainMaterialId::BuiltStone,
+    TerrainMaterialId::BuiltDirt,
+    TerrainMaterialId::BuiltGrass,
+    TerrainMaterialId::BuiltConcrete,
+    TerrainMaterialId::BuiltGlass,
+    TerrainMaterialId::BuiltNeonCyan,
+    TerrainMaterialId::BuiltNeonMagenta,
+    TerrainMaterialId::BuiltNeonYellow,
+];
 
 impl TerrainMaterialId {
     /// Texture-array layer index for a uniform (all-face) material — equal to
@@ -111,7 +170,7 @@ pub(crate) struct MaterialDef {
 
 /// The canonical material palette. Order MUST match the [`TerrainMaterialId`]
 /// discriminants (guarded by the `palette_matches_enum` test).
-pub(crate) const PALETTE: [MaterialDef; 4] = [
+pub(crate) const PALETTE: [MaterialDef; 18] = [
     MaterialDef {
         id: TerrainMaterialId::Grass,
         label: "Grass",
@@ -141,6 +200,96 @@ pub(crate) const PALETTE: [MaterialDef; 4] = [
         label: "Water",
         color: [0xd4, 0xc1, 0x88],
         faces: [TerrainMaterialId::Seafloor.layer(); 3],
+    },
+    MaterialDef {
+        id: TerrainMaterialId::Asphalt,
+        label: "Asphalt",
+        color: [0x18, 0x1b, 0x24],
+        faces: [TerrainMaterialId::Asphalt.layer(); 3],
+    },
+    MaterialDef {
+        id: TerrainMaterialId::Concrete,
+        label: "Concrete",
+        color: [0x5d, 0x62, 0x70],
+        faces: [TerrainMaterialId::Concrete.layer(); 3],
+    },
+    MaterialDef {
+        id: TerrainMaterialId::DarkGlass,
+        label: "Dark Glass",
+        color: [0x12, 0x20, 0x32],
+        faces: [TerrainMaterialId::DarkGlass.layer(); 3],
+    },
+    MaterialDef {
+        id: TerrainMaterialId::NeonCyan,
+        label: "Neon Cyan",
+        color: [0x00, 0xf0, 0xff],
+        faces: [TerrainMaterialId::NeonCyan.layer(); 3],
+    },
+    MaterialDef {
+        id: TerrainMaterialId::NeonMagenta,
+        label: "Neon Magenta",
+        color: [0xff, 0x27, 0xd8],
+        faces: [TerrainMaterialId::NeonMagenta.layer(); 3],
+    },
+    MaterialDef {
+        id: TerrainMaterialId::NeonYellow,
+        label: "Neon Yellow",
+        color: [0xff, 0xf0, 0x3a],
+        faces: [TerrainMaterialId::NeonYellow.layer(); 3],
+    },
+    MaterialDef {
+        // Player-placed stone — same tint as Stone (so a build looks like stone),
+        // but its own texture-array layer so the shader can detect "built".
+        id: TerrainMaterialId::BuiltStone,
+        label: "Built Stone",
+        color: [0x6e, 0x6f, 0x72],
+        faces: [TerrainMaterialId::BuiltStone.layer(); 3],
+    },
+    MaterialDef {
+        // The remaining `Built*` blocks reuse their terrain/city cousin's tint so a
+        // build reads as that material, but each carries its own texture-array layer
+        // so the shader can tell builds from terrain (the see-through cutout).
+        id: TerrainMaterialId::BuiltDirt,
+        label: "Built Dirt",
+        color: [0x6b, 0x4a, 0x2c],
+        faces: [TerrainMaterialId::BuiltDirt.layer(); 3],
+    },
+    MaterialDef {
+        id: TerrainMaterialId::BuiltGrass,
+        label: "Built Grass",
+        color: [0x4f, 0x7a, 0x35],
+        faces: [TerrainMaterialId::BuiltGrass.layer(); 3],
+    },
+    MaterialDef {
+        id: TerrainMaterialId::BuiltConcrete,
+        label: "Built Concrete",
+        color: [0x5d, 0x62, 0x70],
+        faces: [TerrainMaterialId::BuiltConcrete.layer(); 3],
+    },
+    MaterialDef {
+        // Lighter than terrain DarkGlass so a glass build reads as a solid block.
+        id: TerrainMaterialId::BuiltGlass,
+        label: "Built Glass",
+        color: [0x3a, 0x5c, 0x7e],
+        faces: [TerrainMaterialId::BuiltGlass.layer(); 3],
+    },
+    MaterialDef {
+        id: TerrainMaterialId::BuiltNeonCyan,
+        label: "Built Neon Cyan",
+        color: [0x00, 0xf0, 0xff],
+        faces: [TerrainMaterialId::BuiltNeonCyan.layer(); 3],
+    },
+    MaterialDef {
+        id: TerrainMaterialId::BuiltNeonMagenta,
+        label: "Built Neon Magenta",
+        color: [0xff, 0x27, 0xd8],
+        faces: [TerrainMaterialId::BuiltNeonMagenta.layer(); 3],
+    },
+    MaterialDef {
+        id: TerrainMaterialId::BuiltNeonYellow,
+        label: "Built Neon Yellow",
+        color: [0xff, 0xf0, 0x3a],
+        faces: [TerrainMaterialId::BuiltNeonYellow.layer(); 3],
     },
 ];
 
@@ -309,6 +458,11 @@ impl VoxelWorldConfig for MainWorld {
         previous_lod: Option<LodLevel>,
         camera_position: Vec3,
     ) -> LodLevel {
+        // City detail (alleys/window strips/neon) is authored at one-voxel scale;
+        // terrain LOD sampling makes it look broken, so keep city chunks crisp.
+        if self.world_gen.kind() == WorldKind::City {
+            return 0;
+        }
         let band = self.terrain_lod_distance.max(1.0);
         let chunk_center = chunk_position.as_vec3() * CHUNK_INTERIOR as f32
             + Vec3::splat(CHUNK_INTERIOR as f32 * 0.5);
@@ -381,11 +535,11 @@ impl VoxelWorldConfig for MainWorld {
         // so this is free for the common case.
         let overrides = self.overrides.clone();
         let world_gen = self.world_gen.clone();
-        // Read the flat flag per meshing job (not once at config build) so a New
+        // Read the world kind per meshing job (not once at config build) so a New
         // Game / Load that flips it, then re-meshes, regenerates with the new
-        // surface. Cheap: one relaxed atomic load per chunk job.
+        // backend. Cheap: one relaxed atomic load per chunk job.
         Box::new(move |_chunk_pos, lod, _previous| {
-            get_voxel_fn(lod, overrides.snapshot(), world_gen.is_flat())
+            get_voxel_fn(lod, overrides.snapshot(), world_gen.kind())
         })
     }
 
@@ -430,7 +584,7 @@ impl Plugin for WorldPlugin {
         // the first game are the lab level — not procedural terrain the player
         // appears "spawned into". New Game stamps the test map onto it; Load may
         // switch the flag. Procedural terrain stays available via the flag.
-        world_gen.set_flat(true);
+        world_gen.set_kind(WorldKind::TestFlat);
 
         let main_world = MainWorld {
             render_distance_chunks,
@@ -521,7 +675,7 @@ fn setup_lighting(mut commands: Commands) {
 fn get_voxel_fn(
     lod: u8,
     overrides: VoxelOverrideSnapshot,
-    flat: bool,
+    kind: WorldKind,
 ) -> Box<dyn FnMut(IVec3, Option<WorldVoxel>) -> WorldVoxel + Send + Sync> {
     let noise = build_noise_lod(lod);
     let mut cache = HashMap::<(i32, i32), f64>::new();
@@ -546,10 +700,16 @@ fn get_voxel_fn(
             }
         }
 
+        if kind == WorldKind::City {
+            return inf3d_city::voxel_at(pos)
+                .map(WorldVoxel::Solid)
+                .unwrap_or(WorldVoxel::Air);
+        }
+
         // Flat test world: every column is the SAME constant surface — skip the
         // noise sample entirely and feed the shared flat height to the identical
         // solid/classify logic below, so the mesh matches the `Terrain` oracle.
-        let surface = if flat {
+        let surface = if kind == WorldKind::TestFlat {
             FLAT_SURFACE_HEIGHT
         } else {
             let key = (pos.x, pos.z);
@@ -591,6 +751,9 @@ fn get_voxel_fn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use inf3d_city::{
+        MAT_ASPHALT, MAT_CONCRETE, MAT_DARK_GLASS, MAT_NEON_CYAN, MAT_NEON_MAGENTA, MAT_NEON_YELLOW,
+    };
 
     /// PALETTE is the single source of truth, indexed by discriminant. This guards
     /// the invariant every consumer relies on: row `i` describes the variant whose
@@ -603,23 +766,77 @@ mod tests {
         use TerrainMaterialId::*;
         // Every variant, listed once. Adding a variant means updating this list,
         // the enum, AND PALETTE — and any mismatch trips an assertion below.
-        let all = [Grass, Dirt, Stone, Seafloor];
+        let all = [
+            Grass,
+            Dirt,
+            Stone,
+            Seafloor,
+            Asphalt,
+            Concrete,
+            DarkGlass,
+            NeonCyan,
+            NeonMagenta,
+            NeonYellow,
+            BuiltStone,
+            BuiltDirt,
+            BuiltGrass,
+            BuiltConcrete,
+            BuiltGlass,
+            BuiltNeonCyan,
+            BuiltNeonMagenta,
+            BuiltNeonYellow,
+        ];
         assert_eq!(
             PALETTE.len(),
             all.len(),
             "PALETTE must have exactly one row per TerrainMaterialId variant"
         );
         for (i, def) in PALETTE.iter().enumerate() {
-            assert_eq!(def.id as usize, i, "PALETTE[{i}] must describe discriminant {i}");
+            assert_eq!(
+                def.id as usize, i,
+                "PALETTE[{i}] must describe discriminant {i}"
+            );
             assert_eq!(
                 TerrainMaterialId::from_index(i as u8),
                 Some(def.id),
                 "from_index({i}) must round-trip to PALETTE[{i}].id"
             );
-            assert_eq!(def.id.label(), def.label, "label() must equal the table label");
+            assert_eq!(
+                def.id.label(),
+                def.label,
+                "label() must equal the table label"
+            );
         }
         // Out-of-range indices have no material.
         assert_eq!(TerrainMaterialId::from_index(PALETTE.len() as u8), None);
+        assert_eq!(TerrainMaterialId::Asphalt as u8, MAT_ASPHALT);
+        assert_eq!(TerrainMaterialId::Concrete as u8, MAT_CONCRETE);
+        assert_eq!(TerrainMaterialId::DarkGlass as u8, MAT_DARK_GLASS);
+        assert_eq!(TerrainMaterialId::NeonCyan as u8, MAT_NEON_CYAN);
+        assert_eq!(TerrainMaterialId::NeonMagenta as u8, MAT_NEON_MAGENTA);
+        assert_eq!(TerrainMaterialId::NeonYellow as u8, MAT_NEON_YELLOW);
+    }
+
+    /// The picker's buildable set must satisfy the two invariants every consumer
+    /// relies on: `BUILDABLE[0]` is the resource default the picker boots to
+    /// (`inf3d_core::DEFAULT_BUILD_MATERIAL`), and EVERY buildable is a player-build
+    /// index (`>= BUILT_MATERIAL_BASE`) so the see-through cutout / build-vs-terrain
+    /// split only ever apply to player builds — never to terrain. If someone adds a
+    /// terrain material to `BUILDABLE`, or changes the default without updating the
+    /// other, this fails loudly here.
+    #[test]
+    fn buildable_defaults_align() {
+        assert_eq!(
+            BUILDABLE[0] as u8,
+            inf3d_core::DEFAULT_BUILD_MATERIAL,
+            "BUILDABLE[0] must equal inf3d_core::DEFAULT_BUILD_MATERIAL"
+        );
+        for m in BUILDABLE {
+            assert!(
+                m as u32 >= BUILT_MATERIAL_BASE,
+                "{m:?} is in BUILDABLE but is not a Built* material (index < BUILT_MATERIAL_BASE)"
+            );
+        }
     }
 
     /// The mesher must honor player edits: a `Placed` block appears where the
@@ -631,10 +848,13 @@ mod tests {
         let high = IVec3::new(3, 90, 3); // above all terrain → base air
         let low = IVec3::new(3, 0, 3); // deep underground → base solid
 
-        // Baseline with an empty snapshot (taken before any edit). `flat = false`
+        // Baseline with an empty snapshot (taken before any edit). `Normal`
         // exercises the procedural path this test asserts against.
-        let mut base = get_voxel_fn(0, store.snapshot(), false);
-        assert!(matches!(base(high, None), WorldVoxel::Air), "high voxel is air by default");
+        let mut base = get_voxel_fn(0, store.snapshot(), WorldKind::Normal);
+        assert!(
+            matches!(base(high, None), WorldVoxel::Air),
+            "high voxel is air by default"
+        );
         assert!(
             matches!(base(low, None), WorldVoxel::Solid(_)),
             "low voxel is solid by default"
@@ -643,11 +863,14 @@ mod tests {
         // Edit, then re-mesh from a fresh snapshot.
         store.place(high, TerrainMaterialId::Stone as u8);
         store.remove(low);
-        let mut edited = get_voxel_fn(0, store.snapshot(), false);
+        let mut edited = get_voxel_fn(0, store.snapshot(), WorldKind::Normal);
         assert!(
             matches!(edited(high, None), WorldVoxel::Solid(m) if m == TerrainMaterialId::Stone as u8),
             "placed block is meshed as the chosen material"
         );
-        assert!(matches!(edited(low, None), WorldVoxel::Air), "removed block is meshed as air");
+        assert!(
+            matches!(edited(low, None), WorldVoxel::Air),
+            "removed block is meshed as air"
+        );
     }
 }

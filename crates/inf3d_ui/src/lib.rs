@@ -12,8 +12,8 @@ use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
 use bevy_voxel_world::prelude::Chunk;
 
-use inf3d_core::{AppState, EditMode, FrameStats, GameSet, QualitySettings};
-use inf3d_world::{MainWorld, TerrainMaterialId};
+use inf3d_core::{AppState, EditMode, FrameStats, GameSet, QualitySettings, SelectedMaterial};
+use inf3d_world::{MainWorld, TerrainMaterialId, BUILDABLE};
 
 /// Live-monitor metrics, logged each second by `LogDiagnosticsPlugin` alongside
 /// the built-in FPS / frame-time / entity-count diagnostics.
@@ -61,7 +61,7 @@ impl Plugin for HudPlugin {
         app.register_diagnostic(Diagnostic::new(DIAG_CHUNKS))
             .register_diagnostic(Diagnostic::new(DIAG_MESHES))
             .init_resource::<HudStats>()
-            .add_systems(Startup, (spawn_hud, spawn_mode_buttons))
+            .add_systems(Startup, (spawn_hud, spawn_mode_buttons, spawn_material_picker))
             // The in-game HUD + mode buttons show only during `AppState::InGame`
             // (they spawn hidden — we boot into the menu). In `Fx`, which stays
             // ungated, so it still runs in the menu / when paused; `state_changed`
@@ -80,6 +80,23 @@ impl Plugin for HudPlugin {
                     .in_set(GameSet::Fx)
                     .run_if(resource_changed::<EditMode>),
             )
+            // Material picker: clicks + number keys pick in Input; the selected-
+            // swatch highlight restyles in Fx whenever the pick changes; the bar's
+            // visibility tracks Build mode + being in-game.
+            .add_systems(
+                Update,
+                (picker_click_system, picker_key_system).in_set(GameSet::Input),
+            )
+            .add_systems(
+                Update,
+                update_picker_selection
+                    .in_set(GameSet::Fx)
+                    .run_if(resource_changed::<SelectedMaterial>),
+            )
+            // Runs every frame in Fx (cheap — one root entity) but writes
+            // Visibility only when it actually flips, so it never thrashes change
+            // detection; a plain run avoids needing a combined run-condition.
+            .add_systems(Update, sync_picker_visibility.in_set(GameSet::Fx))
             // Graphics settings are currently fixed high; runtime settings UI will
             // be reintroduced later. Everything below is read-only diagnostics /
             // presentation and belongs in `Fx` (end of the frame).
@@ -133,10 +150,7 @@ fn spawn_hud(mut commands: Commands) {
 /// Show the in-game HUD + mode buttons only in [`AppState::InGame`]; hide them in
 /// the main menu. Runs only on a state change (cheap). Setting `Visibility` on the
 /// UI root propagates to its children.
-fn sync_hud_visibility(
-    state: Res<State<AppState>>,
-    mut q: Query<&mut Visibility, With<InGameUi>>,
-) {
+fn sync_hud_visibility(state: Res<State<AppState>>, mut q: Query<&mut Visibility, With<InGameUi>>) {
     let vis = if *state.get() == AppState::InGame {
         Visibility::Visible
     } else {
@@ -230,6 +244,8 @@ fn update_hud(
     settings: Res<QualitySettings>,
     frame: Res<FrameStats>,
     hud: Res<HudStats>,
+    mode: Res<EditMode>,
+    selected: Res<SelectedMaterial>,
     mut text_q: Query<&mut Text, With<HudText>>,
 ) {
     let Ok(mut text) = text_q.single_mut() else {
@@ -273,8 +289,15 @@ fn update_hud(
 
     let on_off = |b: bool| if b { "on" } else { "off" };
 
+    // Mode line: in Build, also show which block the picker has selected (1..8 keys
+    // re-bind it). Left-click places / right-click breaks in Build; moves in Walk.
+    let mode_line = match *mode {
+        EditMode::Build => format!("Mode: Build   Block: {}", material_name(selected.0)),
+        EditMode::Walk => "Mode: Walk".to_string(),
+    };
+
     text.0 = format!(
-        "FPS: {:.0}  ({:.1} ms, p95 {:.1} ms)\nEntities: {:.0}   Chunks: {}\nPlayer: ({:.1}, {:.1}, {:.1})  cell=({}, {})\nGraphics: fixed high  rd={}  terrain_lod0={:.0}  SSAO {}  MB {}\n{}",
+        "FPS: {:.0}  ({:.1} ms, p95 {:.1} ms)\nEntities: {:.0}   Chunks: {}\nPlayer: ({:.1}, {:.1}, {:.1})  cell=({}, {})\nGraphics: fixed high  rd={}  terrain_lod0={:.0}  SSAO {}  MB {}\n{}\n{}",
         fps,
         frame_ms,
         frame.ms_p95,
@@ -286,6 +309,7 @@ fn update_hud(
         settings.terrain_lod_distance,
         on_off(settings.ssao_enabled),
         on_off(settings.motion_blur_enabled),
+        mode_line,
         hover_line,
     );
 }
@@ -383,12 +407,205 @@ fn mode_button_system(
 
 /// Highlight the active mode button and dim the others. Runs whenever
 /// [`EditMode`] changes (including the first frame, so the default `Walk` lights up).
-fn update_mode_buttons(mode: Res<EditMode>, mut buttons: Query<(&ModeButton, &mut BackgroundColor)>) {
+fn update_mode_buttons(
+    mode: Res<EditMode>,
+    mut buttons: Query<(&ModeButton, &mut BackgroundColor)>,
+) {
     for (button, mut bg) in &mut buttons {
         bg.0 = if button.mode == *mode {
             button.active
         } else {
             button.inactive
         };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build-mode material picker (hotbar)
+// ---------------------------------------------------------------------------
+
+/// Idle frame behind a picker swatch — a thin dark ring (via padding) so adjacent
+/// swatches read as separate chips.
+const PICKER_FRAME_IDLE: Color = Color::srgba(0.10, 0.11, 0.14, 0.85);
+/// Frame behind the SELECTED swatch — a bright gold ring so the current block reads
+/// at a glance regardless of the swatch's own color (works over neon or stone alike).
+const PICKER_FRAME_SELECTED: Color = Color::srgb(0.97, 0.82, 0.27);
+
+/// Root of the Build-mode material hotbar (bottom-center). Visible only while
+/// in-game AND in [`EditMode::Build`] — see [`sync_picker_visibility`]. Spawns
+/// hidden because the game boots into the menu.
+#[derive(Component)]
+struct PickerRoot;
+
+/// One swatch in the material hotbar, carrying the raw material it selects. The
+/// material doubles as the selection key (each [`BUILDABLE`] entry is distinct), so
+/// [`update_picker_selection`] just compares it to [`SelectedMaterial`].
+#[derive(Component, Clone, Copy)]
+struct PickerSlot {
+    material: u8,
+}
+
+/// Spawn the material hotbar: a centered row of color swatches, one per
+/// [`BUILDABLE`] entry, each a clickable [`Button`] with its number-key hint. The
+/// swatch order / contents come straight from `BUILDABLE` (the single source of
+/// truth in `inf3d_world`), so adding a buildable block needs no UI change.
+fn spawn_material_picker(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                bottom: Val::Px(14.0),
+                left: Val::Px(0.0),
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(8.0),
+                // Start collapsed (we boot into the menu). `Display::None` — not
+                // `Visibility::Hidden` — so the full-width bar neither renders NOR
+                // captures clicks while hidden; otherwise its swatch buttons would
+                // swallow Walk-mode world clicks along the bottom of the screen.
+                display: Display::None,
+                ..default()
+            },
+            // Visibility is owned solely by `sync_picker_visibility` (which gates on
+            // both in-game AND Build mode), so this is deliberately NOT tagged
+            // `InGameUi` — the blanket `InGameUi` show-on-enter must not touch it.
+            PickerRoot,
+        ))
+        .with_children(|bar| {
+            for (i, material) in BUILDABLE.iter().enumerate() {
+                let mat_u8 = *material as u8;
+                let [r, g, b] = material.color();
+                bar.spawn((
+                    Button,
+                    Interaction::default(),
+                    // The frame: 3px padding draws a ring around the inner swatch;
+                    // its color flips to gold when this slot is the selected one.
+                    Node {
+                        padding: UiRect::all(Val::Px(3.0)),
+                        ..default()
+                    },
+                    BackgroundColor(PICKER_FRAME_IDLE),
+                    PickerSlot { material: mat_u8 },
+                ))
+                .with_children(|frame| {
+                    frame
+                        .spawn((
+                            Node {
+                                width: Val::Px(40.0),
+                                height: Val::Px(40.0),
+                                justify_content: JustifyContent::FlexEnd,
+                                align_items: AlignItems::FlexStart,
+                                padding: UiRect::all(Val::Px(2.0)),
+                                ..default()
+                            },
+                            BackgroundColor(Color::srgb_u8(r, g, b)),
+                        ))
+                        .with_children(|swatch| {
+                            // Number-key hint on a dark chip so it stays legible over
+                            // any swatch color (bright neon or near-black glass alike).
+                            swatch
+                                .spawn((
+                                    Node {
+                                        padding: UiRect::axes(Val::Px(3.0), Val::Px(0.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.5)),
+                                ))
+                                .with_children(|tag| {
+                                    tag.spawn((
+                                        Text::new((i + 1).to_string()),
+                                        TextFont {
+                                            font_size: 12.0,
+                                            ..default()
+                                        },
+                                        TextColor(Color::srgb(0.96, 0.98, 1.0)),
+                                    ));
+                                });
+                        });
+                });
+            }
+        });
+}
+
+/// Pick a build material when its swatch is clicked. A click on a swatch also
+/// suppresses the world edit for that frame (the editor ignores clicks while any
+/// `Interaction` is non-`None`), so picking never places a block behind the bar.
+fn picker_click_system(
+    buttons: Query<(&Interaction, &PickerSlot), Changed<Interaction>>,
+    mut selected: ResMut<SelectedMaterial>,
+) {
+    for (interaction, slot) in &buttons {
+        if *interaction == Interaction::Pressed && selected.0 != slot.material {
+            selected.0 = slot.material;
+        }
+    }
+}
+
+/// Number keys 1..8 select the corresponding [`BUILDABLE`] block, but only while
+/// building (so the keys are free for other actions in Walk mode).
+fn picker_key_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    mode: Res<EditMode>,
+    mut selected: ResMut<SelectedMaterial>,
+) {
+    if *mode != EditMode::Build {
+        return;
+    }
+    const DIGITS: [KeyCode; 8] = [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+    ];
+    for (i, key) in DIGITS.iter().enumerate() {
+        if keys.just_pressed(*key) {
+            if let Some(material) = BUILDABLE.get(i) {
+                let m = *material as u8;
+                if selected.0 != m {
+                    selected.0 = m;
+                }
+            }
+        }
+    }
+}
+
+/// Re-tint every swatch frame so the selected one is gold and the rest dim. Runs
+/// whenever [`SelectedMaterial`] changes (including frame one, so the default block
+/// is highlighted immediately).
+fn update_picker_selection(
+    selected: Res<SelectedMaterial>,
+    mut slots: Query<(&PickerSlot, &mut BackgroundColor)>,
+) {
+    for (slot, mut bg) in &mut slots {
+        bg.0 = if slot.material == selected.0 {
+            PICKER_FRAME_SELECTED
+        } else {
+            PICKER_FRAME_IDLE
+        };
+    }
+}
+
+/// Show the material hotbar only while in-game AND in Build mode; collapse it in
+/// Walk mode and in the menu. Toggles `Display` (not `Visibility`) so a hidden bar
+/// captures no clicks — see the note in [`spawn_material_picker`].
+fn sync_picker_visibility(
+    state: Res<State<AppState>>,
+    mode: Res<EditMode>,
+    mut roots: Query<&mut Node, With<PickerRoot>>,
+) {
+    let show = *state.get() == AppState::InGame && *mode == EditMode::Build;
+    let target = if show { Display::Flex } else { Display::None };
+    for mut node in &mut roots {
+        // Only write on an actual change so we don't force a layout recompute every
+        // frame (mutating `Node` marks it dirty for the UI layout pass).
+        if node.display != target {
+            node.display = target;
+        }
     }
 }

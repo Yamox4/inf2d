@@ -2,9 +2,10 @@
 //! meshing (on worker threads) and gameplay (pathfinding/standing).
 
 use bevy::prelude::*;
+use inf3d_city::CITY_SURFACE_HEIGHT;
 use noise::{HybridMulti, NoiseFn, Perlin};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// World-space height of the water surface (the `bevy_water` plane). The lowest
@@ -30,31 +31,66 @@ pub const FLAT_SURFACE_Y: i32 = 8;
 /// ambiguous under `y < surface`).
 pub const FLAT_SURFACE_HEIGHT: f64 = FLAT_SURFACE_Y as f64 + 0.5;
 
-/// Shared, cheap-to-clone toggle selecting the **flat test world** (no noise) vs
-/// the procedural terrain. Mirrors the [`VoxelOverrides`] sharing pattern: ONE
-/// flag is cloned into the [`Terrain`] oracle, the meshing config, and exposed as
-/// a resource, so the surface the oracle reports and the surface the mesher builds
-/// can never disagree. `New Game` sets it (flat), `Load` restores the saved world
-/// kind; after either, all resident chunks must be re-meshed for the change to
-/// show. `Relaxed` ordering is fine — a one-frame stale read across the
-/// flag-flip/remesh boundary is harmless (the remesh re-reads it).
+/// Base world backend selected for procedural voxel lookups.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[repr(u8)]
+pub enum WorldKind {
+    /// Normal noise terrain.
+    #[default]
+    Normal = 0,
+    /// Flat test lab, optionally stamped with test structures by the menu.
+    TestFlat = 1,
+    /// Deterministic infinite cyberpunk city backend (`inf3d_city`).
+    City = 2,
+}
+
+impl WorldKind {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::TestFlat,
+            2 => Self::City,
+            _ => Self::Normal,
+        }
+    }
+}
+
+/// Shared, cheap-to-clone selector for the base world backend. Mirrors the
+/// [`VoxelOverrides`] sharing pattern: ONE selector is cloned into the [`Terrain`]
+/// oracle, the meshing config, and exposed as a resource, so the surface the oracle
+/// reports and the surface the mesher builds can never disagree. `Relaxed` ordering
+/// is fine — a one-frame stale read across a switch/remesh boundary is harmless.
 #[derive(Resource, Clone, Default)]
-pub struct WorldGen(Arc<AtomicBool>);
+pub struct WorldGen(Arc<AtomicU8>);
 
 impl WorldGen {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Selected base world backend.
+    pub fn kind(&self) -> WorldKind {
+        WorldKind::from_u8(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Select the base world backend. The caller must re-mesh resident chunks
+    /// afterwards for the new surface to show.
+    pub fn set_kind(&self, kind: WorldKind) {
+        self.0.store(kind as u8, Ordering::Relaxed);
+    }
+
     /// Whether the world is the flat test world (`true`) rather than procedural.
     pub fn is_flat(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.kind() == WorldKind::TestFlat
     }
 
     /// Select the flat test world (`true`) or procedural terrain (`false`). The
     /// caller must re-mesh resident chunks afterwards for the new surface to show.
     pub fn set_flat(&self, flat: bool) {
-        self.0.store(flat, Ordering::Relaxed);
+        self.set_kind(if flat {
+            WorldKind::TestFlat
+        } else {
+            WorldKind::Normal
+        });
     }
 }
 
@@ -203,6 +239,10 @@ struct VoxelOverrideData {
     edits: HashMap<IVec3, VoxelEdit>,
     /// Columns that contain at least one edit, for the surface fast path.
     columns: HashMap<IVec2, ColumnSummary>,
+    /// Monotonic counter bumped on every mutation, so cheap consumers (the
+    /// built-block renderer) can detect "edits changed" without diffing the map
+    /// every frame. Wraps harmlessly — only equality vs the last seen value matters.
+    version: u64,
 }
 
 /// Sparse, shared store of player voxel edits — **the single place an edited
@@ -254,14 +294,15 @@ impl VoxelOverrides {
         };
         let col = IVec2::new(pos.x, pos.z);
         let is_new = data.edits.insert(pos, edit).is_none();
-        let summary = data
-            .columns
-            .entry(col)
-            .or_insert(ColumnSummary { count: 0, max_y: i32::MIN });
+        let summary = data.columns.entry(col).or_insert(ColumnSummary {
+            count: 0,
+            max_y: i32::MIN,
+        });
         if is_new {
             summary.count += 1;
         }
         summary.max_y = summary.max_y.max(pos.y);
+        data.version = data.version.wrapping_add(1);
     }
 
     /// Place a solid block of `material` (the [`VoxelEdit::Placed`] discriminant).
@@ -282,6 +323,7 @@ impl VoxelOverrides {
         if data.edits.remove(&pos).is_none() {
             return;
         }
+        data.version = data.version.wrapping_add(1);
         let col = IVec2::new(pos.x, pos.z);
         if let Some(s) = data.columns.get_mut(&col) {
             s.count = s.count.saturating_sub(1);
@@ -339,7 +381,15 @@ impl VoxelOverrides {
         if let Ok(mut data) = self.0.write() {
             data.edits.clear();
             data.columns.clear();
+            data.version = data.version.wrapping_add(1);
         }
+    }
+
+    /// Monotonic edit version — changes on every mutation (place/remove/clear/
+    /// import). Consumers compare it against the last value they saw to skip work
+    /// when nothing changed. See [`VoxelOverrideData::version`].
+    pub fn version(&self) -> u64 {
+        self.0.read().map(|d| d.version).unwrap_or(0)
     }
 
     /// Replace all edits with `edits` (clears first, then re-applies through
@@ -497,10 +547,13 @@ impl Terrain {
     /// once sampled the procedural noise directly here, so under a flat-meshed
     /// world the player walked/pathfound on invisible procedural hills.)
     fn base_kind(&self, x: i32, z: i32) -> ColumnKind {
-        if self.world_gen.is_flat() {
-            ColumnKind::from_height(FLAT_SURFACE_HEIGHT)
-        } else {
-            column_kind(&self.noise, x, z)
+        match self.world_gen.kind() {
+            WorldKind::Normal => column_kind(&self.noise, x, z),
+            WorldKind::TestFlat => ColumnKind::from_height(FLAT_SURFACE_HEIGHT),
+            // The city backend is primarily a fly-through visual/debug world. Keep
+            // the gameplay oracle on the street plane so free-fly/iso starts on the
+            // ground instead of snapping to skyscraper roofs.
+            WorldKind::City => ColumnKind::from_height(CITY_SURFACE_HEIGHT),
         }
     }
 
@@ -644,7 +697,11 @@ mod tests {
         let base = t.surface_y(c.x, c.y);
 
         store.place(IVec3::new(c.x, base + 1, c.y), 0);
-        assert_eq!(t.surface_y(c.x, c.y), base + 1, "placed block raises surface");
+        assert_eq!(
+            t.surface_y(c.x, c.y),
+            base + 1,
+            "placed block raises surface"
+        );
         // Feet rest on the top face of the new topmost voxel.
         assert_eq!(t.stand_pos(c.x, c.y).y, (base + 2) as f32);
     }
@@ -657,7 +714,11 @@ mod tests {
         let base = t.surface_y(c.x, c.y);
 
         store.remove(IVec3::new(c.x, base, c.y));
-        assert_eq!(t.surface_y(c.x, c.y), base - 1, "removing the top drops surface");
+        assert_eq!(
+            t.surface_y(c.x, c.y),
+            base - 1,
+            "removing the top drops surface"
+        );
     }
 
     #[test]
@@ -672,7 +733,11 @@ mod tests {
         assert_eq!(t.surface_y(c.x, c.y), base + 2);
 
         store.clear(IVec3::new(c.x, base + 2, c.y));
-        assert_eq!(t.surface_y(c.x, c.y), base + 1, "clearing the top voxel exposes the one below");
+        assert_eq!(
+            t.surface_y(c.x, c.y),
+            base + 1,
+            "clearing the top voxel exposes the one below"
+        );
     }
 
     #[test]
@@ -687,12 +752,18 @@ mod tests {
         for y in 1..=base {
             store.remove(IVec3::new(c.x, y, c.y));
         }
-        assert!(!t.is_land(c.x, c.y), "column dug below the water line reads as water");
+        assert!(
+            !t.is_land(c.x, c.y),
+            "column dug below the water line reads as water"
+        );
 
         // Build back up above the water line.
         store.place(IVec3::new(c.x, 1, c.y), 0);
         store.place(IVec3::new(c.x, 2, c.y), 0);
-        assert!(t.is_land(c.x, c.y), "refilled above the water line reads as land again");
+        assert!(
+            t.is_land(c.x, c.y),
+            "refilled above the water line reads as land again"
+        );
         assert_eq!(t.surface_y(c.x, c.y), 2);
     }
 
@@ -707,7 +778,11 @@ mod tests {
         assert_eq!(store.len(), 1);
 
         store.clear(IVec3::new(c.x, base + 1, c.y));
-        assert_eq!(t.surface_y(c.x, c.y), base, "cleared column reverts to procedural surface");
+        assert_eq!(
+            t.surface_y(c.x, c.y),
+            base,
+            "cleared column reverts to procedural surface"
+        );
         assert!(store.is_empty());
         // Back on the fast path: column no longer in the edit index.
         assert_eq!(store.resolved_surface_y(c.x, c.y, base), None);
@@ -727,13 +802,20 @@ mod tests {
         world_gen.set_flat(true);
 
         for (x, z) in [(0, 0), (37, -12), (-100, 250), (5, 5)] {
-            assert_eq!(t.surface_y(x, z), FLAT_SURFACE_Y, "flat surface_y at ({x},{z})");
+            assert_eq!(
+                t.surface_y(x, z),
+                FLAT_SURFACE_Y,
+                "flat surface_y at ({x},{z})"
+            );
             assert_eq!(
                 t.surface_y_near(x, z, FLAT_SURFACE_Y + 1),
                 FLAT_SURFACE_Y,
                 "flat surface_y_near must equal surface_y at ({x},{z}) — the invisible-hills bug"
             );
-            assert!(t.is_land(x, z), "flat world stands above the water line at ({x},{z})");
+            assert!(
+                t.is_land(x, z),
+                "flat world stands above the water line at ({x},{z})"
+            );
         }
     }
 }

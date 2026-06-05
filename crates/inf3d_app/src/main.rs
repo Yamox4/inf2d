@@ -13,6 +13,7 @@ use inf3d_pathfinding::PathfindPlugin;
 use inf3d_physics::PhysicsGamePlugin;
 use inf3d_render::{
     CursorPlugin, DustPlugin, EditPlugin, FogPlugin, FoliagePlugin, HighlightPlugin, WaterPlugin,
+    XrayPlugin,
 };
 use inf3d_ui::HudPlugin;
 use inf3d_world::WorldPlugin;
@@ -60,6 +61,9 @@ fn main() {
         .add_plugins(PathfindPlugin)
         .add_plugins(HighlightPlugin)
         .add_plugins(EditPlugin)
+        // Feeds the terrain material's see-through uniform (player screen pos) so
+        // built walls between the camera and player dither away.
+        .add_plugins(XrayPlugin)
         .add_plugins(CursorPlugin)
         .add_plugins(DustPlugin)
         .add_plugins(FogPlugin)

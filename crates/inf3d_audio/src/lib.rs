@@ -16,6 +16,12 @@
 //!   variation so repeated steps don't sound identical/robotic. A single
 //!   "all surfaces" clip is used today; per-surface clips can be selected later
 //!   from the `Footstep` data without touching the trigger.
+//! - **Block edits** — one per [`inf3d_render::BlockEdited`] message: a "thunk" when
+//!   a block is placed, a "crumble" when one is broken (selected via the message's
+//!   `placed` flag), with the same pitch/volume variation as footsteps. The clips
+//!   are placeholder synth `.ogg`s under `sfx/world/`; drop in real numbered
+//!   variants there to replace them (the loader still loads one fixed clip each —
+//!   extend to a variant vec the same way footsteps will).
 
 use bevy::audio::Volume; // not in bevy::prelude (AudioPlayer/PlaybackSettings are)
 use bevy::prelude::*;
@@ -23,6 +29,7 @@ use rand::Rng;
 
 use inf3d_core::GameSet;
 use inf3d_gameplay::Footstep;
+use inf3d_render::BlockEdited;
 
 /// Footstep clip, relative to the app asset root (`crates/inf3d_app/assets/`).
 /// This is a TRIMMED `.ogg` (≈0.22 s) produced from the original `.mp3`, which had
@@ -41,10 +48,26 @@ const FOOTSTEP_SPEED_MAX: f32 = 1.05;
 /// Per-step volume jitter as a ± fraction of [`FOOTSTEP_VOLUME`] (0.1 = ±10%).
 const FOOTSTEP_VOLUME_JITTER: f32 = 0.1;
 
-/// Loaded sound handles, kept resident so steps play instantly (no per-step load).
+/// Block place ("thunk") + break ("crumble") clips, relative to the app asset root.
+/// Placeholder synth `.ogg`s (gap-trimmed, mono); see the folder README + module
+/// docs to swap in real clips. The `_01` suffix leaves room for random variants.
+const BLOCK_PLACE_CLIP: &str = "audio/sfx/world/world_block_place_01.ogg";
+const BLOCK_BREAK_CLIP: &str = "audio/sfx/world/world_block_break_01.ogg";
+/// Base edit-SFX volume (linear). A touch under footsteps so building doesn't shout.
+const BLOCK_VOLUME: f32 = 0.6;
+/// Playback-speed (= pitch) range per edit — slightly wider than footsteps so
+/// repeated placements feel chunky rather than identical.
+const BLOCK_SPEED_MIN: f32 = 0.92;
+const BLOCK_SPEED_MAX: f32 = 1.08;
+/// Per-edit volume jitter as a ± fraction of [`BLOCK_VOLUME`].
+const BLOCK_VOLUME_JITTER: f32 = 0.12;
+
+/// Loaded sound handles, kept resident so sounds play instantly (no per-event load).
 #[derive(Resource)]
 struct AudioAssets {
     footstep: Handle<AudioSource>,
+    block_place: Handle<AudioSource>,
+    block_break: Handle<AudioSource>,
 }
 
 /// Plays game sound. Add once in the app (downstream of gameplay).
@@ -54,14 +77,16 @@ impl Plugin for AudioPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, load_audio)
             // Presentation: react to gameplay events at the end of the frame.
-            .add_systems(Update, play_footsteps.in_set(GameSet::Fx));
+            .add_systems(Update, (play_footsteps, play_block_edits).in_set(GameSet::Fx));
     }
 }
 
-/// Load sound handles once at startup so they're resident before the first step.
+/// Load sound handles once at startup so they're resident before the first event.
 fn load_audio(mut commands: Commands, assets: Res<AssetServer>) {
     commands.insert_resource(AudioAssets {
         footstep: assets.load(FOOTSTEP_CLIP),
+        block_place: assets.load(BLOCK_PLACE_CLIP),
+        block_break: assets.load(BLOCK_BREAK_CLIP),
     });
 }
 
@@ -89,5 +114,35 @@ fn play_footsteps(
         settings.speed = speed;
         settings.volume = Volume::Linear(volume);
         commands.spawn((AudioPlayer(audio.footstep.clone()), settings));
+    }
+}
+
+/// Spawn a one-shot place/break sound for each block edit this frame: the "thunk"
+/// clip on a place, the "crumble" clip on a break, each with a slight random pitch +
+/// volume so repeated edits don't sound mechanical. Self-cleaning via
+/// `PlaybackSettings::DESPAWN`, like footsteps. If a clip file is missing the handle
+/// just resolves to nothing and stays silent — adding the file later is enough.
+fn play_block_edits(
+    mut commands: Commands,
+    mut edits: MessageReader<BlockEdited>,
+    audio: Option<Res<AudioAssets>>,
+) {
+    let Some(audio) = audio else {
+        return;
+    };
+    let mut rng = rand::rng();
+    for edit in edits.read() {
+        let clip = if edit.placed {
+            audio.block_place.clone()
+        } else {
+            audio.block_break.clone()
+        };
+        let speed = rng.random_range(BLOCK_SPEED_MIN..BLOCK_SPEED_MAX);
+        let jitter = rng.random_range(-BLOCK_VOLUME_JITTER..BLOCK_VOLUME_JITTER);
+        let volume = (BLOCK_VOLUME * (1.0 + jitter)).max(0.0);
+        let mut settings = PlaybackSettings::DESPAWN;
+        settings.speed = speed;
+        settings.volume = Volume::Linear(volume);
+        commands.spawn((AudioPlayer(clip), settings));
     }
 }
