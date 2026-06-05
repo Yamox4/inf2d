@@ -136,6 +136,15 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
     only the blocks actually occluding the character open up — side/back/standing-in-front
     walls stay solid. Forward + prepass call the same fn (deterministic, no dither). Knobs:
     `CUT_RADIUS` (≈0.95 blocks), `PLAYER_HALF_HEIGHT` (1.1) in `xray.rs`.
+  - [x] **Cutaway v2 — roof + click-through** — added a **ceiling rule** (cut built
+    blocks above the player within `XRAY_CEILING_RADIUS`) so a whole roof opens up, not
+    just the camera-line strip; bumped `XRAY_CUT_RADIUS` to 1.4; floor guard
+    (`dc.y > -half_h`) so a built floor in front never holes. The cut math now lives in
+    `inf3d_world::voxel_cut_by_xray` (CPU mirror of `terrain_xray.wgsl`), and the click
+    raycasts in BOTH `inf3d_render::highlight` (Walk mode only) and
+    `inf3d_pathfinding::handle_click` skip the cut voxels — so you can click the interior
+    floor through a cut roof/wall and walk in. All tuning consts in
+    `inf3d_world::terrain_material` (one source for shader + raycasts).
   - [ ] **Next:** perf in dense areas (rd=10 + foliage is the dominant cost; the prepass
     discard also disables terrain early-z); horizontal collision for placed voxels (you
     can still walk through their sides); then harvesting (Tree/Rock/`InteractionTarget`

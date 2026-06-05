@@ -11,9 +11,11 @@ use bevy::{
     window::PrimaryWindow,
 };
 use bevy_voxel_world::prelude::*;
+use bevy_voxel_world::rendering::VoxelWorldMaterialHandle;
 
 use inf3d_camera::IsoCamera;
-use inf3d_core::{GameSet, PathTarget};
+use inf3d_core::{EditMode, GameSet, PathTarget};
+use inf3d_world::terrain_material::{voxel_cut_by_xray, TerrainMaterial};
 use inf3d_world::MainWorld;
 use inf3d_worldgen::Terrain;
 
@@ -92,15 +94,31 @@ fn spawn_highlight(
 
 /// Raycast the cursor into the voxel world and move/show the highlight on the
 /// hovered voxel; hide it when nothing is under the cursor.
+#[allow(clippy::too_many_arguments)]
 fn update_highlight(
     window: Query<&Window, With<PrimaryWindow>>,
     cam: Query<(&Camera, &GlobalTransform), With<IsoCamera>>,
     voxel_world: VoxelWorld<MainWorld>,
+    mode: Res<EditMode>,
+    xray_handle: Option<Res<VoxelWorldMaterialHandle<TerrainMaterial>>>,
+    xray_materials: Res<Assets<TerrainMaterial>>,
     mut highlight: Query<(&mut Transform, &mut Visibility), With<VoxelHighlight>>,
     mut hover: ResMut<Hover>,
 ) {
     let Ok((mut transform, mut visibility)) = highlight.single_mut() else {
         return;
+    };
+
+    // In Walk mode the cursor should resolve to what you can SEE, so skip the voxels
+    // the cutaway removes (you point at the interior, not the cut roof). In Build mode
+    // leave every block targetable so you can still edit a cut wall/roof.
+    let xray = if *mode == EditMode::Walk {
+        xray_handle
+            .as_ref()
+            .and_then(|h| xray_materials.get(&h.handle))
+            .map(|m| m.extension.xray)
+    } else {
+        None
     };
 
     let hit = window
@@ -109,7 +127,15 @@ fn update_highlight(
         .and_then(|w| w.cursor_position())
         .zip(cam.single().ok())
         .and_then(|(cursor, (camera, cam_gtf))| camera.viewport_to_world(cam_gtf, cursor).ok())
-        .and_then(|ray| voxel_world.raycast(ray, &|(_p, _v)| true));
+        .and_then(|ray| {
+            voxel_world.raycast(ray, &|(coords, voxel)| match voxel {
+                WorldVoxel::Solid(m) => match xray {
+                    Some(x) => !voxel_cut_by_xray(coords + Vec3::splat(0.5), m, &x),
+                    None => true,
+                },
+                _ => false,
+            })
+        });
 
     match hit {
         Some(hit) => {

@@ -14,16 +14,10 @@ use bevy_voxel_world::rendering::VoxelWorldMaterialHandle;
 
 use inf3d_camera::IsoCamera;
 use inf3d_core::{FollowTarget, GameSet};
-use inf3d_world::terrain_material::TerrainMaterial;
-
-/// World-space radius (in blocks) of the cutaway shaft along the camera→player line.
-/// A built voxel whose center is within this distance of that line (and in front of
-/// the player) is removed. ≈ player half-width + a margin; the main knob for how many
-/// blocks open up — smaller = tighter, larger = wider.
-const CUT_RADIUS: f32 = 0.95;
-/// Half the player's height (world units), so the cutaway covers head-to-foot
-/// occluders, not just the body center.
-const PLAYER_HALF_HEIGHT: f32 = 1.1;
+use inf3d_world::terrain_material::{
+    TerrainMaterial, XRAY_CEILING_RADIUS, XRAY_CUT_RADIUS, XRAY_HEAD_CLEARANCE,
+    XRAY_PLAYER_HALF_HEIGHT,
+};
 
 pub struct XrayPlugin;
 
@@ -83,6 +77,11 @@ fn update_xray_uniform(
     let forward = *cam_gtf.forward(); // Dir3 derefs to the unit Vec3 view direction
 
     mat.extension.xray.player = player_center.extend(enabled);
-    mat.extension.xray.view = forward.extend(CUT_RADIUS);
-    mat.extension.xray.extra = Vec4::new(PLAYER_HALF_HEIGHT, 0.0, 0.0, 0.0);
+    mat.extension.xray.view = forward.extend(XRAY_CUT_RADIUS);
+    mat.extension.xray.extra = Vec4::new(
+        XRAY_PLAYER_HALF_HEIGHT,
+        XRAY_CEILING_RADIUS,
+        XRAY_HEAD_CLEARANCE,
+        0.0,
+    );
 }

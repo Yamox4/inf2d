@@ -26,10 +26,13 @@ var<uniform> xray: XrayParams;
 // alone classifies a fragment as build-vs-terrain.
 const BUILT_MATERIAL_BASE: u32 = 10u;
 
-// Whether this fragment's VOXEL should be cut for the cutaway: a player build that
-// sits BETWEEN the camera and the player's body. Snaps to the voxel center so the
-// whole block decides together (blocky), and measures distance to the player's whole
-// vertical extent so blocks occluding the head/feet are cut too, not just the chest.
+// Whether this fragment's VOXEL should be cut for the cutaway. Two rules (OR):
+//   (1) Cylinder — a player build sitting between the camera and the player's body
+//       (front-wall occluders), measured against the player's whole vertical segment.
+//   (2) Ceiling — a player build directly above the player within a horizontal radius,
+//       so a roof over your head opens up too.
+// Snaps to the voxel center so the whole block decides together (blocky). MUST stay in
+// sync with `inf3d_world::voxel_cut_by_xray` (the CPU copy the click raycasts use).
 fn xray_should_discard(world_position: vec3<f32>, world_normal: vec3<f32>, material: u32) -> bool {
     if xray.player.w <= 0.5 || material < BUILT_MATERIAL_BASE {
         return false;
@@ -38,6 +41,8 @@ fn xray_should_discard(world_position: vec3<f32>, world_normal: vec3<f32>, mater
     let v = xray.view.xyz;       // camera forward (into the scene)
     let radius = xray.view.w;
     let half_h = xray.extra.x;
+    let ceiling_radius = xray.extra.y;
+    let head_clearance = xray.extra.z;
 
     // One decision per voxel: test the block's CENTER so every fragment of it agrees.
     // Faces sit ON voxel boundaries, so step half a unit back along the (outward)
@@ -46,22 +51,26 @@ fn xray_should_discard(world_position: vec3<f32>, world_normal: vec3<f32>, mater
     let center = floor(world_position - world_normal * 0.5) + vec3<f32>(0.5, 0.5, 0.5);
     let dc = center - p;
 
-    // Distance along the view direction. A voxel toward the camera (occluding the
-    // player) lies in the -v direction → dot < 0. Require it to be clearly in front,
-    // so the player's own cell and everything behind the player stay solid.
+    // (1) Cylinder along the camera→player line. A voxel toward the camera (occluding
+    // the player) lies in the -v direction → along < 0. Require it clearly in front so
+    // the player's own cell and everything behind the player stay solid. `dc.y > -half_h`
+    // skips blocks below the feet (floors), so a built floor in front never holes.
     let along = dot(dc, v);
-    if along > -0.1 {
-        return false;
+    if along < -0.1 && dc.y > -half_h {
+        let dc_perp = dc - along * v;
+        let up = vec3<f32>(0.0, 1.0, 0.0);
+        let up_perp = up - dot(up, v) * v;
+        let up_len2 = max(dot(up_perp, up_perp), 1e-4);
+        let s = clamp(dot(dc_perp, up_perp) / up_len2, -half_h, half_h);
+        if length(dc_perp - s * up_perp) < radius {
+            return true;
+        }
     }
 
-    // Perpendicular (screen-plane) offset of the voxel from the player, then distance
-    // to the player's vertical segment projected into that plane.
-    let dc_perp = dc - along * v;
-    let up = vec3<f32>(0.0, 1.0, 0.0);
-    let up_perp = up - dot(up, v) * v;
-    let up_len2 = max(dot(up_perp, up_perp), 1e-4);
-    let s = clamp(dot(dc_perp, up_perp) / up_len2, -half_h, half_h);
-    let dist = length(dc_perp - s * up_perp);
+    // (2) Ceiling — blocks above the player within a horizontal radius (the roof).
+    if dc.y > head_clearance && length(vec2<f32>(dc.x, dc.z)) < ceiling_radius {
+        return true;
+    }
 
-    return dist < radius;
+    return false;
 }

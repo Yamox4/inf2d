@@ -15,10 +15,12 @@ use bevy::{
     window::PrimaryWindow,
 };
 use bevy_voxel_world::prelude::*;
+use bevy_voxel_world::rendering::VoxelWorldMaterialHandle;
 
 use inf3d_camera::IsoCamera;
 use inf3d_core::{BlockedCells, EditMode, GameSet, PathTarget};
 use inf3d_gameplay::{MovePath, Player};
+use inf3d_world::terrain_material::{voxel_cut_by_xray, TerrainMaterial};
 use inf3d_world::MainWorld;
 use inf3d_worldgen::Terrain;
 
@@ -117,6 +119,7 @@ struct PathSearchResult {
 
 /// On left click, raycast the cursor into the voxel world and queue an A*
 /// search. Pathfinding itself runs on a worker (see [`dispatch_path_task`]).
+#[allow(clippy::too_many_arguments)]
 fn handle_click(
     mouse: Res<ButtonInput<MouseButton>>,
     mode: Res<EditMode>,
@@ -125,6 +128,11 @@ fn handle_click(
     voxel_world: VoxelWorld<MainWorld>,
     query: Query<&Transform, With<Player>>,
     interactions: Query<&Interaction>,
+    // Read the live see-through cutaway so the click ray passes through the SAME
+    // voxels the shader removes — letting you click the interior floor through a cut
+    // roof/wall instead of landing on the roof.
+    xray_handle: Option<Res<VoxelWorldMaterialHandle<TerrainMaterial>>>,
+    xray_materials: Res<Assets<TerrainMaterial>>,
     mut requests: MessageWriter<PathRequest>,
 ) {
     // Click-to-move only in Walk mode; Build-mode clicks are the editor's.
@@ -149,7 +157,20 @@ fn handle_click(
         return;
     };
 
-    let Some(hit) = voxel_world.raycast(ray, &|(_p, _v)| true) else {
+    // Skip voxels the see-through cutaway currently removes, so the ray reaches the
+    // floor inside instead of stopping on the roof/front wall. `voxel_cut_by_xray`
+    // returns false when the cutaway is off, so this is a no-op then.
+    let xray = xray_handle
+        .as_ref()
+        .and_then(|h| xray_materials.get(&h.handle))
+        .map(|m| m.extension.xray);
+    let Some(hit) = voxel_world.raycast(ray, &|(coords, voxel)| match voxel {
+        WorldVoxel::Solid(m) => match xray {
+            Some(x) => !voxel_cut_by_xray(coords + Vec3::splat(0.5), m, &x),
+            None => true,
+        },
+        _ => false,
+    }) else {
         return;
     };
     let goal = IVec2::new(hit.position.x.floor() as i32, hit.position.z.floor() as i32);

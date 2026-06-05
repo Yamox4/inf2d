@@ -180,6 +180,65 @@ impl Default for XrayParams {
     }
 }
 
+// --- See-through cutaway tuning + CPU mirror (shared by the shader & click-raycasts) ---
+
+/// Cylinder radius (world units) of the cutaway around the camera→player line — the
+/// front-wall occluders. Fed to the shader via the xray uniform AND used by the click
+/// raycasts, so clicks pass through exactly the voxels that are visually cut. ONE
+/// source of truth for the whole effect's tuning.
+pub const XRAY_CUT_RADIUS: f32 = 1.4;
+/// Horizontal radius (world units) of the ceiling/roof cut: built blocks above the
+/// player within this distance are removed, so a roof over your head opens up too
+/// (not just the blocks on the camera→player line).
+pub const XRAY_CEILING_RADIUS: f32 = 2.6;
+/// How far above the player's body center (world units) a block must be to count as
+/// "ceiling", so walls at the player's own level aren't removed by the roof rule.
+pub const XRAY_HEAD_CLEARANCE: f32 = 0.3;
+/// Half the player's height (world units) — the cutaway covers head-to-foot occluders.
+pub const XRAY_PLAYER_HALF_HEIGHT: f32 = 1.1;
+
+/// CPU mirror of `terrain_xray.wgsl::xray_should_discard` (voxel-center form — `center`
+/// is the exact voxel center, so no normal is needed). Whether the built voxel at
+/// `center` is currently cut away by the see-through, given the live [`XrayParams`].
+/// The click raycasts call this so a click passes through exactly the voxels the shader
+/// removes (letting you click the interior floor through a cut roof/wall). Returns
+/// `false` when the cutaway is off (`player.w <= 0.5`) or the voxel isn't a player build.
+pub fn voxel_cut_by_xray(center: Vec3, material: u8, xray: &XrayParams) -> bool {
+    if xray.player.w <= 0.5 || (material as u32) < crate::BUILT_MATERIAL_BASE {
+        return false;
+    }
+    let p = xray.player.truncate();
+    let v = xray.view.truncate();
+    let radius = xray.view.w;
+    let half_h = xray.extra.x;
+    let ceiling_radius = xray.extra.y;
+    let head_clearance = xray.extra.z;
+
+    let dc = center - p;
+
+    // (1) Cylinder along the camera→player line — front-wall occluders. `dc.y > -half_h`
+    // skips blocks below the player's feet (those are floors, not occluders), so a
+    // built floor in front never gets a hole punched in it.
+    let along = dc.dot(v);
+    if along < -0.1 && dc.y > -half_h {
+        let dc_perp = dc - along * v;
+        let up = Vec3::Y;
+        let up_perp = up - up.dot(v) * v;
+        let up_len2 = up_perp.length_squared().max(1e-4);
+        let s = (dc_perp.dot(up_perp) / up_len2).clamp(-half_h, half_h);
+        if (dc_perp - s * up_perp).length() < radius {
+            return true;
+        }
+    }
+
+    // (2) Ceiling — blocks above the player within a horizontal radius (the roof).
+    if dc.y > head_clearance && Vec2::new(dc.x, dc.z).length() < ceiling_radius {
+        return true;
+    }
+
+    false
+}
+
 impl MaterialExtension for VoxelTerrainExtension {
     fn fragment_shader() -> ShaderRef {
         ShaderRef::Handle(TERRAIN_MATERIAL_SHADER_HANDLE)
