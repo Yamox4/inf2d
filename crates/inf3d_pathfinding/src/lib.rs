@@ -41,6 +41,32 @@ pub const MAX_GOAL_SNAP: i32 = 32;
 /// the surface above it.
 pub const LEVEL_TOLERANCE: i32 = 2;
 
+/// Weight (cells of XZ distance per voxel of height) on the height difference from
+/// the goal's level when choosing a best-effort target for an UNREACHABLE goal.
+/// Without it, a partial route ends at the reachable cell with the smallest XZ
+/// distance to the click — which for a click below/above a cliff is the cliff EDGE
+/// directly over the goal, so the player walks to the lip of a drop instead of
+/// down the stairs. Biasing toward cells at the goal's *level* makes the partial
+/// route follow the stairs to near the goal's height. Modest (XZ proximity still
+/// dominates) but enough to reject a same-XZ cliff edge. See [`best_effort_score`].
+pub const BEST_EFFORT_HEIGHT_WEIGHT: f32 = 1.5;
+
+/// Stuck-detection window (seconds): progress is measured over this long. Long
+/// enough to ignore the brief stall while an async search is in flight, short
+/// enough that a wedged player recovers within half a second. See
+/// [`repath_when_stuck`].
+pub const STUCK_WINDOW: f32 = 0.5;
+/// XZ world-units the player is expected to cover within [`STUCK_WINDOW`] while
+/// genuinely moving (`speed * window` ≈ `8 * 0.5 = 4`). Covering less than this
+/// while a route is still pending means they're wedged against geometry the
+/// controller blocks. Kept well below the moving expectation so slow-but-real
+/// progress (sliding along a wall) doesn't trip it.
+pub const STUCK_MIN_PROGRESS: f32 = 1.0;
+/// Automatic re-paths attempted for a stuck player before giving up and stopping
+/// them — so a route the controller cannot physically execute ends in a clean stop
+/// instead of an endless grind against the wall.
+pub const MAX_AUTO_REPATHS: u32 = 3;
+
 pub struct PathfindPlugin;
 
 impl Plugin for PathfindPlugin {
@@ -53,10 +79,16 @@ impl Plugin for PathfindPlugin {
             // set tags place input ahead of all logic globally (Input runs before
             // Logic), and `.chain()` preserves the exact per-frame data flow:
             // read click → dispatch → poll → consume.
+            .init_resource::<ActiveGoal>()
             .add_systems(Update, handle_click.in_set(GameSet::Input))
             .add_systems(
                 Update,
-                (dispatch_path_task, poll_path_task, consume_path_found)
+                (
+                    dispatch_path_task,
+                    poll_path_task,
+                    consume_path_found,
+                    repath_when_stuck,
+                )
                     .chain()
                     .in_set(GameSet::Logic),
             );
@@ -87,6 +119,20 @@ pub struct PathFound {
 /// abandons the previous search's result (it never reaches `consume_path_found`).
 #[derive(Resource, Default)]
 pub struct ActivePathTask(Option<Task<PathSearchResult>>);
+
+/// The destination (snapped goal cell + reference level) of the route the player
+/// is currently following, so a wedged player can be re-routed to the SAME place
+/// without another click (see [`repath_when_stuck`]). Set when a real route is
+/// published in [`poll_path_task`]; cleared on arrival or once the re-path budget
+/// is spent.
+#[derive(Resource, Default)]
+struct ActiveGoal(Option<ActiveGoalData>);
+
+#[derive(Clone, Copy)]
+struct ActiveGoalData {
+    goal: IVec2,
+    ref_y: i32,
+}
 
 /// Last A* timing for diagnostics (read by the HUD or inspector). Written each
 /// time a worker task finishes (whether it produced a path or hit the cap).
@@ -265,6 +311,7 @@ fn poll_path_task(
     mut path_found: MessageWriter<PathFound>,
     mut timing: ResMut<PathTiming>,
     mut target: ResMut<PathTarget>,
+    mut active_goal: ResMut<ActiveGoal>,
 ) {
     let Some(task) = active.0.as_mut() else {
         return;
@@ -294,6 +341,33 @@ fn poll_path_task(
         return;
     };
 
+    // DIAGNOSTIC: distinguish "reached the goal" from "best-effort partial" (the
+    // goal was unreachable and we routed as close as possible). Best-effort is the
+    // signature of "the guy walks somewhere and stops at a wall instead of taking
+    // the stairs" — so surface WHY it happened (start/goal/end stand heights tell
+    // apart too-tall steps, a wall with no detour, and a multi-level mismatch). The
+    // route still plays out; this only narrates the failure. `warn!` shows by default.
+    let start_cell = cells.first().copied().unwrap_or(result.goal);
+    let end_cell = cells.last().copied().unwrap_or(result.goal);
+    if end_cell != result.goal {
+        let h = |c: IVec2| result.terrain.surface_y_near(c.x, c.y, result.ref_y) + 1;
+        warn!(
+            "pathfinding: BEST-EFFORT only — goal {:?} (stand y={}, ref_y={}) UNREACHABLE \
+             by ≤1-voxel steps; routed from {:?} (y={}) to {:?} (y={}) over {} cells, {} \
+             expansions. Likely: steps taller than 1 voxel, a wall/gap with no detour, or \
+             a multi-level column the search resolves at the clicked level.",
+            result.goal,
+            h(result.goal),
+            result.ref_y,
+            start_cell,
+            h(start_cell),
+            end_cell,
+            h(end_cell),
+            cells.len(),
+            result.expansions,
+        );
+    }
+
     // Skip the start cell (index 0): the player already stands there.
     let waypoints: Vec<Vec3> = cells
         .into_iter()
@@ -308,6 +382,12 @@ fn poll_path_task(
     // A real route exists: highlight the destination until the player arrives
     // (gameplay clears `PathTarget` once `MovePath` empties).
     target.0 = Some(result.goal);
+    // Remember WHERE we're going so `repath_when_stuck` can re-route a wedged
+    // player to the same destination without another click.
+    active_goal.0 = Some(ActiveGoalData {
+        goal: result.goal,
+        ref_y: result.ref_y,
+    });
 
     path_found.write(PathFound { waypoints });
 }
@@ -326,6 +406,93 @@ fn consume_path_found(
         return;
     };
     move_path.waypoints = latest.waypoints.iter().copied().collect();
+}
+
+/// Recover a player wedged against geometry the controller blocks but the route
+/// ran through — a convex corner, a prop whose collider over-reaches its blocked
+/// cell, or terrain that disagrees with the planner at the player's level. Without
+/// this, `follow_path` keeps steering at the unreachable waypoint and the player
+/// grinds the wall forever (the "perma-running into walls" bug).
+///
+/// Progress is measured over a [`STUCK_WINDOW`]: if the player covered less than
+/// [`STUCK_MIN_PROGRESS`] of XZ distance while a route is still pending (and no
+/// async search is already running), they're stuck. We then re-path to the SAME
+/// destination from the current cell; after [`MAX_AUTO_REPATHS`] attempts fail to
+/// free them we stop the player cleanly (clear the route) instead of grinding on.
+/// Runs after `consume_path_found` so it sees the freshest `MovePath`.
+fn repath_when_stuck(
+    time: Res<Time>,
+    active: Res<ActivePathTask>,
+    mut goal: ResMut<ActiveGoal>,
+    mut target: ResMut<PathTarget>,
+    mut requests: MessageWriter<PathRequest>,
+    mut query: Query<(&Transform, &mut MovePath), With<Player>>,
+    mut anchor: Local<Option<Vec3>>,
+    mut window_t: Local<f32>,
+    mut repaths: Local<u32>,
+) {
+    let Ok((transform, mut move_path)) = query.single_mut() else {
+        return;
+    };
+
+    // Not following a route: reset bookkeeping and drop any stale goal so a new
+    // click starts fresh. (Goal is only cleared once the route is actually empty —
+    // a momentary empty `MovePath` between re-path request and result keeps it.)
+    if move_path.waypoints.is_empty() || goal.0.is_none() {
+        *anchor = None;
+        *window_t = 0.0;
+        *repaths = 0;
+        if move_path.waypoints.is_empty() {
+            goal.0 = None;
+        }
+        return;
+    }
+
+    let here = transform.translation;
+    let start_pos = *anchor.get_or_insert(here);
+    *window_t += time.delta_secs();
+    if *window_t < STUCK_WINDOW {
+        return; // accumulate a full window before judging progress
+    }
+
+    // Window elapsed — measure progress and restart the window from here.
+    let moved = Vec2::new(here.x - start_pos.x, here.z - start_pos.z).length();
+    *window_t = 0.0;
+    *anchor = Some(here);
+
+    if moved >= STUCK_MIN_PROGRESS {
+        *repaths = 0; // genuine progress — reset the retry budget
+        return;
+    }
+    // Wedged. Let an in-flight search finish before issuing another.
+    if active.0.is_some() {
+        return;
+    }
+    let Some(g) = goal.0 else {
+        return;
+    };
+
+    if *repaths >= MAX_AUTO_REPATHS {
+        // The route can't be physically executed from here — stop cleanly rather
+        // than grind the wall. A fresh click starts a new route.
+        move_path.waypoints.clear();
+        goal.0 = None;
+        target.0 = None;
+        *repaths = 0;
+        info!("pathfinding: player stuck — gave up after {MAX_AUTO_REPATHS} re-paths");
+        return;
+    }
+    *repaths += 1;
+    let start = IVec2::new(here.x.floor() as i32, here.z.floor() as i32);
+    requests.write(PathRequest {
+        start,
+        goal: g.goal,
+        ref_y: g.ref_y,
+    });
+    info!(
+        "pathfinding: player stuck — re-pathing ({}/{}) to {:?}",
+        *repaths, MAX_AUTO_REPATHS, g.goal
+    );
 }
 
 /// Total-orderable wrapper around an A* f-score. `f32` is only `PartialOrd`, so
@@ -370,6 +537,16 @@ fn octile(a: IVec2, b: IVec2) -> f32 {
     let dz = (a.y - b.y).abs() as f32;
     let (lo, hi) = if dx < dz { (dx, dz) } else { (dz, dx) };
     (std::f32::consts::SQRT_2 - 1.0) * lo + hi
+}
+
+/// Score for choosing a best-effort target when the goal is unreachable: XZ octile
+/// distance to the goal plus [`BEST_EFFORT_HEIGHT_WEIGHT`] per voxel of height
+/// difference from the goal's level. Taking the minimum makes a partial route end
+/// NEAR the goal's height (the foot of the stairs) rather than at a same-XZ cliff
+/// edge far above/below it — the "it jumps off the ledge instead of taking the
+/// stairs" fix. Pure (no oracle) so it can be unit-tested directly.
+fn best_effort_score(cell: IVec2, goal: IVec2, cell_surf: i32, goal_surf: i32) -> f32 {
+    octile(cell, goal) + BEST_EFFORT_HEIGHT_WEIGHT * (cell_surf - goal_surf).abs() as f32
 }
 
 /// Abstraction the A* solver uses to query the world. Implemented for the
@@ -539,23 +716,20 @@ fn astar<O: SurfaceOracle>(
     let mut expansions = 0usize;
 
     // Best-effort target: the reachable cell that ends up closest to the goal.
-    // If the goal itself can't be reached (e.g. a tunnel too small to enter), we
-    // route here instead so a click always walks the player as close as possible
-    // — stopping at the entrance rather than going nowhere.
+    // If the goal itself can't be reached (e.g. a tunnel too small to enter, or
+    // the far side of a cliff), we route here instead so a click always walks the
+    // player as close as possible. "Closest" is scored by XZ distance AND height
+    // proximity to the goal's level (see [`best_effort_score`]) so the partial
+    // route ends at the foot of the stairs, not the cliff edge over the goal.
+    let goal_surf = terrain.surface_y(goal.x, goal.y);
     let mut best = start;
-    let mut best_h = octile(start, goal);
+    let mut best_score =
+        best_effort_score(start, goal, terrain.surface_y(start.x, start.y), goal_surf);
 
     while let Some(Reverse((_, cx, cy))) = open.pop() {
         let current = IVec2::new(cx, cy);
         if current == goal {
             return (Some(reconstruct(&came_from, current)), expansions);
-        }
-
-        // `current` is reached; track it if it's the closest-to-goal so far.
-        let h = octile(current, goal);
-        if h < best_h {
-            best_h = h;
-            best = current;
         }
 
         expansions += 1;
@@ -565,6 +739,14 @@ fn astar<O: SurfaceOracle>(
 
         let current_g = *g_score.get(&current).unwrap_or(&f32::INFINITY);
         let h_current = terrain.surface_y(current.x, current.y);
+
+        // `current` is reached; keep it as the best-effort fallback if it scores
+        // closest to the goal so far (XZ distance + height-to-goal-level penalty).
+        let score = best_effort_score(current, goal, h_current, goal_surf);
+        if score < best_score {
+            best_score = score;
+            best = current;
+        }
 
         // Whether `cell` is a surface the capsule may stand on, reachable from
         // `current` in a single step: walkable land, not capsule-blocked, and
@@ -910,6 +1092,38 @@ mod tests {
         // Pure diagonal of length 3: cost = 3 * sqrt(2).
         let expected = 3.0 * std::f32::consts::SQRT_2;
         assert!((h - expected).abs() < 1e-6, "got {h}, want {expected}");
+    }
+
+    // The best-effort tie-break must prefer a cell at the GOAL'S LEVEL over a
+    // same-XZ cell on a cliff above/below it — the "walks to the cliff edge instead
+    // of the foot of the stairs" fix. Two candidates with identical XZ distance to
+    // the goal: one at the goal's height, one 5 voxels up. The goal-level one wins,
+    // and the gap is exactly the height penalty.
+    #[test]
+    fn best_effort_score_prefers_goal_level() {
+        let goal = IVec2::new(10, 0);
+        let goal_surf = 0;
+        let cell = IVec2::new(5, 0); // same coords for both candidates → equal octile
+        let at_goal_level = best_effort_score(cell, goal, 0, goal_surf);
+        let on_cliff = best_effort_score(cell, goal, 5, goal_surf);
+        assert!(
+            at_goal_level < on_cliff,
+            "goal-level cell must beat a same-XZ cliff edge: {at_goal_level} vs {on_cliff}"
+        );
+        let expected_gap = BEST_EFFORT_HEIGHT_WEIGHT * 5.0;
+        assert!(
+            (on_cliff - at_goal_level - expected_gap).abs() < 1e-6,
+            "the score gap must equal the height penalty"
+        );
+    }
+
+    // With no height difference the score collapses to pure octile distance, so
+    // reachable / same-level routing is scored exactly as before (no regression).
+    #[test]
+    fn best_effort_score_is_octile_at_goal_level() {
+        let goal = IVec2::new(7, 3);
+        let cell = IVec2::new(2, 1);
+        assert!((best_effort_score(cell, goal, 4, 4) - octile(cell, goal)).abs() < 1e-6);
     }
 
     #[test]

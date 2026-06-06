@@ -160,7 +160,18 @@ pub const STEP_HEIGHT: f32 = 1.1;
 /// Extra reach below the feet within which the ground still "grabs" the player
 /// (keeps the feet glued to the surface on downhill steps instead of briefly
 /// going airborne). A drop larger than this leaves the player airborne.
-pub const GROUND_SNAP_DISTANCE: f32 = 0.5;
+///
+/// Sized to **mirror the climb cap on the way DOWN**: it is just above one voxel
+/// (matching [`STEP_HEIGHT`] / pathfinding's `MAX_STEP = 1`) so a single 1-voxel
+/// step down — the most common descent, and every tread of a built staircase —
+/// stays grounded and *eases* down instead of flinging the player airborne for a
+/// frame. At `0.5` (the old value) a 1.0-voxel step sat OUTSIDE the snap band, so
+/// the controller went ballistic on every downward step: walking downhill or down
+/// stairs read as a constant series of little "jumps off ledges". A genuine ledge
+/// (a ≥2-voxel drop) is still beyond this and correctly goes airborne. Keeping the
+/// up cap ([`STEP_HEIGHT`]) and this down cap equal is what makes the locomotion
+/// able to execute, smoothly, exactly the ≤1-step routes the planner produces.
+pub const GROUND_SNAP_DISTANCE: f32 = 1.1;
 /// Distance the camera interaction ray travels before giving up.
 pub const INTERACT_RAY_LENGTH: f32 = 1000.0;
 /// How fast the feet ease onto the followed ground (per second). High = snappy
@@ -812,6 +823,48 @@ mod tests {
             new_y > surface + FOOT_OFFSET,
             "the descent eases (does not snap) in one step"
         );
+    }
+
+    // (f) REGRESSION (the "jumps off ledges" / downhill hopping bug): a normal
+    // 1-voxel step DOWN must stay grounded and ease down, NOT go airborne. With the
+    // old GROUND_SNAP_DISTANCE = 0.5 a 1.0-voxel drop sat outside the snap band, so
+    // every downward step flung the player ballistic for a frame — descending stairs
+    // / hills read as a constant series of little jumps. The snap band now mirrors
+    // the climb cap (≈1 voxel), so a single step down is glued to the surface.
+    #[test]
+    fn step_down_one_voxel_stays_grounded() {
+        let (feet, center) = resting_on(5.0);
+        let surface = 4.0; // exactly one voxel below the current surface
+        let (new_y, grounded, vv) = resolve_ground(feet, center, surface, FOOT_OFFSET, 0.0, DT);
+        assert!(
+            grounded,
+            "a 1-voxel step down must stay grounded, not go airborne (the hopping bug)"
+        );
+        assert_eq!(vv, 0.0, "a grounded step-down carries no falling velocity");
+        // Eased (not snapped) down toward the lower resting centre, strictly descending.
+        let target = surface + FOOT_OFFSET;
+        assert!(new_y < center, "the feet ease down onto the lower step");
+        assert!(
+            new_y > target,
+            "the descent eases (does not snap) in one step: {new_y} vs target {target}"
+        );
+    }
+
+    // (f2) BOUNDARY: a 2-voxel drop is a genuine ledge — beyond the (≈1-voxel) snap
+    // band — so it still goes airborne and falls. This pins GROUND_SNAP_DISTANCE
+    // between one voxel (grabbed, above) and two (released, here) so a future tweak
+    // can't silently start gluing the player to ledges they should fall off.
+    #[test]
+    fn step_down_two_voxels_goes_airborne() {
+        let (feet, center) = resting_on(5.0);
+        let surface = 3.0; // two voxels below — a real ledge
+        let (new_y, grounded, vv) = resolve_ground(feet, center, surface, FOOT_OFFSET, 0.0, DT);
+        assert!(
+            !grounded,
+            "a 2-voxel drop is a ledge and must go airborne, not stick"
+        );
+        assert!(vv < 0.0, "gravity pulls the velocity negative off the ledge");
+        assert!(new_y < center, "the player starts descending");
     }
 
     // --- footprint_surface: multi-cell support sampling ---

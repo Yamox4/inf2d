@@ -78,6 +78,13 @@ const STEP_SWING: f32 = 0.18; // fore/aft foot swing amplitude
 const STEP_LIFT: f32 = 0.12; // foot lift on the forward swing
 const ARM_SWING: f32 = 0.14; // hand fore/aft swing amplitude
 const FPS_SPRINT_MULT: f32 = 1.75;
+/// Radius (world units, XZ) within which a waypoint counts as reached and is
+/// popped. Must exceed the distance the player covers in one fixed physics step
+/// (`speed * fixed_dt` ≈ 8 / 64 ≈ 0.125) so a waypoint is caught on approach
+/// instead of being overshot and then orbited forever — the old 0.1 threshold sat
+/// *below* per-step travel at `speed = 8`, so the player could circle a waypoint
+/// it could never land exactly within. A quarter-voxel reads as a crisp arrival.
+const ARRIVE_RADIUS: f32 = 0.25;
 
 pub struct PlayerPlugin;
 
@@ -272,6 +279,21 @@ fn follow_path(
 
     player.cell = cell_of(transform.translation);
 
+    // Compare in the XZ plane only — the controller decides our height.
+    let here = Vec2::new(transform.translation.x, transform.translation.z);
+
+    // Pop every waypoint already reached this step. The arrival radius sits ABOVE
+    // the distance the player covers in one fixed step, so a waypoint is caught on
+    // approach instead of overshot and orbited (see [`ARRIVE_RADIUS`]). Draining in
+    // a loop also collapses any cluster of near-coincident waypoints in one step.
+    while move_path
+        .waypoints
+        .front()
+        .is_some_and(|wp| Vec2::new(wp.x, wp.z).distance(here) <= ARRIVE_RADIUS)
+    {
+        move_path.waypoints.pop_front();
+    }
+
     let Some(&waypoint) = move_path.waypoints.front() else {
         // Idle: no horizontal intent (controller keeps applying gravity/snap).
         desired.velocity = Vec3::ZERO;
@@ -284,26 +306,16 @@ fn follow_path(
         return;
     };
 
-    // Compare in the XZ plane only — the controller decides our height.
-    let here = Vec2::new(transform.translation.x, transform.translation.z);
-    let goal = Vec2::new(waypoint.x, waypoint.z);
-    let to_target = goal - here;
+    let to_target = Vec2::new(waypoint.x, waypoint.z) - here;
     let distance = to_target.length();
-
     if distance > 1e-4 {
         player.facing = to_target.x.atan2(to_target.y);
     }
-
-    // Arrival threshold scales with speed so we never overshoot in one frame.
-    if distance <= 0.1 {
-        move_path.waypoints.pop_front();
-        desired.velocity = Vec3::ZERO;
-        desired.jump = false;
-    } else {
-        let dir = to_target / distance;
-        desired.velocity = Vec3::new(dir.x * player.speed, 0.0, dir.y * player.speed);
-        desired.jump = false;
-    }
+    // Steer at the next waypoint at full speed; the controller resolves walls
+    // (axis-separated slide) and ground. Arrival popping above ends the route.
+    let dir = to_target / distance.max(1e-4);
+    desired.velocity = Vec3::new(dir.x * player.speed, 0.0, dir.y * player.speed);
+    desired.jump = false;
 }
 
 fn apply_fps_move(

@@ -146,9 +146,39 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
     floor through a cut roof/wall and walk in. All tuning consts in
     `inf3d_world::terrain_material` (one source for shader + raycasts).
   - [ ] **Next:** perf in dense areas (rd=10 + foliage is the dominant cost; the prepass
-    discard also disables terrain early-z); horizontal collision for placed voxels (you
-    can still walk through their sides); then harvesting (Tree/Rock/`InteractionTarget`
-    hooks exist), inventory/items, foliage wind.
+    discard also disables terrain early-z) — **deprioritized**, log shows 60fps steady, the
+    vertical-clamp structural win already shipped (`MainWorld::chunk_y_bounds`); horizontal
+    collision for placed voxels — **already done** via the controller's `is_wall` path
+    (2+ tall placed walls block; 1-tall is an intended climbable step); then harvesting
+    (Tree/Rock/`InteractionTarget` hooks exist), inventory/items, foliage wind.
+
+## Pathfinding AAA overhaul (current focus)
+The click-to-move pathfinding felt broken: jumped off ledges, perma-ran into walls, stuck
+on corners, and preferred dropping off a ledge to taking nearby stairs. Root causes were
+**planner ↔ locomotion disagreement** + a missing recovery loop. Fixes (all unit-tested;
+**user to build + repro**):
+- [~] **Smooth descents (the main "jumps off ledges" cause).** `GROUND_SNAP_DISTANCE`
+  was `0.5`, but a normal 1-voxel step DOWN drops support `1.0` below the feet → outside
+  the snap band → the controller went airborne on *every* downward step (downhill/stairs
+  read as constant hopping). Raised to `1.1` to **mirror the climb cap** (`STEP_HEIGHT` /
+  `MAX_STEP`): one voxel down now stays grounded + eases; a ≥2-voxel ledge still falls.
+  *File:* `inf3d_physics/src/lib.rs`. See [[pathfinding-traversability-invariant]].
+- [~] **Stuck-detection → re-path (the "perma-running into walls" cause).** `follow_path`
+  steered at the front waypoint forever with no recovery. Added `ActiveGoal` + the
+  `repath_when_stuck` system: no XZ progress over a `STUCK_WINDOW` while a route is pending
+  → re-path to the same goal; after `MAX_AUTO_REPATHS` give up and stop cleanly (no grind).
+  *File:* `inf3d_pathfinding/src/lib.rs`.
+- [~] **Height-aware best-effort (the "jumps down instead of stairs" cause).** Unreachable-
+  goal partial routes used XZ-only octile → ended at the cliff EDGE over the goal. Now
+  scored by `best_effort_score` (XZ + height-to-goal-level penalty) so a partial route ends
+  at the foot of the stairs. *File:* `inf3d_pathfinding/src/lib.rs`.
+- [~] **Arrival radius (corner orbit).** `follow_path` popped waypoints at `0.1`, below
+  per-step travel (`speed*dt ≈ 0.125`) → could orbit a point forever. Raised to
+  `ARRIVE_RADIUS = 0.25` + drain-all-reached loop. *File:* `inf3d_gameplay/src/lib.rs`.
+- [ ] **Possible follow-up:** terrain-wall clearance — the planner routes on cell centres
+  while the controller uses the 0.45-radius capsule, so it can *rub* a convex wall corner
+  (re-path/give-up catches the worst case). A radius-inflated terrain-wall cost would tighten
+  it, but risks over-constraining the 1-wide corridors `WALL_SKIN` deliberately enables.
 
 ---
 
