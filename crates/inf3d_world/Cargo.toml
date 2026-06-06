@@ -11,5 +11,4 @@ bevy = { workspace = true }
 bevy_voxel_world = { workspace = true }
 noise = { workspace = true }
 inf3d_core = { workspace = true }
-inf3d_city = { workspace = true }
 inf3d_worldgen = { workspace = true }

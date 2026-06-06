@@ -77,7 +77,10 @@ impl Plugin for AudioPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, load_audio)
             // Presentation: react to gameplay events at the end of the frame.
-            .add_systems(Update, (play_footsteps, play_block_edits).in_set(GameSet::Fx));
+            .add_systems(
+                Update,
+                (play_footsteps, play_block_edits).in_set(GameSet::Fx),
+            );
     }
 }
 

@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/inf3d_core",
-    "crates/inf3d_city",
     "crates/inf3d_worldgen",
     "crates/inf3d_world",
     "crates/inf3d_camera",
@@ -92,7 +91,6 @@ bincode = { version = "2", features = ["serde"] }
 ron = "0.12"
 
 inf3d_core = { path = "crates/inf3d_core" }
-inf3d_city = { path = "crates/inf3d_city" }
 inf3d_worldgen = { path = "crates/inf3d_worldgen" }
 inf3d_world = { path = "crates/inf3d_world" }
 inf3d_camera = { path = "crates/inf3d_camera" }

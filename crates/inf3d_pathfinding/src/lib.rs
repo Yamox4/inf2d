@@ -18,7 +18,7 @@ use bevy_voxel_world::prelude::*;
 use bevy_voxel_world::rendering::VoxelWorldMaterialHandle;
 
 use inf3d_camera::IsoCamera;
-use inf3d_core::{BlockedCells, EditMode, GameSet, PathTarget};
+use inf3d_core::{BlockedCells, EditMode, GameSet, PathTarget, PropSurfaces};
 use inf3d_gameplay::{MovePath, Player};
 use inf3d_world::terrain_material::{voxel_cut_by_xray, TerrainMaterial};
 use inf3d_world::MainWorld;
@@ -197,6 +197,7 @@ fn dispatch_path_task(
     mut requests: MessageReader<PathRequest>,
     terrain: Res<Terrain>,
     blocked: Res<BlockedCells>,
+    props: Res<PropSurfaces>,
     mut active: ResMut<ActivePathTask>,
 ) {
     // Coalesce: only the newest request in the queue matters — older ones are
@@ -211,6 +212,13 @@ fn dispatch_path_task(
     // treat them as impassable. The resident set is bounded by the foliage ring,
     // so this clone is small.
     let blocked_snapshot: HashSet<IVec2> = blocked.iter().collect();
+    // Snapshot the SHORT-prop cells too. Unlike `BlockedCells`, these are NOT
+    // obstacles — a low rock is something the player walks ONTO as a 1-voxel
+    // step. The worker folds this into its surface oracle (see `LeveledTerrain`)
+    // so each such cell reads one voxel higher, making A* treat it as a passable
+    // step rather than detouring around it. Bounded by the foliage ring, so the
+    // clone is small.
+    let prop_cells: HashSet<IVec2> = props.iter().collect();
     let ref_y = req.ref_y;
     let pool = AsyncComputeTaskPool::get();
     let task = pool.spawn(async move {
@@ -222,6 +230,7 @@ fn dispatch_path_task(
         let leveled = LeveledTerrain {
             terrain: terrain_snapshot.clone(),
             ref_y,
+            prop_cells,
         };
         // Snap the goal to the nearest walkable, unblocked cell so clicking a
         // tree/rock walks to a reachable spot beside it and clicking water walks
@@ -391,21 +400,48 @@ impl SurfaceOracle for Terrain {
 /// level (`ref_y`), so the A* search follows the player's current height into
 /// tunnels / built structures rather than always taking the topmost voxel.
 /// Unedited columns ignore `ref_y`, so normal-terrain navigation is unchanged.
+///
+/// It also folds in the SHORT-prop surfaces (`prop_cells`): a low rock the player
+/// should walk ONTO reads as the terrain surface **+1 voxel** here, so A* sees it
+/// as a single climbable step (Δheight 1 ≤ [`MAX_STEP`]) rather than an obstacle.
+/// Short props are deliberately kept OUT of the `blocked` set for exactly this
+/// reason — the height fold, not a detour, is what carries the player over them.
 struct LeveledTerrain {
     terrain: Terrain,
     ref_y: i32,
+    /// Cells carrying a walkable short prop (a +1 step). Snapshotted from
+    /// [`PropSurfaces`] on the main thread so the worker touches no ECS.
+    prop_cells: HashSet<IVec2>,
 }
 
 impl SurfaceOracle for LeveledTerrain {
     fn surface_y(&self, x: i32, z: i32) -> i32 {
+        // Fold the short-prop step into the surface: a cell carrying a low rock
+        // reads one voxel higher, so A* sees walking onto it as a +1 step (within
+        // MAX_STEP) instead of a detour-worthy obstacle. Plain terrain is +0.
         self.terrain.surface_y_near(x, z, self.ref_y)
+            + if self.prop_cells.contains(&IVec2::new(x, z)) {
+                1
+            } else {
+                0
+            }
     }
     fn is_land(&self, x: i32, z: i32) -> bool {
+        // Short props sit ON land, so land-ness is unchanged by the prop fold.
         self.terrain.is_land(x, z)
     }
     fn near_target_level(&self, x: i32, z: i32) -> bool {
-        // Stand height of the resolved floor (`surface_y + 1`) vs the clicked level.
-        (self.terrain.surface_y_near(x, z, self.ref_y) + 1 - self.ref_y).abs() <= LEVEL_TOLERANCE
+        // Stand height of the resolved floor (`surface_y + 1`) vs the clicked
+        // level. Apply the SAME short-prop fold as `surface_y` so a goal clicked
+        // on top of a low rock resolves at the prop's (raised) level — keeping
+        // goal snapping consistent with the height A* actually routes at.
+        let prop = if self.prop_cells.contains(&IVec2::new(x, z)) {
+            1
+        } else {
+            0
+        };
+        (self.terrain.surface_y_near(x, z, self.ref_y) + prop + 1 - self.ref_y).abs()
+            <= LEVEL_TOLERANCE
     }
 }
 
@@ -816,6 +852,34 @@ mod tests {
         }
     }
 
+    /// Flat land with a SINGLE raised cell, modelling the prop-surface fold the
+    /// leveled oracle applies: `(bump_x, bump_z)` stands `bump` voxels above the
+    /// otherwise-flat `base`. With `bump == 1` it mirrors a short prop (a +1 step
+    /// the player walks ONTO); with `bump == 2` it is a tall obstacle no single
+    /// step can climb (Δheight 2 > MAX_STEP). This is exactly the height
+    /// `LeveledTerrain::surface_y` produces for a `prop_cells` member, so routing
+    /// over this fixture validates the fold without spinning up the worldgen
+    /// noise. All cells are land (props sit on land).
+    struct PropStepLand {
+        bump_x: i32,
+        bump_z: i32,
+        base: i32,
+        bump: i32,
+    }
+
+    impl SurfaceOracle for PropStepLand {
+        fn surface_y(&self, x: i32, z: i32) -> i32 {
+            if x == self.bump_x && z == self.bump_z {
+                self.base + self.bump
+            } else {
+                self.base
+            }
+        }
+        fn is_land(&self, _x: i32, _z: i32) -> bool {
+            true
+        }
+    }
+
     /// Tiny enclosed pocket: only `(0,0)` is land. Any goal is unreachable.
     struct Island;
 
@@ -971,6 +1035,86 @@ mod tests {
             "expected detour, got direct path: {:?}",
             path
         );
+    }
+
+    /// A sealed one-cell-wide corridor straight down z=0 from `(0,0)` to `(4,0)`,
+    /// with `(2,0)` raised by `bump` voxels. Blocking z=±1 across the whole span
+    /// removes every sideways escape, so the bump is the SOLE gateway between the
+    /// start and goal halves. This isolates the height rule: the route can only
+    /// reach the goal if it can step onto `(2,0)` — true for a walkable +1 prop
+    /// step, false for an unclimbable +2 obstacle. Returns the search result for
+    /// `bump`-high middle cell over that corridor.
+    fn corridor_over_bump(bump: i32) -> (Option<Vec<IVec2>>, IVec2, IVec2, IVec2) {
+        let mid = IVec2::new(2, 0);
+        let terrain = PropStepLand {
+            bump_x: mid.x,
+            bump_z: mid.y,
+            base: 5,
+            bump,
+        };
+        // Wall off both sides of the corridor so there is no flanking detour.
+        let mut blocked = HashSet::new();
+        for x in 0..=4 {
+            blocked.insert(IVec2::new(x, 1));
+            blocked.insert(IVec2::new(x, -1));
+        }
+        let start = IVec2::new(0, 0);
+        let goal = IVec2::new(4, 0);
+        let (path, _expansions) = astar(&terrain, start, goal, &blocked);
+        (path, start, goal, mid)
+    }
+
+    #[test]
+    fn astar_steps_onto_a_short_prop_cell() {
+        // A single +1 cell — exactly what `LeveledTerrain::surface_y` produces for
+        // a short prop (terrain + 1) — sits in a sealed one-cell corridor as the
+        // only gateway to the goal. Because Δheight 1 ≤ MAX_STEP the cell is a
+        // walkable STEP, so the route must reach the goal by stepping THROUGH it.
+        // (Short props are intentionally absent from `blocked`, so nothing else
+        // could make A* avoid the cell; only a height delta over MAX_STEP would —
+        // which +1 does not.)
+        let (path, start, goal, mid) = corridor_over_bump(1);
+        let path = path.expect("a +1 step is walkable, so the corridor goal is reachable");
+        assert_eq!(path.first().copied(), Some(start));
+        assert_eq!(path.last().copied(), Some(goal));
+        // With both flanks sealed, the straight z=0 run (4 steps + start) is the
+        // only route, and it walks ONTO the raised prop cell rather than past it.
+        assert_eq!(
+            path.len(),
+            5,
+            "sealed corridor should force the straight 5-cell run: {path:?}"
+        );
+        assert!(
+            path.contains(&mid),
+            "route did not step onto the short-prop cell: {path:?}"
+        );
+    }
+
+    #[test]
+    fn astar_does_not_step_onto_a_tall_obstacle() {
+        // The SAME sealed corridor but with a +2 middle cell: now Δheight 2 >
+        // MAX_STEP, so the cell is an unclimbable obstacle, not a walkable step.
+        // It is the only gateway and the flanks are walled, so the goal is now
+        // UNREACHABLE — and whatever best-effort partial route A* returns must
+        // never set foot on the +2 cell. This is the conjugate of
+        // `astar_steps_onto_a_short_prop_cell`: a +1 fold is walked over, a +2 is
+        // refused — confirming the prop fold only ever adds a passable +1 step,
+        // while taller cells stay obstacles the existing MAX_STEP clearance bars.
+        let (path, _start, goal, mid) = corridor_over_bump(2);
+        // The bump is the sole gateway and it is too tall to climb, so the goal
+        // cannot be reached. Either no route at all, or a best-effort partial that
+        // stops on the near side — never reaching the goal, never on the +2 cell.
+        if let Some(path) = path {
+            assert_ne!(
+                path.last().copied(),
+                Some(goal),
+                "reached the goal only by climbing an unclimbable +2 cell: {path:?}"
+            );
+            assert!(
+                !path.contains(&mid),
+                "route stepped onto an unclimbable +2 obstacle: {path:?}"
+            );
+        }
     }
 
     #[test]

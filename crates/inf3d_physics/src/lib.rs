@@ -167,6 +167,27 @@ pub const INTERACT_RAY_LENGTH: f32 = 1000.0;
 /// but soft; lower = floatier. Smooths step-ups so climbing a voxel eases up
 /// instead of snapping in one frame (which read as a hard jolt).
 pub const GROUND_FOLLOW_RATE: f32 = 14.0;
+/// Collision "skin": how far the capsule's horizontal half-width is inset when
+/// testing terrain / placed-block walls. The visual + avian capsule stays a full
+/// voxel wide (`2 * PLAYER_RADIUS`); only the analytic wall test uses the inset.
+///
+/// Both the "phase through a wall's side" and the "can't walk a 2×1 corridor"
+/// bugs trace to using the exact `PLAYER_RADIUS` (0.5) here. A capsule centred in
+/// a cell (which the pathfinder always aims for — waypoints are cell centres) has
+/// its edge land *exactly* on the neighbour cell boundary, and `floor()` then:
+/// (a) reports the body as spanning TWO cells, so a 1-wide gap reads as blocked
+/// even though a 1-wide body fits; and (b) places the leading edge already inside
+/// the wall cell at the *start* of a step, so the `new_edge != old_edge` crossing
+/// test never fires and the player slides into the wall face. Insetting by a small
+/// skin fixes both: a centred body occupies exactly its own cell, and a wall
+/// crossing is detected at the face. Kept tiny so the body still stops flush
+/// against walls (≈5 cm of give).
+pub const WALL_SKIN: f32 = 0.05;
+/// Effective horizontal half-width for terrain / placed-block wall tests: the
+/// capsule radius inset by [`WALL_SKIN`] (see there for the why). Used only by the
+/// analytic wall math — vertical ground support still samples the full
+/// [`PLAYER_RADIUS`] footprint so standing is never narrowed.
+pub const WALL_HALF_WIDTH: f32 = PLAYER_RADIUS - WALL_SKIN;
 
 pub struct PhysicsGamePlugin;
 
@@ -253,6 +274,13 @@ fn build_prop_colliders(
 fn player_controller(
     time: Res<Time>,
     terrain: Res<Terrain>,
+    // Short props (low rocks) carry NO physics collider, so the analytic ground is
+    // the only thing that can put the player on top of one. `PropSurfaces::step`
+    // contributes a +1 voxel rise on a cell occupied by a short prop; folded into
+    // the effective walkable surface below it reads as a single climbable step (its
+    // top is `terrain_top + 1`, ≤ `feet + STEP_HEIGHT` from adjacent flat ground, so
+    // it's climbed — not flagged a wall).
+    props: Res<inf3d_core::PropSurfaces>,
     move_and_slide: MoveAndSlide,
     mut q: Query<(
         Entity,
@@ -292,14 +320,21 @@ fn player_controller(
         // columns are never walls here.
         let wall_cap = feet_y + STEP_HEIGHT;
         // Whether terrain cell `(cx, cz)` is a WALL: dry land whose top face is above
-        // the step cap (a 2-high wall blocks; a 1-voxel rise stays walkable).
+        // the step cap (a 2-high wall blocks; a 1-voxel rise stays walkable). The
+        // surface is the EFFECTIVE walkable height — terrain plus any short-prop step
+        // — so a low rock adds +1 and its top (`terrain_top + 1`) stays ≤ the step cap
+        // for a player on adjacent flat ground: it reads as a climbable step, NOT a
+        // wall (a real 2-high terrain wall is still above the cap and blocks).
         let is_wall = |cx: i32, cz: i32| {
             terrain.is_land(cx, cz)
-                && (terrain.surface_y_near(cx, cz, ref_y) as f32 + 1.0) > wall_cap
+                && (terrain.surface_y_near(cx, cz, ref_y) + props.step(IVec2::new(cx, cz))) as f32
+                    + 1.0
+                    > wall_cap
         };
-        // Integer cell range the capsule (radius `PLAYER_RADIUS`) spans about `v`.
-        let cell_span =
-            |v: f32| ((v - PLAYER_RADIUS).floor() as i32, (v + PLAYER_RADIUS).floor() as i32);
+        // Integer cell range the capsule spans about `v`, using the inset
+        // `WALL_HALF_WIDTH` so a body centred in a cell occupies exactly that cell
+        // (1-wide corridors stay passable; see `WALL_SKIN`).
+        let cell_span = |v: f32| cells_spanned(v, WALL_HALF_WIDTH);
 
         // --- HORIZONTAL: blocked by solid props (move_and_slide) AND by terrain
         // walls taller than the step cap. Without the terrain block the player walks
@@ -329,12 +364,13 @@ fn player_controller(
         }
         // Block each axis when the capsule's LEADING EDGE crosses into a wall cell
         // that wasn't a wall at the old edge — so the body stops at the wall FACE
-        // (no penetration, even at the full 1-voxel-wide hitbox) yet still slides
-        // along a wall it's already beside.
+        // (the edge uses the inset `WALL_HALF_WIDTH`, so a centred body stops flush
+        // with ≈`WALL_SKIN` of give and a 1-wide corridor stays passable) yet still
+        // slides along a wall it's already beside.
         let dx = new_pos.x - old_xz.x;
         if dx.abs() > 1e-6 {
-            let new_edge = (new_pos.x + PLAYER_RADIUS * dx.signum()).floor() as i32;
-            let old_edge = (old_xz.x + PLAYER_RADIUS * dx.signum()).floor() as i32;
+            let new_edge = leading_cell(new_pos.x, WALL_HALF_WIDTH, dx.signum());
+            let old_edge = leading_cell(old_xz.x, WALL_HALF_WIDTH, dx.signum());
             let (z0, z1) = cell_span(old_xz.z);
             let into_wall = new_edge != old_edge
                 && (z0..=z1).any(|cz| is_wall(new_edge, cz))
@@ -345,8 +381,8 @@ fn player_controller(
         }
         let dz = new_pos.z - old_xz.z;
         if dz.abs() > 1e-6 {
-            let new_edge = (new_pos.z + PLAYER_RADIUS * dz.signum()).floor() as i32;
-            let old_edge = (old_xz.z + PLAYER_RADIUS * dz.signum()).floor() as i32;
+            let new_edge = leading_cell(new_pos.z, WALL_HALF_WIDTH, dz.signum());
+            let old_edge = leading_cell(old_xz.z, WALL_HALF_WIDTH, dz.signum());
             let (x0, x1) = cell_span(new_pos.x);
             let into_wall = new_edge != old_edge
                 && (x0..=x1).any(|cx| is_wall(cx, new_edge))
@@ -368,7 +404,11 @@ fn player_controller(
             PLAYER_RADIUS,
             feet_y,
             feet_y + STEP_HEIGHT,
-            |cx, cz| terrain.surface_y_near(cx, cz, ref_y),
+            // EFFECTIVE walkable surface: terrain height plus any short-prop step on
+            // the cell, so the feet rest on the prop's top (terrain_top + 1) when the
+            // player stands over a low rock. `is_land` stays terrain-only — short props
+            // only ever sit on land, so they never gate standability themselves.
+            |cx, cz| terrain.surface_y_near(cx, cz, ref_y) + props.step(IVec2::new(cx, cz)),
             |cx, cz| terrain.is_land(cx, cz),
         );
 
@@ -390,6 +430,29 @@ fn player_controller(
             cc.vertical_velocity = new_vv;
         }
     }
+}
+
+/// Inclusive integer cell range `[lo, hi]` an axis-aligned span of half-width
+/// `half` about `center` touches — the cells under the capsule to test for walls.
+/// With the inset [`WALL_HALF_WIDTH`] a capsule centred in a cell spans exactly
+/// that one cell, so a 1-wide corridor is passable; with the full [`PLAYER_RADIUS`]
+/// a centred body straddles into the neighbour cell (the corridor-blocking bug).
+fn cells_spanned(center: f32, half: f32) -> (i32, i32) {
+    (
+        (center - half).floor() as i32,
+        (center + half).floor() as i32,
+    )
+}
+
+/// Integer cell index the capsule's **leading edge** lies in when moving along an
+/// axis: `center` pushed out by `half` in the travel direction (`dir_sign` is
+/// `±1`). The controller blocks a step when this index crosses from a non-wall
+/// cell into a wall cell. With the inset [`WALL_HALF_WIDTH`] a centred body's
+/// leading edge stays inside its own cell, so the crossing into an adjacent wall
+/// is actually detected; the full [`PLAYER_RADIUS`] would start it on the boundary
+/// (already "in" the wall cell) and miss the crossing (the wall-phasing bug).
+fn leading_cell(center: f32, half: f32, dir_sign: f32) -> i32 {
+    (center + half * dir_sign).floor() as i32
 }
 
 /// Sample the analytic terrain top face under the capsule footprint and return
@@ -588,6 +651,84 @@ mod tests {
         (center - FOOT_OFFSET, center)
     }
 
+    // --- horizontal wall math: the 2×1 corridor + wall-phasing fix (WALL_SKIN) ---
+
+    // REGRESSION (can't walk a 2×1 corridor): a capsule centred in a cell must
+    // span exactly that one cell with the inset half-width, so the perpendicular
+    // wall test never sees the flanking wall of a 1-wide corridor. The full radius
+    // straddles into the neighbour — the bug that made a 1-wide corridor read as
+    // blocked even though a 1-wide body fits.
+    #[test]
+    fn centred_capsule_spans_single_cell_with_skin() {
+        // Centre of cell 5 is x = 5.5.
+        assert_eq!(
+            cells_spanned(5.5, WALL_HALF_WIDTH),
+            (5, 5),
+            "a centred body must occupy exactly its own cell (corridor passable)"
+        );
+        // The unfixed full-radius span straddles into cell 6 — the corridor block.
+        assert_eq!(
+            cells_spanned(5.5, PLAYER_RADIUS),
+            (5, 6),
+            "full radius straddles into the neighbour cell (the corridor bug)"
+        );
+    }
+
+    // The skin must be small enough that a body NOT centred — pushed up against a
+    // wall — still only reaches the wall it's beside, and large enough that the
+    // span never reports three cells for a sub-voxel body.
+    #[test]
+    fn cell_span_is_one_cell_across_a_voxel() {
+        // Anywhere inside cell 5, the inset span stays within [4, 6] and is at most
+        // two cells wide; centred it is exactly one. Sample several offsets.
+        for &x in &[5.05_f32, 5.25, 5.5, 5.75, 5.95] {
+            let (lo, hi) = cells_spanned(x, WALL_HALF_WIDTH);
+            assert!(hi - lo <= 1, "span {lo}..={hi} for x={x} exceeds two cells");
+            assert!(
+                lo >= 4 && hi <= 6,
+                "span {lo}..={hi} for x={x} escaped the voxel"
+            );
+        }
+    }
+
+    // REGRESSION (phasing through a wall's side): moving from a cell-centred
+    // position toward a wall in the next cell, the OLD leading edge must still be
+    // inside the current cell and the NEW edge must cross into the wall, so the
+    // crossing is detectable. The full radius starts the edge already in the wall
+    // cell, so old == new and the block never fires (the phase-through bug).
+    #[test]
+    fn leading_edge_crossing_into_wall_is_detected() {
+        let center = 5.5_f32; // centred in cell 5; wall is cell 6
+        let old_edge = leading_cell(center, WALL_HALF_WIDTH, 1.0);
+        assert_eq!(
+            old_edge, 5,
+            "inset leading edge starts inside the current cell"
+        );
+        let moved = center + 0.1; // one step toward the wall
+        let new_edge = leading_cell(moved, WALL_HALF_WIDTH, 1.0);
+        assert_eq!(
+            new_edge, 6,
+            "the step crosses the leading edge into the wall cell"
+        );
+        assert_ne!(old_edge, new_edge, "a crossing the controller can block");
+        // The unfixed full radius puts the edge on the wall cell from the start, so
+        // there is no crossing to detect → the player slides straight in.
+        assert_eq!(
+            leading_cell(center, PLAYER_RADIUS, 1.0),
+            6,
+            "full radius starts the edge already in the wall cell (the phasing bug)"
+        );
+    }
+
+    // Symmetry: the same holds for negative-direction travel (the leading edge is
+    // on the low side), so walls block identically whichever way you walk into them.
+    #[test]
+    fn leading_edge_crossing_is_symmetric() {
+        let center = 5.5_f32; // centred in cell 5; wall is cell 4
+        assert_eq!(leading_cell(center, WALL_HALF_WIDTH, -1.0), 5);
+        assert_eq!(leading_cell(center - 0.1, WALL_HALF_WIDTH, -1.0), 4);
+    }
+
     // (a) A surface exactly 1 voxel above the feet is within STEP_HEIGHT (1.1):
     // the player eases up toward it and stays grounded.
     #[test]
@@ -739,6 +880,79 @@ mod tests {
             |_, _| true,
         );
         assert_eq!(s, 7.0, "diagonal corner of the footprint must be sampled");
+    }
+
+    // --- short-prop step: PropSurfaces::step folded into the walkable surface ---
+
+    // A short prop (low rock) carries NO collider, so the analytic ground is the
+    // only thing that can stand the player on it. The controller folds
+    // `PropSurfaces::step` (+1 on a prop cell) into the EFFECTIVE surface passed to
+    // `footprint_surface`. Standing over the prop, the feet must rise onto the
+    // prop's top (terrain top + 1), and that rise must be CLIMBABLE — within
+    // `STEP_HEIGHT` of the feet — so the support is accepted, not filtered as a wall.
+    #[test]
+    fn footprint_climbs_onto_short_prop_step() {
+        // Flat terrain at surface_y = 5 (top face 6); the prop sits on the cell the
+        // player stands over (here x == prop_x == 0 at centre 0.5). The effective
+        // field is `base + step`, i.e. terrain 5 plus the +1 short-prop step.
+        let base = 5;
+        let prop_x = 0;
+        let effective = |cx: i32, _cz: i32| base + if cx == prop_x { 1 } else { 0 };
+        // Player feet on the flat ground top face (6); the prop top is 7 = feet + 1,
+        // which is ≤ feet + STEP_HEIGHT (7.1), so it's a climbable step.
+        let feet = 6.0;
+        let s = footprint_surface(
+            0.5,
+            0.5,
+            PLAYER_RADIUS,
+            feet,
+            feet + STEP_HEIGHT,
+            effective,
+            |_, _| true,
+        );
+        assert_eq!(
+            s, 7.0,
+            "feet must rest on the short prop's top (terrain top 6 + the +1 prop step)"
+        );
+        // And the rise is genuinely climbable from the feet (mirrors the controller's
+        // step cap), so the resolver eases the player up and keeps them grounded.
+        let (feet_flat, center_flat) = resting_on(6.0);
+        let (new_y, grounded, vv) = resolve_ground(feet_flat, center_flat, s, FOOT_OFFSET, 0.0, DT);
+        assert!(
+            grounded,
+            "stepping onto a short prop keeps the player grounded"
+        );
+        assert_eq!(vv, 0.0, "grounded resolution zeroes vertical velocity");
+        assert!(new_y > center_flat, "the feet rise toward the prop top");
+    }
+
+    // The +1 short-prop step must read as a climbable STEP, never a wall. The
+    // controller's `is_wall` flags a cell only when its effective top face exceeds
+    // the step cap (`feet + STEP_HEIGHT`). For a player on adjacent flat ground
+    // (`feet = base + 1` voxels), a short prop's effective top is `base + 1 + 1`,
+    // which is ≤ the cap — so it is NOT a wall. (A real 2-high terrain wall would be
+    // `base + 2 + 1`, above the cap, and would block.) This mirrors the exact
+    // comparison `is_wall` makes, on a synthetic effective field.
+    #[test]
+    fn short_prop_step_is_not_a_wall() {
+        // Player stands on flat ground whose top face is `base + 1` (surface_y base,
+        // top = base + 1). Express the feet in those terms.
+        let base = 5_i32;
+        let feet = (base + 1) as f32; // feet on the flat-ground top face
+        let wall_cap = feet + STEP_HEIGHT;
+        // Effective surface_y over the prop cell = terrain `base` + the +1 prop step.
+        let prop_surface_y = base + 1;
+        let prop_top = prop_surface_y as f32 + 1.0; // == base + 1 + 1
+        assert!(
+            prop_top <= wall_cap,
+            "a +1 short-prop step (top {prop_top}) is within the step cap {wall_cap} — a climbable step, not a wall"
+        );
+        // Contrast: a genuine 2-high terrain wall on the same cell IS above the cap.
+        let wall_top = (base + 2) as f32 + 1.0; // == base + 2 + 1
+        assert!(
+            wall_top > wall_cap,
+            "a real 2-high wall (top {wall_top}) still exceeds the cap {wall_cap} and blocks"
+        );
     }
 
     // REGRESSION (the 10-voxel wall climb): a player boxed in by walls all taller

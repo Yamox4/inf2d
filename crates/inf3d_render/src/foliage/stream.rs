@@ -46,15 +46,15 @@ use bevy::prelude::*;
 use bevy::tasks::{block_on, poll_once, AsyncComputeTaskPool};
 
 use inf3d_camera::IsoCamera;
-use inf3d_core::{BlockedCells, FollowTarget, QualitySettings};
+use inf3d_core::{BlockedCells, FollowTarget, PropSurfaces, QualitySettings};
 use inf3d_physics::PLAYER_RADIUS;
 use inf3d_worldgen::{Terrain, WorldGen, WorldKind};
 
 use super::scatter::{scatter_grass, scatter_solid};
 use super::spawn::spawn_tile_entities;
 use super::{
-    footprint_radius, FoliageAssets, GrassField, GrassTileState, ScatterCategory, ScatterItem,
-    SolidField, SolidTileState, SolidVariantSizes, TileScatterTask, TILE,
+    footprint_radius, is_low_prop, FoliageAssets, GrassField, GrassTileState, ScatterCategory,
+    ScatterItem, SolidField, SolidTileState, SolidVariantSizes, TileScatterTask, TILE,
 };
 
 /// Minimum solid ring radius the streamer ever uses, regardless of zoom level.
@@ -105,6 +105,7 @@ pub(super) fn stream_solid(
     terrain: Res<Terrain>,
     mut field: ResMut<SolidField>,
     mut blocked: ResMut<BlockedCells>,
+    mut props: ResMut<PropSurfaces>,
     settings: Res<QualitySettings>,
     player_q: Query<&Transform, With<FollowTarget>>,
     camera_q: Query<&Projection, With<IsoCamera>>,
@@ -113,7 +114,7 @@ pub(super) fn stream_solid(
         return;
     };
     if !settings.foliage_enabled {
-        clear_solid_tiles(&mut commands, &mut field, &mut blocked);
+        clear_solid_tiles(&mut commands, &mut field, &mut blocked, &mut props);
         return;
     }
     let Ok(player) = player_q.single() else {
@@ -125,11 +126,12 @@ pub(super) fn stream_solid(
     let spawn_ring = compute_ring(projection, settings.foliage_ring_max);
     let despawn_ring = spawn_ring + DESPAWN_RING_MARGIN;
 
-    poll_solid_tasks(&mut commands, &assets, &mut field, &mut blocked);
+    poll_solid_tasks(&mut commands, &assets, &mut field, &mut blocked, &mut props);
     despawn_solid_out_of_band(
         &mut commands,
         &mut field,
         &mut blocked,
+        &mut props,
         center,
         despawn_ring,
     );
@@ -202,18 +204,32 @@ fn tile_of(world: Vec3) -> IVec2 {
 // Solid layer
 // ---------------------------------------------------------------------------
 
-/// Foliage disabled: unload every solid tile and surrender its blocked cells.
-/// Pending tasks simply drop (their handle abandons the future, like
-/// pathfinding's cancel).
-fn clear_solid_tiles(commands: &mut Commands, field: &mut SolidField, blocked: &mut BlockedCells) {
+/// Foliage disabled: unload every solid tile and surrender its claims — both the
+/// tall props' [`BlockedCells`] and the low props' [`PropSurfaces`] (releasing
+/// each list balances the refcounts this tile took). Pending tasks simply drop
+/// (their handle abandons the future, like pathfinding's cancel).
+fn clear_solid_tiles(
+    commands: &mut Commands,
+    field: &mut SolidField,
+    blocked: &mut BlockedCells,
+    props: &mut PropSurfaces,
+) {
     if field.tiles.is_empty() {
         return;
     }
     for (_, state) in field.tiles.drain() {
-        if let SolidTileState::Live { entity, cells } = state {
+        if let SolidTileState::Live {
+            entity,
+            cells,
+            prop_cells,
+        } = state
+        {
             commands.entity(entity).despawn();
             for cell in cells {
                 blocked.release(cell);
+            }
+            for cell in prop_cells {
+                props.release(cell);
             }
         }
     }
@@ -234,6 +250,7 @@ pub(super) fn clear_foliage_on_world_change(
     mut solid: ResMut<SolidField>,
     mut grass: ResMut<GrassField>,
     mut blocked: ResMut<BlockedCells>,
+    mut props: ResMut<PropSurfaces>,
     mut commands: Commands,
 ) {
     let kind = world_gen.kind();
@@ -241,32 +258,39 @@ pub(super) fn clear_foliage_on_world_change(
         return;
     }
     if last_kind.is_some() {
-        clear_solid_tiles(&mut commands, &mut solid, &mut blocked);
+        clear_solid_tiles(&mut commands, &mut solid, &mut blocked, &mut props);
         clear_grass_tiles(&mut commands, &mut grass);
     }
     *last_kind = Some(kind);
 }
 
 /// Solid phase 1: poll in-flight scatter tasks; spawn entities for any that
-/// finished, recording into [`BlockedCells`] every voxel cell the PLAYER CAPSULE
-/// cannot occupy because a SOLID prop sits there, so the pathfinder routes the
-/// whole capsule (not a point) around them.
+/// finished, routing each spawned solid prop by its height (see [`is_low_prop`]):
 ///
-/// A solid prop blocks not just the single column it stands in but every integer
-/// cell whose center falls within the prop's footprint inflated by the player
-/// radius: `footprint_radius(size) + PLAYER_RADIUS`. That inflation is what makes
-/// `BlockedCells` mean "cells the capsule center can't reach" — a path through a
-/// cell adjacent to a fat tree would clip the trunk with the capsule's edge even
-/// though the cell's own center is clear. We record EVERY claim this tile makes
-/// (with duplicates: two props in the same tile can claim the same cell) in the
-/// tile's `Live` list, so releasing the list on despawn decrements the shared
-/// refcount exactly as many times as this tile incremented it — never clearing a
-/// cell a neighbouring tile's prop still occupies across the boundary.
+/// * **TALL prop** → [`mark_blocked_footprint`] records into [`BlockedCells`]
+///   every voxel cell the PLAYER CAPSULE can't occupy because the prop sits there
+///   (footprint inflated by `PLAYER_RADIUS`), so the pathfinder routes the whole
+///   capsule (not a point) around it. The cell adjacent to a fat tree would clip
+///   the trunk with the capsule's edge even though its own center is clear — the
+///   inflation is what makes `BlockedCells` mean "cells the capsule center can't
+///   reach".
+/// * **LOW prop** → [`mark_prop_surface_footprint`] claims into [`PropSurfaces`]
+///   the cells the prop actually SITS ON (the *un-inflated* `footprint_radius`, no
+///   player-capsule margin — we want a step exactly under the prop, not a no-go
+///   ring around it), so physics + A\* fold it into the walkable surface as a
+///   1-voxel step the player climbs ONTO instead of routing around.
+///
+/// Each claim (in either store) is recorded into the tile's matching `Live` list
+/// — with duplicates, since two props in the same tile can claim the same cell —
+/// so releasing the list on despawn decrements the shared refcount exactly as many
+/// times as this tile incremented it, never clearing a cell a neighbouring tile's
+/// prop still occupies across the boundary.
 fn poll_solid_tasks(
     commands: &mut Commands,
     assets: &FoliageAssets,
     field: &mut SolidField,
     blocked: &mut BlockedCells,
+    props: &mut PropSurfaces,
 ) {
     let mut ready: Vec<(IVec2, Vec<ScatterItem>)> = Vec::new();
     for (tile, state) in field.tiles.iter_mut() {
@@ -279,6 +303,7 @@ fn poll_solid_tasks(
     for (tile, items) in ready {
         let entity = spawn_tile_entities(commands, assets, tile, &items);
         let mut cells: Vec<IVec2> = Vec::new();
+        let mut prop_cells: Vec<IVec2> = Vec::new();
         for item in &items {
             // The solid worker only emits trees/rocks; match exhaustively and
             // skip anything else defensively (grass is never recorded here).
@@ -287,11 +312,23 @@ fn poll_solid_tasks(
                 ScatterCategory::Rock => assets.rocks[item.variant].size,
                 ScatterCategory::Grass => continue,
             };
-            mark_blocked_footprint(blocked, &mut cells, item.pos, size);
+            // Height routes the prop: a low prop is a climbable step (PropSurfaces,
+            // un-inflated footprint, no collider); a tall prop is an obstacle
+            // (BlockedCells, inflated footprint, collider — see `spawn_prop`).
+            if is_low_prop(size) {
+                mark_prop_surface_footprint(props, &mut prop_cells, item.pos, size);
+            } else {
+                mark_blocked_footprint(blocked, &mut cells, item.pos, size);
+            }
         }
-        field
-            .tiles
-            .insert(tile, SolidTileState::Live { entity, cells });
+        field.tiles.insert(
+            tile,
+            SolidTileState::Live {
+                entity,
+                cells,
+                prop_cells,
+            },
+        );
     }
 }
 
@@ -345,16 +382,68 @@ fn mark_blocked_footprint(
     }
 }
 
+/// Claim in [`PropSurfaces`] every integer cell `(x, z)` whose center lies within
+/// the prop's *un-inflated* `footprint_radius(size)` of its XZ position, and append
+/// EVERY claimed cell to `prop_cells` (duplicates included) so releasing the list on
+/// despawn balances the refcount exactly as many times as this tile incremented it.
+///
+/// The LOW-prop counterpart to [`mark_blocked_footprint`], with one deliberate
+/// difference: there is **no `+ PLAYER_RADIUS`** inflation. A blocked cell means
+/// "the capsule center can't sit here", so it inflates by the capsule radius; a
+/// *surface* cell means "the player stands one voxel UP here, on the prop", so we
+/// want exactly the cells the prop actually covers — inflating would falsely mark a
+/// ring of clear ground around a pebble as a step. A low prop carries no collider
+/// either (see `spawn_prop`), so the player walks onto it as a single step.
+///
+/// Like the blocked path, recording every claim (not just the first per cell) keeps
+/// the refcount correct when one cell sits under two low props — within this tile
+/// (`prop_cells` carries it twice) or across a tile boundary (each tile records its
+/// own claim). The cell stays a step until the last claimant releases. Runs only
+/// when a tile spawns, so the small footprint scan stays off the hot path.
+fn mark_prop_surface_footprint(
+    props: &mut PropSurfaces,
+    prop_cells: &mut Vec<IVec2>,
+    pos: Vec3,
+    size: Vec3,
+) {
+    let reach = footprint_radius(size);
+    let reach_sq = reach * reach;
+    // Cell centers sit at integer+0.5; scan the integer cells whose centers can
+    // fall within `reach` of the prop (bounding box of the un-inflated footprint).
+    let min_x = (pos.x - reach - 0.5).floor() as i32;
+    let max_x = (pos.x + reach - 0.5).ceil() as i32;
+    let min_z = (pos.z - reach - 0.5).floor() as i32;
+    let max_z = (pos.z + reach - 0.5).ceil() as i32;
+    for cx in min_x..=max_x {
+        for cz in min_z..=max_z {
+            let center_x = cx as f32 + 0.5;
+            let center_z = cz as f32 + 0.5;
+            let dx = center_x - pos.x;
+            let dz = center_z - pos.z;
+            if dx * dx + dz * dz <= reach_sq {
+                let cell = IVec2::new(cx, cz);
+                // One claim per prop disc; record it so the tile releases exactly
+                // this many on despawn. `claim` increments unconditionally —
+                // duplicates are intentional (refcount, see doc above).
+                props.claim(cell);
+                prop_cells.push(cell);
+            }
+        }
+    }
+}
+
 /// Solid phase 2: unload tiles outside the wider despawn ring, **budgeted** to
 /// [`MAX_SOLID_DESPAWNS_PER_FRAME`] per frame (farthest-out first). Despawning a
 /// whole ring-edge row at once on each boundary crossing was a periodic walk
 /// hitch that scaled with zoom; spreading it removes the spike. A recursive
-/// despawn cascades to every prop under the tile parent, and we release the
-/// tile's blocked cells back to the pathfinder.
+/// despawn cascades to every prop under the tile parent, and we release the tile's
+/// claims back to the shared stores — both the tall props' [`BlockedCells`] and the
+/// low props' [`PropSurfaces`] — so the pathfinder/physics see the cells freed.
 fn despawn_solid_out_of_band(
     commands: &mut Commands,
     field: &mut SolidField,
     blocked: &mut BlockedCells,
+    props: &mut PropSurfaces,
     center: IVec2,
     despawn_ring: i32,
 ) {
@@ -377,11 +466,19 @@ fn despawn_solid_out_of_band(
 
     for tile in out_of_band.into_iter().take(MAX_SOLID_DESPAWNS_PER_FRAME) {
         // Pending tasks just drop (the future is abandoned); Live tiles despawn
-        // and surrender their blocked cells.
-        if let Some(SolidTileState::Live { entity, cells }) = field.tiles.remove(&tile) {
+        // and surrender both their blocked cells and their prop-surface cells.
+        if let Some(SolidTileState::Live {
+            entity,
+            cells,
+            prop_cells,
+        }) = field.tiles.remove(&tile)
+        {
             commands.entity(entity).despawn();
             for cell in cells {
                 blocked.release(cell);
+            }
+            for cell in prop_cells {
+                props.release(cell);
             }
         }
     }
@@ -684,5 +781,62 @@ mod tests {
         assert_eq!(tile_of(Vec3::new(15.9, 0.0, 0.1)), IVec2::new(0, 0));
         assert_eq!(tile_of(Vec3::new(16.0, 0.0, 0.0)), IVec2::new(1, 0));
         assert_eq!(tile_of(Vec3::new(-0.1, 0.0, -16.0)), IVec2::new(-1, -1));
+    }
+
+    #[test]
+    fn low_prop_claims_own_cell_and_release_frees_it() {
+        // A small low prop centered on a cell claims (at least) that cell into
+        // `PropSurfaces`, and releasing the recorded list balances the refcount so
+        // the cell is no longer a step. Mirrors how `poll_solid_tasks` records and
+        // `despawn_solid_out_of_band` releases the tile's `prop_cells`.
+        let mut props = PropSurfaces::default();
+        let mut prop_cells: Vec<IVec2> = Vec::new();
+        // Prop centered at cell (3,5)'s center, small footprint (radius 0.25).
+        let pos = Vec3::new(3.5, 2.0, 5.5);
+        let size = Vec3::new(0.5, 0.6, 0.5);
+        mark_prop_surface_footprint(&mut props, &mut prop_cells, pos, size);
+
+        // It must have claimed its own cell as a walkable step.
+        let own = IVec2::new(3, 5);
+        assert!(props.contains(own), "low prop did not claim its own cell");
+        assert_eq!(props.step(own), 1, "claimed cell should read as a 1-step");
+        assert!(
+            prop_cells.contains(&own),
+            "own cell not recorded for release"
+        );
+
+        // Releasing exactly the recorded list frees every claim this prop made —
+        // the cell is no longer a step (refcount back to zero).
+        for cell in &prop_cells {
+            props.release(*cell);
+        }
+        assert!(
+            !props.contains(own),
+            "releasing the recorded list must free the claimed cell"
+        );
+        assert_eq!(props.step(own), 0);
+    }
+
+    #[test]
+    fn low_prop_footprint_is_not_player_inflated() {
+        // Unlike `mark_blocked_footprint` (which inflates by PLAYER_RADIUS), the
+        // prop-surface footprint is the prop's BARE footprint: a pebble must not
+        // mark a whole capsule-width ring of clear ground as a step. With radius
+        // 0.25 only the prop's own cell qualifies — its neighbours' centers sit
+        // 1.0 away, far outside the disc.
+        let mut props = PropSurfaces::default();
+        let mut prop_cells: Vec<IVec2> = Vec::new();
+        let pos = Vec3::new(3.5, 2.0, 5.5);
+        let size = Vec3::new(0.5, 0.6, 0.5);
+        mark_prop_surface_footprint(&mut props, &mut prop_cells, pos, size);
+
+        assert_eq!(
+            prop_cells,
+            vec![IVec2::new(3, 5)],
+            "bare footprint should claim only the prop's own cell"
+        );
+        // A neighbouring cell that PLAYER_RADIUS inflation WOULD have caught stays
+        // clear under the un-inflated footprint.
+        assert!(!props.contains(IVec2::new(4, 5)));
     }
 }

@@ -2,7 +2,6 @@
 //! meshing (on worker threads) and gameplay (pathfinding/standing).
 
 use bevy::prelude::*;
-use inf3d_city::CITY_SURFACE_HEIGHT;
 use noise::{HybridMulti, NoiseFn, Perlin};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -40,15 +39,12 @@ pub enum WorldKind {
     Normal = 0,
     /// Flat test lab, optionally stamped with test structures by the menu.
     TestFlat = 1,
-    /// Deterministic infinite cyberpunk city backend (`inf3d_city`).
-    City = 2,
 }
 
 impl WorldKind {
     fn from_u8(v: u8) -> Self {
         match v {
             1 => Self::TestFlat,
-            2 => Self::City,
             _ => Self::Normal,
         }
     }
@@ -550,10 +546,6 @@ impl Terrain {
         match self.world_gen.kind() {
             WorldKind::Normal => column_kind(&self.noise, x, z),
             WorldKind::TestFlat => ColumnKind::from_height(FLAT_SURFACE_HEIGHT),
-            // The city backend is primarily a fly-through visual/debug world. Keep
-            // the gameplay oracle on the street plane so free-fly/iso starts on the
-            // ground instead of snapping to skyscraper roofs.
-            WorldKind::City => ColumnKind::from_height(CITY_SURFACE_HEIGHT),
         }
     }
 

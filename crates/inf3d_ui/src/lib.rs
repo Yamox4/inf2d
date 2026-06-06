@@ -61,7 +61,10 @@ impl Plugin for HudPlugin {
         app.register_diagnostic(Diagnostic::new(DIAG_CHUNKS))
             .register_diagnostic(Diagnostic::new(DIAG_MESHES))
             .init_resource::<HudStats>()
-            .add_systems(Startup, (spawn_hud, spawn_mode_buttons, spawn_material_picker))
+            .add_systems(
+                Startup,
+                (spawn_hud, spawn_mode_buttons, spawn_material_picker),
+            )
             // The in-game HUD + mode buttons show only during `AppState::InGame`
             // (they spawn hidden — we boot into the menu). In `Fx`, which stays
             // ungated, so it still runs in the menu / when paused; `state_changed`

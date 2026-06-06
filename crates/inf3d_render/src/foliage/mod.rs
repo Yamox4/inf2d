@@ -182,12 +182,25 @@ struct TileScatterTask {
 /// `Pending` (scatter task in flight) → `Live` (entities spawned, parent held).
 ///
 /// `Live` also carries the voxel cells its SOLID props occupy, so that when the
-/// tile despawns we can remove exactly those cells from
-/// [`BlockedCells`](inf3d_core::BlockedCells) (the shared resource the
-/// pathfinder reads).
+/// tile despawns we can release exactly those claims. The two cell lists mirror
+/// the two routing destinations a prop can take (see [`is_low_prop`]):
+///
+/// * `cells` — TALL props' footprint-inflated claims in
+///   [`BlockedCells`](inf3d_core::BlockedCells) (impassable, with a collider).
+/// * `prop_cells` — LOW props' un-inflated claims in
+///   [`PropSurfaces`](inf3d_core::PropSurfaces) (no collider, a walkable 1-voxel
+///   step).
+///
+/// Both record EVERY claim (duplicates included), so releasing each list on
+/// despawn decrements the shared refcount exactly as many times as this tile
+/// incremented it — never freeing a cell a neighbouring tile's prop still holds.
 enum SolidTileState {
     Pending(TileScatterTask),
-    Live { entity: Entity, cells: Vec<IVec2> },
+    Live {
+        entity: Entity,
+        cells: Vec<IVec2>,
+        prop_cells: Vec<IVec2>,
+    },
 }
 
 /// State a GRASS tile occupies in [`GrassField`]. Like [`SolidTileState`] but
@@ -216,6 +229,28 @@ struct GrassField {
 /// [`spawn`] (collider sizing).
 fn footprint_radius(size: Vec3) -> f32 {
     size.x.max(size.z) * 0.5
+}
+
+/// Post-scale bounding-box height (world units) at or below which a SOLID prop
+/// is treated as **low** — a single climbable voxel step the player walks ONTO
+/// rather than an obstacle. Matched to the physics `STEP_HEIGHT` (one voxel) so a
+/// low prop is exactly one step up: a low prop gets NO horizontal collider and
+/// claims [`PropSurfaces`](inf3d_core::PropSurfaces) instead of
+/// [`BlockedCells`](inf3d_core::BlockedCells), while a taller prop keeps its
+/// collider + blocked footprint. The gate is purely on height (per the decided
+/// design): a short tree and a short rock are both climbable — category never
+/// enters into it.
+const LOW_PROP_MAX_HEIGHT: f32 = 1.1;
+
+/// Whether a solid prop of post-scale bounding-box `size` is **low** (≤ one
+/// climbable voxel step, see [`LOW_PROP_MAX_HEIGHT`]). Pure height test, shared by
+/// [`stream`] (routes low props to [`PropSurfaces`](inf3d_core::PropSurfaces),
+/// tall ones to [`BlockedCells`](inf3d_core::BlockedCells)) and [`spawn`] (a low
+/// prop gets no [`SolidPropCollider`](inf3d_physics::SolidPropCollider) so it
+/// can't block the player horizontally). Gates on height ONLY — a short tree and a
+/// short rock alike read as climbable.
+fn is_low_prop(size: Vec3) -> bool {
+    size.y <= LOW_PROP_MAX_HEIGHT
 }
 
 pub struct FoliagePlugin;
@@ -278,4 +313,42 @@ fn setup_foliage(
         grass,
         material,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_low_prop_gates_on_height() {
+        // Well under the threshold: a pebble / flat rock is climbable.
+        assert!(is_low_prop(Vec3::new(2.0, 0.5, 2.0)));
+        // Exactly one voxel tall is climbable (width never matters — gate is Y).
+        assert!(is_low_prop(Vec3::new(0.3, 1.0, 0.3)));
+    }
+
+    #[test]
+    fn is_low_prop_includes_the_boundary() {
+        // `<=` so the boundary value itself is low (a prop exactly one step tall
+        // is still a single climbable step).
+        assert!(is_low_prop(Vec3::new(1.0, LOW_PROP_MAX_HEIGHT, 1.0)));
+        assert!(is_low_prop(Vec3::new(1.0, 1.1, 1.0)));
+    }
+
+    #[test]
+    fn is_low_prop_rejects_taller_props() {
+        // Just over the threshold is already tall (gets a collider + blocked cells).
+        assert!(!is_low_prop(Vec3::new(1.0, 1.2, 1.0)));
+        // A full tree is firmly tall.
+        assert!(!is_low_prop(Vec3::new(2.0, 3.0, 2.0)));
+    }
+
+    #[test]
+    fn is_low_prop_ignores_category_only_height() {
+        // The decided design: a SHORT prop is climbable whether it'd be a tree or a
+        // rock — a wide-but-short footprint is low, a thin-but-tall one is tall.
+        // Width/depth never flip the result; only Y does.
+        assert!(is_low_prop(Vec3::new(5.0, 0.8, 5.0)));
+        assert!(!is_low_prop(Vec3::new(0.2, 2.5, 0.2)));
+    }
 }

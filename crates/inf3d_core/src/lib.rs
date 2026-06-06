@@ -82,6 +82,69 @@ impl BlockedCells {
     }
 }
 
+/// Voxel columns `(x, z)` occupied by a **short** solid prop (≤ ~1 voxel tall)
+/// the player can walk **onto** — a low rock/boulder reads as a 1-voxel climbable
+/// step instead of an obstacle to route around. The counterpart to
+/// [`BlockedCells`]: a *tall* prop is recorded there (impassable + a real
+/// collider); a *short* prop is recorded **here instead** (no collider, no blocked
+/// cell) so physics ground + A\* fold it into the walkable surface as a step.
+///
+/// Same cross-crate flow + refcounting rationale as [`BlockedCells`]: the foliage
+/// streamer in `inf3d_render` claims/releases cells as low props stream in/out,
+/// and the *upstream* physics controller + pathfinder read [`step`](Self::step)
+/// (through this shared `inf3d_core` resource, so neither depends on render). The
+/// refcount is mandatory for the same reason — one cell can sit under two low
+/// props, within a tile and across a tile boundary, so it must stay a step until
+/// the last claimant releases. Every recorded prop currently contributes the same
+/// **1-voxel** rise ("walkable if 1 voxel high"); [`step`](Self::step) returns it.
+#[derive(Resource, Default)]
+pub struct PropSurfaces(HashMap<IVec2, u32>);
+
+impl PropSurfaces {
+    /// Claim `cell` for one short-prop disc, incrementing its refcount. Returns
+    /// `true` on the `0 → 1` transition so the caller can record it once per tile
+    /// for later release (mirrors [`BlockedCells::claim`]).
+    pub fn claim(&mut self, cell: IVec2) -> bool {
+        let count = self.0.entry(cell).or_insert(0);
+        *count += 1;
+        *count == 1
+    }
+
+    /// Release one claim on `cell`, removing the entry when it reaches zero (the
+    /// last low prop left). A release with no matching claim is ignored.
+    pub fn release(&mut self, cell: IVec2) {
+        if let Some(count) = self.0.get_mut(&cell) {
+            *count -= 1;
+            if *count == 0 {
+                self.0.remove(&cell);
+            }
+        }
+    }
+
+    /// Whether `cell` carries a walkable short prop.
+    pub fn contains(&self, cell: IVec2) -> bool {
+        self.0.contains_key(&cell)
+    }
+
+    /// The walkable step rise (in voxels) a standing/navigating entity gains on
+    /// `cell`: `1` when a short prop occupies it (stand one voxel up, on the prop),
+    /// `0` otherwise. Physics + pathfinding add this on top of the terrain surface
+    /// so a short prop reads as a single climbable step.
+    pub fn step(&self, cell: IVec2) -> i32 {
+        if self.0.contains_key(&cell) {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Iterate the cells currently carrying a walkable short prop — used by the
+    /// pathfinder to snapshot the set for its off-thread A\* worker.
+    pub fn iter(&self) -> impl Iterator<Item = IVec2> + '_ {
+        self.0.keys().copied()
+    }
+}
+
 /// The current click-to-move destination cell `(x, z)`, or `None` when the
 /// player is idle / has arrived. Set by `inf3d_pathfinding` when a click
 /// produces a path, cleared by `inf3d_gameplay` when the player reaches it, and
@@ -213,12 +276,12 @@ pub enum EditMode {
 }
 
 /// Default placed material — the first entry of `inf3d_world::BUILDABLE`
-/// (`TerrainMaterialId::BuiltStone`, raw index 10). It lives here, not in
+/// (`TerrainMaterialId::BuiltStone`, raw index 4). It lives here, not in
 /// `inf3d_world`, because [`SelectedMaterial`]'s `Default` needs it and `inf3d_core`
 /// must not depend on `inf3d_world` (which depends on core). The
 /// `inf3d_world::buildable_defaults_align` test asserts this stays equal to
 /// `BUILDABLE[0] as u8`, so the literal here can never silently desync.
-pub const DEFAULT_BUILD_MATERIAL: u8 = 10;
+pub const DEFAULT_BUILD_MATERIAL: u8 = 4;
 
 /// The voxel material the player places in [`EditMode::Build`], chosen via the
 /// in-game material picker (`inf3d_ui`) or the number keys. Stored as the raw
@@ -226,9 +289,7 @@ pub const DEFAULT_BUILD_MATERIAL: u8 = 10;
 /// `inf3d_world` (which owns the `TerrainMaterialId` palette + the `BUILDABLE` list).
 /// The picker writes it; the block editor (`inf3d_render`) reads it; save/load
 /// persists it. Defaults to [`DEFAULT_BUILD_MATERIAL`].
-#[derive(
-    Resource, Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SelectedMaterial(pub u8);
 
 impl Default for SelectedMaterial {
@@ -435,6 +496,7 @@ impl Plugin for CorePlugin {
             .init_resource::<EditMode>()
             .init_resource::<SelectedMaterial>()
             .init_resource::<BlockedCells>()
+            .init_resource::<PropSurfaces>()
             .init_resource::<PathTarget>()
             .init_resource::<FpsMoveIntent>();
     }
@@ -494,6 +556,35 @@ mod tests {
         let mut got: Vec<IVec2> = blocked.iter().collect();
         got.sort_by_key(|c| (c.x, c.y));
         assert_eq!(got, vec![a, b]);
+    }
+
+    #[test]
+    fn prop_surfaces_refcount_and_step() {
+        // A short prop makes a cell a 1-voxel walkable step; an unclaimed cell is
+        // flat (step 0). Two low props (e.g. cross-tile overlap) on one cell must
+        // both release before the step disappears — same refcount contract as
+        // `BlockedCells`.
+        let cell = IVec2::new(4, -2);
+        let mut props = PropSurfaces::default();
+        assert_eq!(props.step(cell), 0, "unclaimed cell is flat ground");
+
+        assert!(props.claim(cell), "first claim flips 0 -> 1");
+        assert!(!props.claim(cell), "second claim does not flip");
+        assert_eq!(props.step(cell), 1, "a claimed cell is a 1-voxel step");
+        assert!(props.contains(cell));
+
+        props.release(cell);
+        assert_eq!(props.step(cell), 1, "still a step while one prop remains");
+        props.release(cell);
+        assert_eq!(props.step(cell), 0, "fully released -> back to flat ground");
+        assert!(!props.contains(cell));
+    }
+
+    #[test]
+    fn prop_surfaces_release_without_claim_is_ignored() {
+        let mut props = PropSurfaces::default();
+        props.release(IVec2::new(9, 9));
+        assert_eq!(props.step(IVec2::new(9, 9)), 0);
     }
 
     #[test]

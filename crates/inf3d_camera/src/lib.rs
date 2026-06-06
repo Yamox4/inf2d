@@ -89,8 +89,7 @@ const TERRAIN_LOD_SCREEN_MARGIN: f32 = 64.0;
 pub struct IsoCamera;
 
 /// Runtime camera mode. `F` toggles free-fly in every world; `G` toggles a
-/// player-mounted FPS camera. The menu can also force free-fly for visual/debug
-/// worlds like Cyberpunk City.
+/// player-mounted FPS camera. Menus/debug flows can also force free-fly when needed.
 #[derive(Resource, Default)]
 pub struct CameraMode {
     mode: CameraViewMode,

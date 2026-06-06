@@ -43,16 +43,6 @@ pub enum TerrainMaterialId {
     /// Sandy seafloor for submerged columns. All faces sample this single
     /// layer; it shows through the translucent water plane.
     Seafloor = 3,
-    /// Cyberpunk city road surface.
-    Asphalt = 4,
-    /// Cyberpunk city concrete, sidewalks, floors, and building frames.
-    Concrete = 5,
-    /// Dark city glass.
-    DarkGlass = 6,
-    /// Cyberpunk neon accents.
-    NeonCyan = 7,
-    NeonMagenta = 8,
-    NeonYellow = 9,
     /// Player-PLACED stone. Visually identical to [`Stone`](Self::Stone) (same
     /// tint), but a DISTINCT material/texture-array index so the terrain shader can
     /// tell "this is a player build" and apply the see-through cutout to it (and
@@ -61,22 +51,21 @@ pub enum TerrainMaterialId {
     /// below; the shader treats any index `>= BuiltStone` as "built", so every
     /// variant here is a player build the cutout can act on. The buildable set the
     /// material picker offers is [`BUILDABLE`].
-    BuiltStone = 10,
+    BuiltStone = 4,
     /// Player-placed dirt (Dirt tint).
-    BuiltDirt = 11,
+    BuiltDirt = 5,
     /// Player-placed grass (Grass tint).
-    BuiltGrass = 12,
+    BuiltGrass = 6,
     /// Player-placed concrete (Concrete tint).
-    BuiltConcrete = 13,
-    /// Player-placed glass — a muted blue, lighter than terrain [`DarkGlass`](Self::DarkGlass)
-    /// so it reads as a solid build block rather than near-black.
-    BuiltGlass = 14,
+    BuiltConcrete = 7,
+    /// Player-placed glass — a muted blue so it reads as a solid build block.
+    BuiltGlass = 8,
     /// Player-placed neon cyan accent.
-    BuiltNeonCyan = 15,
+    BuiltNeonCyan = 9,
     /// Player-placed neon magenta accent.
-    BuiltNeonMagenta = 16,
+    BuiltNeonMagenta = 10,
     /// Player-placed neon yellow accent.
-    BuiltNeonYellow = 17,
+    BuiltNeonYellow = 11,
 }
 
 /// The first material index that counts as a player BUILD (vs terrain). The
@@ -170,7 +159,7 @@ pub(crate) struct MaterialDef {
 
 /// The canonical material palette. Order MUST match the [`TerrainMaterialId`]
 /// discriminants (guarded by the `palette_matches_enum` test).
-pub(crate) const PALETTE: [MaterialDef; 18] = [
+pub(crate) const PALETTE: [MaterialDef; 12] = [
     MaterialDef {
         id: TerrainMaterialId::Grass,
         label: "Grass",
@@ -202,42 +191,6 @@ pub(crate) const PALETTE: [MaterialDef; 18] = [
         faces: [TerrainMaterialId::Seafloor.layer(); 3],
     },
     MaterialDef {
-        id: TerrainMaterialId::Asphalt,
-        label: "Asphalt",
-        color: [0x18, 0x1b, 0x24],
-        faces: [TerrainMaterialId::Asphalt.layer(); 3],
-    },
-    MaterialDef {
-        id: TerrainMaterialId::Concrete,
-        label: "Concrete",
-        color: [0x5d, 0x62, 0x70],
-        faces: [TerrainMaterialId::Concrete.layer(); 3],
-    },
-    MaterialDef {
-        id: TerrainMaterialId::DarkGlass,
-        label: "Dark Glass",
-        color: [0x12, 0x20, 0x32],
-        faces: [TerrainMaterialId::DarkGlass.layer(); 3],
-    },
-    MaterialDef {
-        id: TerrainMaterialId::NeonCyan,
-        label: "Neon Cyan",
-        color: [0x00, 0xf0, 0xff],
-        faces: [TerrainMaterialId::NeonCyan.layer(); 3],
-    },
-    MaterialDef {
-        id: TerrainMaterialId::NeonMagenta,
-        label: "Neon Magenta",
-        color: [0xff, 0x27, 0xd8],
-        faces: [TerrainMaterialId::NeonMagenta.layer(); 3],
-    },
-    MaterialDef {
-        id: TerrainMaterialId::NeonYellow,
-        label: "Neon Yellow",
-        color: [0xff, 0xf0, 0x3a],
-        faces: [TerrainMaterialId::NeonYellow.layer(); 3],
-    },
-    MaterialDef {
         // Player-placed stone — same tint as Stone (so a build looks like stone),
         // but its own texture-array layer so the shader can detect "built".
         id: TerrainMaterialId::BuiltStone,
@@ -246,9 +199,8 @@ pub(crate) const PALETTE: [MaterialDef; 18] = [
         faces: [TerrainMaterialId::BuiltStone.layer(); 3],
     },
     MaterialDef {
-        // The remaining `Built*` blocks reuse their terrain/city cousin's tint so a
-        // build reads as that material, but each carries its own texture-array layer
-        // so the shader can tell builds from terrain (the see-through cutout).
+        // The remaining `Built*` blocks each carry their own texture-array layer so
+        // the shader can tell builds from terrain (the see-through cutout).
         id: TerrainMaterialId::BuiltDirt,
         label: "Built Dirt",
         color: [0x6b, 0x4a, 0x2c],
@@ -267,7 +219,6 @@ pub(crate) const PALETTE: [MaterialDef; 18] = [
         faces: [TerrainMaterialId::BuiltConcrete.layer(); 3],
     },
     MaterialDef {
-        // Lighter than terrain DarkGlass so a glass build reads as a solid block.
         id: TerrainMaterialId::BuiltGlass,
         label: "Built Glass",
         color: [0x3a, 0x5c, 0x7e],
@@ -458,11 +409,6 @@ impl VoxelWorldConfig for MainWorld {
         previous_lod: Option<LodLevel>,
         camera_position: Vec3,
     ) -> LodLevel {
-        // City detail (alleys/window strips/neon) is authored at one-voxel scale;
-        // terrain LOD sampling makes it look broken, so keep city chunks crisp.
-        if self.world_gen.kind() == WorldKind::City {
-            return 0;
-        }
         let band = self.terrain_lod_distance.max(1.0);
         let chunk_center = chunk_position.as_vec3() * CHUNK_INTERIOR as f32
             + Vec3::splat(CHUNK_INTERIOR as f32 * 0.5);
@@ -700,12 +646,6 @@ fn get_voxel_fn(
             }
         }
 
-        if kind == WorldKind::City {
-            return inf3d_city::voxel_at(pos)
-                .map(WorldVoxel::Solid)
-                .unwrap_or(WorldVoxel::Air);
-        }
-
         // Flat test world: every column is the SAME constant surface — skip the
         // noise sample entirely and feed the shared flat height to the identical
         // solid/classify logic below, so the mesh matches the `Terrain` oracle.
@@ -751,9 +691,6 @@ fn get_voxel_fn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inf3d_city::{
-        MAT_ASPHALT, MAT_CONCRETE, MAT_DARK_GLASS, MAT_NEON_CYAN, MAT_NEON_MAGENTA, MAT_NEON_YELLOW,
-    };
 
     /// PALETTE is the single source of truth, indexed by discriminant. This guards
     /// the invariant every consumer relies on: row `i` describes the variant whose
@@ -771,12 +708,6 @@ mod tests {
             Dirt,
             Stone,
             Seafloor,
-            Asphalt,
-            Concrete,
-            DarkGlass,
-            NeonCyan,
-            NeonMagenta,
-            NeonYellow,
             BuiltStone,
             BuiltDirt,
             BuiltGrass,
@@ -809,12 +740,6 @@ mod tests {
         }
         // Out-of-range indices have no material.
         assert_eq!(TerrainMaterialId::from_index(PALETTE.len() as u8), None);
-        assert_eq!(TerrainMaterialId::Asphalt as u8, MAT_ASPHALT);
-        assert_eq!(TerrainMaterialId::Concrete as u8, MAT_CONCRETE);
-        assert_eq!(TerrainMaterialId::DarkGlass as u8, MAT_DARK_GLASS);
-        assert_eq!(TerrainMaterialId::NeonCyan as u8, MAT_NEON_CYAN);
-        assert_eq!(TerrainMaterialId::NeonMagenta as u8, MAT_NEON_MAGENTA);
-        assert_eq!(TerrainMaterialId::NeonYellow as u8, MAT_NEON_YELLOW);
     }
 
     /// The picker's buildable set must satisfy the two invariants every consumer

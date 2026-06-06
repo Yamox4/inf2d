@@ -13,7 +13,9 @@ use bevy::prelude::*;
 use inf3d_core::{Rock, Tree};
 use inf3d_physics::SolidPropCollider;
 
-use super::{footprint_radius, FoliageAssets, FoliageVariant, ScatterCategory, ScatterItem};
+use super::{
+    footprint_radius, is_low_prop, FoliageAssets, FoliageVariant, ScatterCategory, ScatterItem,
+};
 
 /// Marker on a per-tile parent entity. Despawning it cascades to every prop
 /// scattered under that tile (the streamer relies on this for unloading).
@@ -96,26 +98,34 @@ fn spawn_prop(
         Visibility::default(),
         ChildOf(parent),
     ));
-    // Solid props (trees, rocks) get a static collider sized to their footprint
-    // so the player is blocked by them and can stand on rocks. The physics crate
-    // turns `SolidPropCollider` into the real `Collider` + `RigidBody::Static`
-    // on the `Solid` collision layer.
+    // Solid props (trees, rocks) keep their `Tree`/`Rock` marker (harvesting hooks)
+    // regardless of size, but the static collider is gated on HEIGHT: only a TALL
+    // prop gets a `SolidPropCollider` (the physics crate turns it into the real
+    // `Collider` + `RigidBody::Static` on the `Solid` layer so the player is blocked
+    // by it / can stand on it). A LOW prop (`is_low_prop`) gets NO collider — a
+    // static collider would block the player horizontally and defeat the step-up;
+    // instead it was claimed into `PropSurfaces` (see `stream::poll_solid_tasks`) so
+    // physics + A* read it as one climbable voxel step the player walks ONTO.
     //
-    // GRASS gets NO collider — it's intentionally left out of the physics layers
-    // so the player walks straight through it (see `inf3d_physics::GameLayer`).
+    // GRASS gets NO collider either — it's intentionally left out of the physics
+    // layers so the player walks straight through it (see `inf3d_physics::GameLayer`).
+    let low = is_low_prop(variant.size);
     match kind {
         Some(PropKind::Tree) => {
-            let height = variant.size.y;
-            let radius = (footprint_radius(variant.size) * 0.35).clamp(0.12, 0.6);
-            entity.insert((Tree, SolidPropCollider::Tree { radius, height }));
+            entity.insert(Tree);
+            if !low {
+                let height = variant.size.y;
+                let radius = (footprint_radius(variant.size) * 0.35).clamp(0.12, 0.6);
+                entity.insert(SolidPropCollider::Tree { radius, height });
+            }
         }
         Some(PropKind::Rock) => {
-            entity.insert((
-                Rock,
-                SolidPropCollider::Rock {
+            entity.insert(Rock);
+            if !low {
+                entity.insert(SolidPropCollider::Rock {
                     half: variant.size * 0.5,
-                },
-            ));
+                });
+            }
         }
         // Grass: tag with its cell so a block edit can despawn just this blade.
         None => {

@@ -10,4 +10,3 @@ rust-version.workspace = true
 bevy = { workspace = true }
 noise = { workspace = true }
 serde = { workspace = true }
-inf3d_city = { workspace = true }

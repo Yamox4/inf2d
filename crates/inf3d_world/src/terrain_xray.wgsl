@@ -15,16 +15,12 @@ struct XrayParams {
     player: vec4<f32>,
     // xyz = camera forward (unit, INTO the scene); w = cut radius (world units).
     view: vec4<f32>,
-    // x = player half-height (world); yzw reserved.
+    // x = player half-height (world); y = ceiling radius; z = head clearance;
+    // w = first player-BUILD material index (`inf3d_world::BUILT_MATERIAL_BASE`).
     extra: vec4<f32>,
 }
 @group(#{MATERIAL_BIND_GROUP}) @binding(102)
 var<uniform> xray: XrayParams;
-
-// First material index that is a player BUILD — keep in sync with
-// `inf3d_world::BUILT_MATERIAL_BASE`. Every terrain/city material is below it, so this
-// alone classifies a fragment as build-vs-terrain.
-const BUILT_MATERIAL_BASE: u32 = 10u;
 
 // Whether this fragment's VOXEL should be cut for the cutaway. Two rules (OR):
 //   (1) Cylinder — a player build sitting between the camera and the player's body
@@ -34,7 +30,12 @@ const BUILT_MATERIAL_BASE: u32 = 10u;
 // Snaps to the voxel center so the whole block decides together (blocky). MUST stay in
 // sync with `inf3d_world::voxel_cut_by_xray` (the CPU copy the click raycasts use).
 fn xray_should_discard(world_position: vec3<f32>, world_normal: vec3<f32>, material: u32) -> bool {
-    if xray.player.w <= 0.5 || material < BUILT_MATERIAL_BASE {
+    // The build-material base comes from the uniform (`extra.w`), not a hard-coded
+    // constant, so it can NEVER drift from `inf3d_world::BUILT_MATERIAL_BASE` the way a
+    // hand-synced copy did (a stale `10u` once made the shader treat stone/dirt builds
+    // as terrain and skip their cutout entirely).
+    let built_base = u32(xray.extra.w);
+    if xray.player.w <= 0.5 || material < built_base {
         return false;
     }
     let p = xray.player.xyz;

@@ -166,7 +166,10 @@ pub struct XrayParams {
     pub player: Vec4,
     /// `xyz` = camera forward (unit, into the scene); `w` = cut radius (world units).
     pub view: Vec4,
-    /// `x` = player half-height (world units); `yzw` reserved.
+    /// `x` = player half-height (world units); `y` = ceiling radius; `z` = head
+    /// clearance; `w` = first player-BUILD material index ([`crate::BUILT_MATERIAL_BASE`]),
+    /// fed from the Rust source of truth so the shader never hard-codes (and drifts
+    /// from) it — `voxel_cut_by_xray` and the WGSL both read the same base.
     pub extra: Vec4,
 }
 
