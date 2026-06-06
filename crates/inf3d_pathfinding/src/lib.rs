@@ -18,7 +18,7 @@ use bevy_voxel_world::prelude::*;
 use bevy_voxel_world::rendering::VoxelWorldMaterialHandle;
 
 use inf3d_camera::IsoCamera;
-use inf3d_core::{BlockedCells, EditMode, GameSet, PathTarget, PropSurfaces};
+use inf3d_core::{BlockedCells, EditMode, FpsMoveIntent, GameSet, PathTarget, PropSurfaces};
 use inf3d_gameplay::{MovePath, Player};
 use inf3d_world::terrain_material::{voxel_cut_by_xray, TerrainMaterial};
 use inf3d_world::MainWorld;
@@ -26,6 +26,13 @@ use inf3d_worldgen::Terrain;
 
 /// Max |Δheight| (in voxels) allowed between adjacent cells when walking.
 pub const MAX_STEP: i32 = 1;
+/// Distance (world units) from the player capsule CENTRE (the entity origin) down
+/// to the feet, so the click handler can derive the player's stand level from the
+/// transform. Mirrors `inf3d_physics::PLAYER_DIMS.visual_root_offset`
+/// (`half_height + radius` = `0.5 + 0.5`); kept as a local literal to avoid a
+/// dependency edge just for one constant — `floor_near` snaps to the nearest real
+/// floor anyway, so being off by a fraction is harmless.
+pub const PLAYER_FOOT_OFFSET: f32 = 1.0;
 /// Safety bound on A* expansion so a click into the void can't hang the worker.
 /// The search runs off-thread on an [`AsyncComputeTaskPool`] worker, so this can
 /// be generous: a far/blocked click that would otherwise fail silently at a low
@@ -101,12 +108,16 @@ impl Plugin for PathfindPlugin {
 pub struct PathRequest {
     pub start: IVec2,
     pub goal: IVec2,
-    /// The world Y the player **clicked at** — the target *level*. The search
-    /// resolves each column's floor nearest this height, so clicking into a tunnel
-    /// routes along the tunnel floor instead of snapping to the surface above it.
-    /// Using the clicked level (not the player's) is what makes it work when you
-    /// dig from outside/above the tunnel. No effect on unedited terrain.
+    /// The world Y the player **clicked at** — the target *level*, used to choose
+    /// which floor of the GOAL column is the destination (and for goal snapping).
+    /// No effect on unedited terrain.
     pub ref_y: i32,
+    /// The player's current stand height (their feet's world Y, rounded) — the
+    /// level the START resolves on. The search is height-following from here, so
+    /// seeding the start at the player's REAL level (not the clicked level) is what
+    /// lets an up-click climb the stairs instead of phantom-starting on the target
+    /// floor. No effect on flat/unedited terrain (one floor per column).
+    pub start_y: i32,
 }
 
 /// A path the worker found, as world-space standing waypoints (no start cell).
@@ -169,6 +180,7 @@ struct PathSearchResult {
 fn handle_click(
     mouse: Res<ButtonInput<MouseButton>>,
     mode: Res<EditMode>,
+    fps: Res<FpsMoveIntent>,
     window: Query<&Window, With<PrimaryWindow>>,
     cam: Query<(&Camera, &GlobalTransform), With<IsoCamera>>,
     voxel_world: VoxelWorld<MainWorld>,
@@ -181,6 +193,12 @@ fn handle_click(
     xray_materials: Res<Assets<TerrainMaterial>>,
     mut requests: MessageWriter<PathRequest>,
 ) {
+    // In first-person (G) the cursor is locked for mouse-look and WASD drives
+    // movement directly — a click must not also fire click-to-move (the path would
+    // just be cleared by `apply_fps_move` next tick anyway, wasting a search).
+    if fps.active {
+        return;
+    }
     // Click-to-move only in Walk mode; Build-mode clicks are the editor's.
     if *mode != EditMode::Walk || !mouse.just_pressed(MouseButton::Left) {
         return;
@@ -233,8 +251,18 @@ fn handle_click(
         t.translation.x.floor() as i32,
         t.translation.z.floor() as i32,
     );
+    // Start LEVEL = the player's feet. `t.translation` is the capsule CENTRE, so
+    // feet = centre − `PLAYER_FOOT_OFFSET`. Seeding the search at the player's real
+    // level (not the clicked one) lets an up-click follow the stairs up instead of
+    // phantom-starting on the target floor.
+    let start_y = (t.translation.y - PLAYER_FOOT_OFFSET).round() as i32;
 
-    requests.write(PathRequest { start, goal, ref_y });
+    requests.write(PathRequest {
+        start,
+        goal,
+        ref_y,
+        start_y,
+    });
 }
 
 /// Spawn an A* worker for the most recent [`PathRequest`] this frame, cancelling
@@ -266,6 +294,7 @@ fn dispatch_path_task(
     // clone is small.
     let prop_cells: HashSet<IVec2> = props.iter().collect();
     let ref_y = req.ref_y;
+    let start_y = req.start_y;
     let pool = AsyncComputeTaskPool::get();
     let task = pool.spawn(async move {
         let started = Instant::now();
@@ -283,7 +312,9 @@ fn dispatch_path_task(
         // to the shore. If nothing suitable is in range, fall back to the raw
         // goal — A* will then report no path (existing behavior).
         let goal = snap_goal(&leveled, req.goal, &blocked_snapshot).unwrap_or(req.goal);
-        let (cells, expansions) = astar(&leveled, req.start, goal, &blocked_snapshot);
+        // Height-following from the player's REAL stand level (`start_y`), so an
+        // up-click climbs the stairs instead of phantom-starting on the target.
+        let (cells, expansions) = astar_from(&leveled, req.start, start_y, goal, &blocked_snapshot);
         // String-pull the blocky 8-connected route into long straight diagonals
         // (Diablo feel) while keeping every dropped corner's clearance. No-op for
         // `None`/empty routes.
@@ -484,10 +515,15 @@ fn repath_when_stuck(
     }
     *repaths += 1;
     let start = IVec2::new(here.x.floor() as i32, here.z.floor() as i32);
+    // Re-seed the start at the player's CURRENT feet level (they may have climbed/
+    // descended since the click) so the height-following search resolves the start
+    // on the floor they're actually on.
+    let start_y = (here.y - PLAYER_FOOT_OFFSET).round() as i32;
     requests.write(PathRequest {
         start,
         goal: g.goal,
         ref_y: g.ref_y,
+        start_y,
     });
     info!(
         "pathfinding: player stuck — re-pathing ({}/{}) to {:?}",
@@ -555,6 +591,18 @@ fn best_effort_score(cell: IVec2, goal: IVec2, cell_surf: i32, goal_surf: i32) -
 trait SurfaceOracle {
     fn surface_y(&self, x: i32, z: i32) -> i32;
     fn is_land(&self, x: i32, z: i32) -> bool;
+    /// Surface `y` of the standable floor in column `(x, z)` whose **stand height
+    /// is nearest `near_stand_y`** — the floor you'd step onto coming from that
+    /// height. This is what makes the search **height-following**: each step
+    /// resolves the next column relative to the floor it is stepping FROM, so a
+    /// route climbs stairs into a structure even when the column also has a higher
+    /// floor (an overhang / upper storey) that the clicked level would otherwise
+    /// snap to. Mirrors the physics controller, which already resolves ground from
+    /// the player's own feet. Default (flat / single-level fixtures): the column's
+    /// only surface, ignoring the reference.
+    fn floor_near(&self, x: i32, z: i32, _near_stand_y: i32) -> i32 {
+        self.surface_y(x, z)
+    }
     /// Whether column `(x, z)` has a standable floor at ~the search's target level.
     /// Default `true` (level-agnostic oracles / tests); the leveled oracle
     /// overrides it so a goal can't snap to a surface far above/below the clicked
@@ -570,6 +618,11 @@ impl SurfaceOracle for Terrain {
     }
     fn is_land(&self, x: i32, z: i32) -> bool {
         Terrain::is_land(self, x, z)
+    }
+    fn floor_near(&self, x: i32, z: i32, near_stand_y: i32) -> i32 {
+        // `surface_y_near` resolves the floor whose STAND height (surface + 1) is
+        // closest to its reference, which is exactly "nearest `near_stand_y`".
+        Terrain::surface_y_near(self, x, z, near_stand_y)
     }
 }
 
@@ -591,17 +644,31 @@ struct LeveledTerrain {
     prop_cells: HashSet<IVec2>,
 }
 
+impl LeveledTerrain {
+    /// The short-prop step fold: a cell carrying a low rock reads one voxel higher
+    /// so A* treats walking onto it as a +1 step rather than an obstacle.
+    fn prop_fold(&self, x: i32, z: i32) -> i32 {
+        if self.prop_cells.contains(&IVec2::new(x, z)) {
+            1
+        } else {
+            0
+        }
+    }
+}
+
 impl SurfaceOracle for LeveledTerrain {
     fn surface_y(&self, x: i32, z: i32) -> i32 {
-        // Fold the short-prop step into the surface: a cell carrying a low rock
-        // reads one voxel higher, so A* sees walking onto it as a +1 step (within
-        // MAX_STEP) instead of a detour-worthy obstacle. Plain terrain is +0.
-        self.terrain.surface_y_near(x, z, self.ref_y)
-            + if self.prop_cells.contains(&IVec2::new(x, z)) {
-                1
-            } else {
-                0
-            }
+        // Resolved at the CLICKED level (`ref_y`): used for goal/best-effort
+        // seeding (which floor the user aimed at). The per-step STEPPING uses
+        // `floor_near` instead, so the route follows the level it arrives at.
+        self.terrain.surface_y_near(x, z, self.ref_y) + self.prop_fold(x, z)
+    }
+    fn floor_near(&self, x: i32, z: i32, near_stand_y: i32) -> i32 {
+        // Height-following stepping: resolve this column's floor relative to the
+        // stand height we're stepping FROM, not the clicked level — so climbing
+        // stairs into a structure picks the LANDING floor even when the same column
+        // also has a higher floor (the platform overhang) nearer the clicked level.
+        self.terrain.surface_y_near(x, z, near_stand_y) + self.prop_fold(x, z)
     }
     fn is_land(&self, x: i32, z: i32) -> bool {
         // Short props sit ON land, so land-ness is unchanged by the prop fold.
@@ -694,9 +761,38 @@ fn snap_goal<O: SurfaceOracle>(
 ///
 /// [`MAX_STEP`] is kept consistent with the physics `STEP_HEIGHT` so a route the
 /// solver accepts is one the player capsule can actually climb.
+///
+/// Convenience wrapper that seeds the start floor at the column's own surface — the
+/// single-level default the tests use. Production calls [`astar_from`] directly
+/// with the player's real stand height, so this is `#[cfg(test)]`-only.
+#[cfg(test)]
 fn astar<O: SurfaceOracle>(
     terrain: &O,
     start: IVec2,
+    goal: IVec2,
+    blocked: &HashSet<IVec2>,
+) -> (Option<Vec<IVec2>>, usize) {
+    let start_stand_y = terrain.surface_y(start.x, start.y) + 1;
+    astar_from(terrain, start, start_stand_y, goal, blocked)
+}
+
+/// As [`astar`], but the start column is resolved at `start_stand_y` (the player's
+/// real stand height) and every step is **height-following**: each neighbour's
+/// floor is resolved relative to the floor the search steps FROM (via
+/// [`SurfaceOracle::floor_near`]), not one fixed level.
+///
+/// This is the fix for "stairs under an overhang confuse the character": the
+/// landing column also has a higher floor (the platform that overhangs it), and
+/// resolving everything at the CLICKED (high) level snapped the landing to the
+/// platform floor — so the stair→landing step looked like a huge drop and the goal
+/// read as unreachable. Stepping relative to the floor we arrive at resolves the
+/// landing to the floor the stairs lead to, exactly as the physics controller
+/// resolves ground from the player's own feet. Single floor per cell on the
+/// best-known path (the `goal` is reached at whichever floor the route arrives at).
+fn astar_from<O: SurfaceOracle>(
+    terrain: &O,
+    start: IVec2,
+    start_stand_y: i32,
     goal: IVec2,
     blocked: &HashSet<IVec2>,
 ) -> (Option<Vec<IVec2>>, usize) {
@@ -709,8 +805,15 @@ fn astar<O: SurfaceOracle>(
     let mut open: BinaryHeap<Reverse<(OrderedF32, i32, i32)>> = BinaryHeap::new();
     let mut came_from: HashMap<IVec2, IVec2> = HashMap::new();
     let mut g_score: HashMap<IVec2, f32> = HashMap::new();
+    // The floor (surface_y) the best-known path assigned to each settled cell —
+    // the reference height used to resolve ITS neighbours. This is the
+    // height-following state; without it every column would resolve at one fixed
+    // level and multi-level structures (overhangs/upper storeys) misroute.
+    let mut floor_of: HashMap<IVec2, i32> = HashMap::new();
 
+    let start_floor = terrain.floor_near(start.x, start.y, start_stand_y);
     g_score.insert(start, 0.0);
+    floor_of.insert(start, start_floor);
     open.push(Reverse((OrderedF32(octile(start, goal)), start.x, start.y)));
 
     let mut expansions = 0usize;
@@ -720,11 +823,11 @@ fn astar<O: SurfaceOracle>(
     // the far side of a cliff), we route here instead so a click always walks the
     // player as close as possible. "Closest" is scored by XZ distance AND height
     // proximity to the goal's level (see [`best_effort_score`]) so the partial
-    // route ends at the foot of the stairs, not the cliff edge over the goal.
+    // route ends at the foot of the stairs, not the cliff edge over the goal. The
+    // goal's floor is taken at the CLICKED level (`surface_y`) — what the user aimed at.
     let goal_surf = terrain.surface_y(goal.x, goal.y);
     let mut best = start;
-    let mut best_score =
-        best_effort_score(start, goal, terrain.surface_y(start.x, start.y), goal_surf);
+    let mut best_score = best_effort_score(start, goal, start_floor, goal_surf);
 
     while let Some(Reverse((_, cx, cy))) = open.pop() {
         let current = IVec2::new(cx, cy);
@@ -738,7 +841,9 @@ fn astar<O: SurfaceOracle>(
         }
 
         let current_g = *g_score.get(&current).unwrap_or(&f32::INFINITY);
-        let h_current = terrain.surface_y(current.x, current.y);
+        // The floor the best path assigned to `current` — the height we step FROM.
+        let h_current = *floor_of.get(&current).unwrap_or(&start_floor);
+        let from_stand = h_current + 1;
 
         // `current` is reached; keep it as the best-effort fallback if it scores
         // closest to the goal so far (XZ distance + height-to-goal-level penalty).
@@ -749,9 +854,10 @@ fn astar<O: SurfaceOracle>(
         }
 
         // Whether `cell` is a surface the capsule may stand on, reachable from
-        // `current` in a single step: walkable land, not capsule-blocked, and
-        // within MAX_STEP of `current`'s height. The lone exception is `start`,
-        // which is always passable so a player atop a prop can step off.
+        // `current` in a single step: walkable land, not capsule-blocked, and its
+        // floor — resolved relative to `current`'s level — within MAX_STEP. The
+        // lone exception is `start`, always passable so a player atop a prop can
+        // step off.
         let passable = |cell: IVec2| {
             if !terrain.is_land(cell.x, cell.y) {
                 return false;
@@ -759,7 +865,7 @@ fn astar<O: SurfaceOracle>(
             if blocked.contains(&cell) && cell != start {
                 return false;
             }
-            (h_current - terrain.surface_y(cell.x, cell.y)).abs() <= MAX_STEP
+            (h_current - terrain.floor_near(cell.x, cell.y, from_stand)).abs() <= MAX_STEP
         };
 
         for offset in NEIGHBORS {
@@ -776,7 +882,10 @@ fn astar<O: SurfaceOracle>(
             if blocked.contains(&next) && next != start {
                 continue;
             }
-            let h_next = terrain.surface_y(next.x, next.y);
+            // Height-following: resolve the neighbour's floor relative to the level
+            // we step FROM, so the route follows stairs up/down into multi-level
+            // structures instead of snapping to a fixed (clicked) level.
+            let h_next = terrain.floor_near(next.x, next.y, from_stand);
             let dh = (h_current - h_next).abs();
             if dh > MAX_STEP {
                 continue;
@@ -802,6 +911,9 @@ fn astar<O: SurfaceOracle>(
             if tentative < *g_score.get(&next).unwrap_or(&f32::INFINITY) {
                 came_from.insert(next, current);
                 g_score.insert(next, tentative);
+                // Record the floor this step lands on, so `next`'s own neighbours
+                // resolve relative to it when `next` is later expanded.
+                floor_of.insert(next, h_next);
                 let f = tentative + octile(next, goal);
                 open.push(Reverse((OrderedF32(f), next.x, next.y)));
             }
@@ -1074,6 +1186,49 @@ mod tests {
         }
     }
 
+    /// A column at `gate_x` (any z) with TWO standable floors — a `low` landing and
+    /// a `high` platform that overhangs it (`high` more than [`MAX_STEP`] above
+    /// `low`) — while every other cell is flat `low`. This models the screenshot:
+    /// stairs leading to a landing that sits under an overhang.
+    ///
+    /// `floor_near` returns whichever floor's STAND height (`floor + 1`) is closest
+    /// to the reference — exactly like the real oracle's `surface_y_near`. But
+    /// `surface_y` (the CLICKED-level resolution) returns the HIGH floor for the
+    /// gate: the bug that made the landing read as a huge drop (unreachable). The
+    /// height-following search must instead resolve the gate to `low` when arriving
+    /// from the low corridor, connecting the route.
+    struct OverhangLand {
+        gate_x: i32,
+        low: i32,
+        high: i32,
+    }
+
+    impl SurfaceOracle for OverhangLand {
+        fn surface_y(&self, x: i32, _z: i32) -> i32 {
+            if x == self.gate_x {
+                self.high
+            } else {
+                self.low
+            }
+        }
+        fn is_land(&self, _x: i32, _z: i32) -> bool {
+            true
+        }
+        fn floor_near(&self, x: i32, _z: i32, near_stand_y: i32) -> i32 {
+            if x == self.gate_x {
+                let to_low = ((self.low + 1) - near_stand_y).abs();
+                let to_high = ((self.high + 1) - near_stand_y).abs();
+                if to_low <= to_high {
+                    self.low
+                } else {
+                    self.high
+                }
+            } else {
+                self.low
+            }
+        }
+    }
+
     #[test]
     fn octile_is_zero_for_equal_cells() {
         let p = IVec2::new(3, -7);
@@ -1329,6 +1484,66 @@ mod tests {
                 "route stepped onto an unclimbable +2 obstacle: {path:?}"
             );
         }
+    }
+
+    // REGRESSION (the screenshot bug: stairs under an overhang confuse the
+    // character). The gate column has a low landing AND a high overhanging platform.
+    // A straight low corridor runs start→gate→goal with the flanks sealed, so the
+    // gate is the only route. The height-following search, arriving from the low
+    // side, must resolve the gate to its LOW floor (Δheight 0, walkable) and reach
+    // the goal — NOT snap it to the high platform floor (the clicked-level
+    // resolution `surface_y` returns), which would read as a huge drop and leave
+    // the goal unreachable. This is exactly the multi-level case the old fixed-level
+    // search failed.
+    #[test]
+    fn astar_climbs_landing_under_an_overhang() {
+        let terrain = OverhangLand {
+            gate_x: 2,
+            low: 5,
+            high: 5 + MAX_STEP + 3, // well above a single step from the low landing
+        };
+        // Seal both flanks so the gate column is the ONLY way across.
+        let mut blocked = HashSet::new();
+        for x in 0..=4 {
+            blocked.insert(IVec2::new(x, 1));
+            blocked.insert(IVec2::new(x, -1));
+        }
+        let start = IVec2::new(0, 0);
+        let goal = IVec2::new(4, 0);
+        let (path, _exp) = astar(&terrain, start, goal, &blocked);
+        let path = path
+            .expect("height-following must connect the low corridor through the overhang gate");
+        assert_eq!(path.first().copied(), Some(start));
+        assert_eq!(path.last().copied(), Some(goal), "must actually reach the goal");
+        assert!(
+            path.contains(&IVec2::new(2, 0)),
+            "route must pass through the gate at its low floor: {path:?}"
+        );
+    }
+
+    // The fixture-level proof of WHY the above works: the clicked-level resolution
+    // (`surface_y`) snaps the overhang gate to the HIGH platform floor, but stepping
+    // FROM the low corridor resolves it to the LOW landing (Δheight 0) — and from a
+    // high approach it picks the high floor. The search uses `floor_near`, so it
+    // follows whichever level it arrives at.
+    #[test]
+    fn overhang_floor_near_follows_the_approach_level() {
+        let t = OverhangLand {
+            gate_x: 2,
+            low: 5,
+            high: 12,
+        };
+        assert_eq!(t.surface_y(2, 0), 12, "clicked-level snaps to the high floor");
+        assert_eq!(
+            t.floor_near(2, 0, 6),
+            5,
+            "stepping from the low landing (stand 6) resolves the gate low"
+        );
+        assert_eq!(
+            t.floor_near(2, 0, 13),
+            12,
+            "stepping from the high platform (stand 13) resolves the gate high"
+        );
     }
 
     #[test]

@@ -116,7 +116,12 @@ impl Plugin for PlayerPlugin {
             )
             // `animate_player` is per-frame VISUAL only (hop/feet/dust; reads the
             // interpolated transform), so it stays in the render-rate Logic set.
-            .add_systems(Update, animate_player.in_set(GameSet::Logic));
+            // `set_character_visibility` hides the figure in first-person so it never
+            // bobs into the FPS view; both are visual and touch disjoint components.
+            .add_systems(
+                Update,
+                (animate_player, set_character_visibility).in_set(GameSet::Logic),
+            );
     }
 }
 
@@ -431,6 +436,30 @@ fn animate_player(
         for (mut t, _part, rest) in &mut part_q {
             t.translation = t.translation.lerp(rest.0, ANIM_EASE * dt);
         }
+    }
+}
+
+/// Hide the third-person character figure while the first-person camera is active
+/// (toggled with `G`), so the player's own head/body never bobs into the FPS view —
+/// the reported bug. `FpsMoveIntent` is the camera's published "FPS is on" signal
+/// (set every frame in that mode, reset otherwise), so we read it rather than
+/// coupling gameplay to the camera's private mode enum. Hiding the `CharacterRoot`
+/// hides the whole figure (Bevy propagates `Visibility` to its children).
+fn set_character_visibility(
+    fps: Res<FpsMoveIntent>,
+    mut root: Query<&mut Visibility, With<CharacterRoot>>,
+) {
+    let Ok(mut vis) = root.single_mut() else {
+        return;
+    };
+    let want = if fps.active {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    // Only write on a real change so we don't churn change-detection every frame.
+    if *vis != want {
+        *vis = want;
     }
 }
 

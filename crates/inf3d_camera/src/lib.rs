@@ -10,9 +10,10 @@ use bevy::post_process::dof::DepthOfField;
 use bevy::post_process::motion_blur::MotionBlur;
 use bevy::prelude::*;
 use bevy::render::view::{ColorGrading, Hdr, Msaa};
+use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use bevy_voxel_world::prelude::*;
 
-use inf3d_core::{FollowTarget, FpsMoveIntent, GameSet, QualitySettings};
+use inf3d_core::{AppState, FollowTarget, FpsMoveIntent, GameSet, Pause, QualitySettings};
 use inf3d_world::MainWorld;
 
 /// Horizontal (XZ-plane) distance from the player to the camera.
@@ -49,6 +50,22 @@ const FREE_FLY_FAST_MULT: f32 = 3.0;
 const FREE_FLY_LOOK_SENS: f32 = 0.003;
 const FPS_LOOK_SENS: f32 = 0.0025;
 const FPS_EYE_HEIGHT: f32 = 0.75;
+// ── First-person view bob ────────────────────────────────────────────────────
+// A subtle head-bob driven by the player's actual ground speed (measured from the
+// interpolated transform), so it stays in step with movement and fades to nothing
+// when standing. Phase advances with DISTANCE travelled (not time), so the stride
+// cadence is frame-rate independent and speeds up when you sprint. Vertical bobs at
+// twice the lateral sway (feet land twice per stride) — the classic FPS feel.
+/// Bob cycles per world-unit travelled (stride cadence). Higher = quicker steps.
+const FPS_BOB_FREQ: f32 = 0.42;
+/// Vertical bob amplitude (world units) at full speed.
+const FPS_BOB_VERTICAL: f32 = 0.055;
+/// Lateral sway amplitude (world units) at full speed.
+const FPS_BOB_LATERAL: f32 = 0.04;
+/// Speed (world u/s) at which the bob reaches full amplitude (≈ the walk speed).
+const FPS_BOB_FULL_SPEED: f32 = 8.0;
+/// Exponential rate the bob amplitude eases in/out as you start/stop moving.
+const FPS_BOB_SMOOTH: f32 = 9.0;
 
 // ── Zoom-scaled chunk render distance (the "half terrain culled" fix) ────────
 // Voxel terrain only streams within `MainWorld::render_distance_chunks` of the
@@ -198,6 +215,7 @@ impl Plugin for IsoCameraPlugin {
                 (
                     toggle_camera_mode,
                     apply_camera_mode,
+                    manage_fps_cursor,
                     camera_input,
                     free_fly_input,
                     fps_input,
@@ -712,6 +730,38 @@ fn fps_input(
     }
 }
 
+/// Lock + hide the OS cursor while in FPS mode so mouse-look has unlimited travel
+/// and the pointer never drifts off-window or onto UI. Releases it whenever FPS is
+/// off OR the game is paused / not in play, so the menus stay clickable (otherwise
+/// pausing in FPS would trap the cursor). Runs every frame but only writes the
+/// window on an actual change, so it's effectively free.
+fn manage_fps_cursor(
+    mode: Res<CameraMode>,
+    app_state: Res<State<AppState>>,
+    pause: Res<State<Pause>>,
+    // In Bevy 0.18 cursor state is its own component on the primary window entity,
+    // not a field on `Window`.
+    mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
+) {
+    let lock = mode.is_fps()
+        && *app_state.get() == AppState::InGame
+        && *pause.get() == Pause::Running;
+    let Ok(mut cursor) = cursor.single_mut() else {
+        return;
+    };
+    let (want_grab, want_visible) = if lock {
+        (CursorGrabMode::Locked, false)
+    } else {
+        (CursorGrabMode::None, true)
+    };
+    if cursor.grab_mode != want_grab {
+        cursor.grab_mode = want_grab;
+    }
+    if cursor.visible != want_visible {
+        cursor.visible = want_visible;
+    }
+}
+
 fn write_fps_move_intent(
     mode: Res<CameraMode>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -759,6 +809,10 @@ fn follow_player(
     time: Res<Time>,
     player_q: Query<&Transform, (With<FollowTarget>, Without<IsoCamera>)>,
     mut cam_q: Query<(&mut Transform, &mut Projection, &mut CameraRig), With<IsoCamera>>,
+    // First-person view-bob state (transient; not persisted by save/load).
+    mut bob_phase: Local<f32>,
+    mut bob_weight: Local<f32>,
+    mut fps_last_xz: Local<Option<Vec2>>,
 ) {
     if mode.is_free_fly() {
         return;
@@ -771,8 +825,32 @@ fn follow_player(
     };
 
     if mode.is_fps() {
-        cam_t.translation = fps_eye(player.translation);
-        cam_t.rotation = Quat::from_euler(EulerRot::YXZ, rig.fps_yaw, rig.fps_pitch, 0.0);
+        // View bob driven by ACTUAL ground speed (from the interpolated transform
+        // delta), eased so it fades in/out as you start/stop. Phase advances with
+        // distance travelled, so cadence is frame-rate independent and quickens when
+        // sprinting; vertical bobs at twice the lateral sway (two footfalls/stride).
+        let dt = time.delta_secs().max(1e-4);
+        let here = Vec2::new(player.translation.x, player.translation.z);
+        let speed = match *fps_last_xz {
+            Some(prev) => (here - prev).length() / dt,
+            None => 0.0,
+        };
+        *fps_last_xz = Some(here);
+
+        let target_w = (speed / FPS_BOB_FULL_SPEED).clamp(0.0, 1.0);
+        let kw = 1.0 - (-FPS_BOB_SMOOTH * dt).exp();
+        *bob_weight = lerp(*bob_weight, target_w, kw);
+        *bob_phase = (*bob_phase + speed * dt * FPS_BOB_FREQ).rem_euclid(1.0);
+
+        let tau = std::f32::consts::TAU;
+        let v = (*bob_phase * tau * 2.0).sin() * FPS_BOB_VERTICAL * *bob_weight;
+        let h = (*bob_phase * tau).sin() * FPS_BOB_LATERAL * *bob_weight;
+
+        let rot = Quat::from_euler(EulerRot::YXZ, rig.fps_yaw, rig.fps_pitch, 0.0);
+        // Lateral sway along the camera's (horizontal) right axis; bob along world up.
+        let right = rot * Vec3::X;
+        cam_t.translation = fps_eye(player.translation) + right * h + Vec3::Y * v;
+        cam_t.rotation = rot;
         if !matches!(&*proj, Projection::Perspective(_)) {
             *proj = Projection::Perspective(PerspectiveProjection {
                 fov: std::f32::consts::FRAC_PI_3,
@@ -783,6 +861,10 @@ fn follow_player(
         }
         return;
     }
+
+    // Not FPS: forget the last bob sample so re-entering FPS starts fresh (no
+    // speed spike from a stale position across the mode switch).
+    *fps_last_xz = None;
 
     // Frame-rate-independent exponential smoothing factor.
     let k = 1.0 - (-SMOOTH * time.delta_secs()).exp();

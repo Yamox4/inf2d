@@ -175,6 +175,17 @@ on corners, and preferred dropping off a ledge to taking nearby stairs. Root cau
 - [~] **Arrival radius (corner orbit).** `follow_path` popped waypoints at `0.1`, below
   per-step travel (`speed*dt ≈ 0.125`) → could orbit a point forever. Raised to
   `ARRIVE_RADIUS = 0.25` + drain-all-reached loop. *File:* `inf3d_gameplay/src/lib.rs`.
+- [~] **Height-following search (stairs under an overhang).** A click on a high platform
+  resolved EVERY column at the clicked (high) level, so a landing that sits under the
+  platform's overhang snapped to the platform floor — the stair→landing step read as a huge
+  drop and the goal looked unreachable (character wandered off / stuck on a wall). The search
+  is now height-following: `astar_from` seeds the start at the player's REAL stand height
+  (`PathRequest::start_y`) and resolves each neighbour relative to the floor it steps FROM
+  (`SurfaceOracle::floor_near`), exactly mirroring how the physics controller resolves ground
+  from the player's feet. Can't regress tunnels/pits (a ≥2 drop was already Δ>MAX_STEP).
+  *Known limit:* single floor per cell on the best path, so a column reachable at two levels
+  arrives at whichever wins g-score — upgrade to `(cell, floor)` A* state if floor-precision
+  on the goal column ever matters. *File:* `inf3d_pathfinding/src/lib.rs`.
 - [ ] **Possible follow-up:** terrain-wall clearance — the planner routes on cell centres
   while the controller uses the 0.45-radius capsule, so it can *rub* a convex wall corner
   (re-path/give-up catches the worst case). A radius-inflated terrain-wall cost would tighten
