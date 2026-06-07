@@ -98,22 +98,32 @@ pub(crate) fn update_hover(
         return;
     }
 
-    // Camera-forward = screen center for a centered viewport, so the crosshair and
-    // the targeted voxel line up. Targets the first solid voxel along the ray.
+    // The crosshair ray follows the camera look (screen center), but STARTS at the
+    // player's depth along that ray — NOT at the camera eye. Casting from the eye, a
+    // solid BETWEEN the camera and the player (e.g. a wall right behind you while you
+    // aim up over your shoulder) is the first hit, so you'd edit that wall instead of
+    // what the crosshair points at on your side. Advancing the origin to the player's
+    // depth skips those near-camera occluders while keeping the aim crosshair-accurate
+    // (it's the same view ray, just begun at the player).
+    let player_pos = player_q.single().map(|p| p.translation()).ok();
     let hit = cam.single().ok().and_then(|cam_gtf| {
-        let ray = Ray3d {
-            origin: cam_gtf.translation(),
-            direction: Dir3::new(cam_gtf.forward().as_vec3()).unwrap_or(Dir3::NEG_Z),
+        let eye = cam_gtf.translation();
+        let dir = Dir3::new(cam_gtf.forward().as_vec3()).unwrap_or(Dir3::NEG_Z);
+        let origin = match player_pos {
+            Some(p) => eye + dir.as_vec3() * (p - eye).dot(dir.as_vec3()).max(0.0),
+            None => eye,
         };
-        voxel_world.raycast(ray, &|(_coords, voxel)| matches!(voxel, WorldVoxel::Solid(_)))
+        voxel_world.raycast(
+            Ray3d { origin, direction: dir },
+            &|(_coords, voxel)| matches!(voxel, WorldVoxel::Solid(_)),
+        )
     });
 
     // Build reach: ignore a crosshair hit farther than `BUILD_RANGE` from the player,
     // so you can only place/break within arm's reach in the space in front of you.
     let hit = hit.filter(|h| {
-        player_q
-            .single()
-            .map(|p| (h.position - p.translation()).length() <= BUILD_RANGE)
+        player_pos
+            .map(|p| (h.position - p).length() <= BUILD_RANGE)
             .unwrap_or(true)
     });
 

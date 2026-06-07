@@ -1,0 +1,33 @@
+[package]
+name = "inf3d_editor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Standalone tool: a separate binary, NOT wired into the game. Run with
+# `cargo run -p inf3d_editor`.
+[[bin]]
+name = "inf3d-editor"
+path = "src/main.rs"
+
+[dependencies]
+# Reuse the workspace pins so the editor shares the game's exact dependency
+# versions (no duplicate builds).
+bevy = { workspace = true }
+serde = { workspace = true }
+ron = { workspace = true }
+# Read-only reuse of the in-game material palette so editor reference colors
+# match the game's block hues (TerrainMaterialId::color/label + BUILDABLE).
+inf3d_world = { workspace = true }
+# The egui UI toolkit (bevy_egui 0.39 → egui 0.33, compatible with Bevy 0.18).
+# Kept LOCAL to this crate (not added to [workspace.dependencies]) so deleting
+# the crate fully removes it. egui itself is re-exported as `bevy_egui::egui`.
+bevy_egui = "0.39"
+
+[dev-dependencies]
+# `dot_vox` is the SAME loader the game uses (the render crate declares it as
+# "5"); we use it only in tests to prove our hand-written .vox writer round-trips
+# through it (correct coords + palette). Matching version, no workspace edit.
+dot_vox = "5"

@@ -29,9 +29,10 @@ use inf3d_world::MainWorld;
 // ── Projection ───────────────────────────────────────────────────────────────
 /// Vertical field of view (radians). 60° reads as a natural third-person lens.
 const FOV: f32 = std::f32::consts::FRAC_PI_3;
-/// Near clip plane (world units). Small so the boom can pull in close without the
-/// player clipping out of view.
-const NEAR: f32 = 0.1;
+/// Near clip plane (world units). Small so the boom can pull in close in tight/narrow
+/// spaces without the near plane slicing through nearby walls (the "camera culls in
+/// narrow spaces" artifact).
+const NEAR: f32 = 0.05;
 /// Far clip plane (world units). Large enough for the orbit/free-fly view to reach
 /// the horizon over the streamed terrain.
 const FAR: f32 = 1500.0;
@@ -48,8 +49,10 @@ const ZOOM_SPEED: f32 = 2.0;
 
 // ── Orbit angles ───────────────────────────────────────────────────────────────
 /// Lowest pitch (radians): dips the camera below the focus to look UP, so you can aim
-/// up at tall walls / overhead blocks when building. Not so low it flips under the world.
-const PITCH_MIN: f32 = -0.5;
+/// up at tall walls / overhead blocks when building. Widened for overhead building;
+/// the boom collision (with its lowered floor) keeps the dipped eye from sinking
+/// through the ground.
+const PITCH_MIN: f32 = -1.2;
 /// Highest pitch (radians): a steep near-top-down look, short of straight down so
 /// the look-at never degenerates against world up.
 const PITCH_MAX: f32 = 1.4;
@@ -65,6 +68,25 @@ const LOOK_SENS: f32 = 0.005;
 /// its head. The camera pivots on the PLAYER — there is no forward pivot offset, which
 /// read as a disorienting "orbit around a point in front of you".
 const FOCUS_HEIGHT: f32 = 1.2;
+/// How far AHEAD of the player (world units, along the camera's horizontal heading)
+/// the rig looks at gentle pitch, so the screen-centre crosshair points into the space
+/// in front of you (build / interact target) instead of right at the character. The
+/// orbit still pivots on the player — only the LOOK target shifts forward. This offset
+/// fades to zero as you look steeply down (see [`PITCH_AIM_FULL`]).
+const AIM_FORWARD: f32 = 2.0;
+/// Pitch (radians) up to which the FULL [`AIM_FORWARD`] offset applies. Past it, the
+/// forward aim lerps to zero by [`PITCH_MAX`], so a steep down-look aims nearly
+/// straight below — letting you target the block beneath you for digging, pillaring,
+/// bridging and staircases (the fixed forward offset used to make that impossible).
+const PITCH_AIM_FULL: f32 = 0.8;
+/// Only pull the focus down for a ceiling within this distance above the player
+/// (world units). Beyond it the sky/high roofs don't affect framing.
+const FOCUS_CEILING_PROBE: f32 = 4.0;
+/// Gap kept between the focus and a detected ceiling, so the rig (which anchors on
+/// the focus) stays below a low roof instead of poking through it. Sized so a
+/// 2-block-tall room — a perfect fit for the 2-block player, where the head-height
+/// focus would otherwise sit at/above the roof — keeps the whole rig inside.
+const FOCUS_CEILING_MARGIN: f32 = 0.4;
 /// Exponential rate the boom DISTANCE eases toward its scroll target (zoom glide). The
 /// camera POSITION is otherwise rigid — recomputed from the (already interpolated)
 /// player every frame with NO horizontal lerp — so the follow has no lag and never
@@ -77,10 +99,13 @@ const CAMERA_RADIUS: f32 = 0.3;
 /// Gap (world units) kept between the camera and a voxel the boom would otherwise clip
 /// into — the boom stops this far short of terrain/builds.
 const BOOM_PADDING: f32 = 0.3;
-/// Floor for the boom length after a collision clamp, so the camera never collapses
-/// fully onto the focus when pressed against a wall (kept just outside the body —
-/// near-first-person in a tight cave, which is the indoor "zoom in" behaviour).
-const BOOM_MIN: f32 = 1.0;
+/// Floor for the boom length. This MUST stay small: it's applied AFTER the collision
+/// clamp, so a large floor would push the eye back PAST close geometry and punch it
+/// through the wall/ground (the "camera clips outside in a corridor / through the
+/// ground when looking up" bug — the old 1.0 floor shoved the eye a full unit out even
+/// when a wall sat 0.5 away). At 0.3 the eye tucks to just outside the head in tight
+/// spaces (near-first-person) without breaching geometry.
+const BOOM_MIN: f32 = 0.3;
 /// Exponential rate the boom snaps IN when an obstacle appears — fast, so the camera
 /// never lingers inside a wall.
 const BOOM_IN_SMOOTH: f32 = 35.0;
@@ -220,7 +245,6 @@ impl Plugin for OrbitCameraPlugin {
                 (
                     toggle_camera_mode,
                     apply_camera_mode,
-                    manage_cursor_grab,
                     orbit_input,
                     free_fly_input,
                     write_move_intent,
@@ -228,6 +252,12 @@ impl Plugin for OrbitCameraPlugin {
                     .chain()
                     .in_set(GameSet::Input),
             )
+            // Cursor grab is UNGATED (no `GameSet`): it must keep running while paused
+            // / in the menu so it can RELEASE the cursor there. It reads the state and
+            // decides lock itself, and only writes the window on a change. (If it lived
+            // in the gated Input set, pausing would stop it mid-locked and the cursor
+            // would never free — you couldn't click the pause menu.)
+            .add_systems(Update, manage_cursor_grab)
             // Drive the voxel chunk render distance + terrain LOD (Input phase,
             // before streaming) so enough terrain loads to fill the view.
             .add_systems(Update, scale_voxel_render_distance.in_set(GameSet::Input))
@@ -760,7 +790,11 @@ fn free_fly_input(
 /// free.
 fn manage_cursor_grab(
     app_state: Res<State<AppState>>,
-    pause: Res<State<Pause>>,
+    // `Pause` is a SubState that exists ONLY while `AppState::InGame`; in the main menu
+    // the resource is absent. This system is UNGATED (it must run in every state to
+    // release the cursor on pause/menu), so take `Pause` as `Option` — absent ⇒ not in
+    // play ⇒ cursor released. (Requiring it unconditionally panicked at the menu.)
+    pause: Option<Res<State<Pause>>>,
     keys: Res<ButtonInput<KeyCode>>,
     // In Bevy 0.18 cursor state is its own component on the primary window entity,
     // not a field on `Window`.
@@ -771,8 +805,8 @@ fn manage_cursor_grab(
     // suspended while it's held (see `orbit_input` / `write_move_intent`), so moving the
     // pointer to a button never spins the camera or walks the player.
     let ui_cursor = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
-    let lock =
-        *app_state.get() == AppState::InGame && *pause.get() == Pause::Running && !ui_cursor;
+    let running = pause.is_some_and(|p| *p.get() == Pause::Running);
+    let lock = *app_state.get() == AppState::InGame && running && !ui_cursor;
     let Ok(mut cursor) = cursor.single_mut() else {
         return;
     };
@@ -865,7 +899,24 @@ fn follow_player(
     let k_zoom = 1.0 - (-DISTANCE_SMOOTH * dt).exp();
     rig.distance = lerp(rig.distance, rig.distance_target, k_zoom);
 
-    let focus = focus_point(player.translation);
+    // Ceiling-aware focus (see `FOCUS_CEILING_MARGIN`): in a low room the head-height
+    // focus would sit at/above the roof, anchoring the rig THROUGH it so the boom jams
+    // the eye into the ceiling and the near plane slices the roof blocks (the
+    // "see-through under a 2-block ceiling"). Probe straight up and keep the focus a
+    // margin below a nearby roof, so the whole rig stays inside the room (the boom then
+    // pulls in to near-first-person, roof solid).
+    let mut focus = focus_point(player.translation);
+    let up = Ray3d {
+        origin: player.translation,
+        direction: Dir3::Y,
+    };
+    if let Some(hit) = voxel_world.raycast(up, &|(_c, v)| matches!(v, WorldVoxel::Solid(_))) {
+        if hit.position.y < player.translation.y + FOCUS_CEILING_PROBE {
+            focus.y = (hit.position.y - FOCUS_CEILING_MARGIN)
+                .min(focus.y)
+                .max(player.translation.y);
+        }
+    }
     let dir = orbit_dir(rig.yaw, rig.pitch);
 
     // Boom collision (sphere-cast-ish): how far the camera may sit before a wall clips
@@ -885,7 +936,16 @@ fn follow_player(
     // RIGID horizontal follow: recompute the eye from the (already interpolated, smooth)
     // player every frame — no position lerp — so the follow has zero lag.
     cam_t.translation = focus + dir * rig.boom;
-    *cam_t = cam_t.looking_at(focus, Vec3::Y);
+    // Aim AHEAD of the player so the screen-centre crosshair points into the space in
+    // front of you, not at the character (`dir` is focus→eye, so the camera's horizontal
+    // heading is `-dir.xz`). The forward offset SHRINKS to zero as you look steeply down
+    // so a steep down-look aims nearly straight below — that's what lets you target the
+    // block beneath you for digging, pillaring, bridging and staircases. The eye is
+    // unchanged (still orbits the player); this only tilts the look.
+    let down_t = ((rig.pitch - PITCH_AIM_FULL) / (PITCH_MAX - PITCH_AIM_FULL)).clamp(0.0, 1.0);
+    let heading = Vec3::new(-dir.x, 0.0, -dir.z).normalize_or_zero();
+    let look_at = focus + heading * (AIM_FORWARD * (1.0 - down_t));
+    *cam_t = cam_t.looking_at(look_at, Vec3::Y);
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {

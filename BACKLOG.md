@@ -163,6 +163,34 @@ worker + this follow-up; **user to build + repro**.
 
 ---
 
+## Standalone tool — voxel model + animation editor (planned, NOT started)
+
+A separate **voxel model editor → displayer → creator → animator** (a mini-MagicaVoxel +
+mini-animation suite) to author characters/items + animation clips, then import them into
+the game. **Tracked here so it isn't lost; gating + decisions locked 2026-06-07** (mirrors
+the `voxel-editor-planned` memory).
+
+- **Where:** a new, fully self-contained member crate `inf3d/crates/inf3d_editor` with its
+  own `[[bin]]` — deletable later by removing the folder + one `members` line.
+- **UI:** `bevy_egui` 0.39 (confirmed compatible with Bevy 0.18; 0.40.0-rc.1 also tracks
+  0.18). Declared in the editor crate's OWN `Cargo.toml`, **NOT** workspace deps.
+- **Reuse game crates READ-ONLY** — already-`pub` types only (`TerrainMaterialId`/palette,
+  `dot_vox` like the foliage pipeline). NEVER edit a game crate; if a needed item isn't
+  `pub`, flag it — don't add the `pub`.
+- **Interchange:** `.vox` geometry + `.ron` sidecars (rig: body-part name→region+pivot+
+  parent tree; anim: keyframes per part). Body-part tagging = the rig.
+- **Gating:** build **AFTER** the engine-rework lands (user chose serial, not parallel).
+  The one unavoidable shared edit is the workspace `Cargo.toml` `members = [...]` append,
+  and the repo is **NOT git** (last-writer-clobbers), so coordinate that single edit.
+- [ ] **Phase 1 — Displayer + Creator** (standalone): paint on a 1-block reference grid,
+  toggle N×N×N voxels; object type character/item; body-part tagging; save/load `.vox` +
+  `rig.ron`.
+- [ ] **Phase 2 — Animator** (standalone): import a rigged model, timeline + keyframes per
+  part, playback, save `clip.ron`.
+- [ ] **Phase 3 — In-game import loader** — the ONLY part that touches game crates; do LAST.
+
+---
+
 ## Recently completed (context)
 - [x] Footstep audio (`inf3d_audio` sink crate; gap-trimmed `.ogg`; pitch/volume variation).
 - [x] Shadow cascade fix (160u / 3 cascades / 4096 map).

@@ -84,10 +84,10 @@ pub struct CharacterController {
     pub vertical_velocity: f32,
     /// Whether the controller found ground last frame.
     pub grounded: bool,
-    /// Smoothed horizontal velocity (world u/s). Ramps toward the input target
-    /// ([`DesiredMove::velocity`]) at [`GROUND_ACCEL`]/[`GROUND_DECEL`]/[`AIR_ACCEL`] so
-    /// movement has weight instead of snapping on/off — this is what `move_and_slide`
-    /// actually integrates each step.
+    /// Smoothed horizontal velocity (world u/s). On the ground it's shaped by
+    /// [`GROUND_FRICTION`] then [`GROUND_ACCEL`] (Source-style friction-then-accelerate);
+    /// in the air by [`AIR_ACCEL`] with NO friction, so a jump keeps its momentum and you
+    /// only steer. This is what `move_and_slide` actually integrates each step.
     pub horizontal_velocity: Vec3,
     /// Seconds of grace left to still count as grounded for a jump after walking off a
     /// ledge (coyote time). Refilled to [`COYOTE_TIME`] while grounded, counts down airborne.
@@ -165,28 +165,50 @@ pub const PLAYER_RADIUS: f32 = PLAYER_DIMS.radius;
 /// Player capsule cylindrical half-height (full capsule ≈ 2*half + 2*radius).
 /// Alias for [`PLAYER_DIMS`]'s `half_height`.
 pub const PLAYER_HALF_HEIGHT: f32 = PLAYER_DIMS.half_height;
-/// Gravity acceleration (world units / s²), applied only while airborne.
+/// Gravity (world u/s²) while RISING — a slightly floaty ascent. The descent uses
+/// the stronger [`FALL_GRAVITY`] for a snappy, committed arc (asymmetric "fast-fall").
 pub const GRAVITY: f32 = 24.0;
-/// Initial upward velocity for a Space-key jump.
-pub const JUMP_SPEED: f32 = 9.0;
-/// Ground acceleration (world u/s²): how fast horizontal velocity ramps toward the input
-/// target. Sized so the player reaches walk speed (~8 u/s) in ~0.1 s — snappy but with a
-/// touch of weight, per game-feel norms (50–200 ms to top speed).
-pub const GROUND_ACCEL: f32 = 90.0;
-/// Ground deceleration (world u/s²) with no input — a quick, non-floaty stop.
-pub const GROUND_DECEL: f32 = 120.0;
-/// Air acceleration / deceleration (world u/s²): gentle, so a jump keeps its horizontal
-/// momentum and you land roughly where you aimed (limited mid-air steering).
-pub const AIR_ACCEL: f32 = 35.0;
+/// Gravity (world u/s²) while FALLING — stronger than the rise so jumps come down
+/// with weight instead of floating (a classic platformer feel).
+pub const FALL_GRAVITY: f32 = 40.0;
+/// Max downward speed (world u/s): terminal velocity, so a long fall stays controllable.
+pub const TERMINAL_VELOCITY: f32 = 55.0;
+/// Initial upward velocity for a Space-key jump. Sized so the apex clears ~2 voxels,
+/// enough to hop onto a 2-tall ledge.
+pub const JUMP_SPEED: f32 = 10.0;
+/// Fraction the upward velocity is kept at when Space is RELEASED mid-rise — variable
+/// jump height, so a tap is a short hop and a hold is the full jump.
+pub const JUMP_CUT: f32 = 0.45;
+/// Ground acceleration coefficient (Source/Quake-style). The per-step gain toward the
+/// wish-velocity is `GROUND_ACCEL * wish_speed * dt`, capped so you never exceed wish
+/// speed. ~12 reaches walk speed (~8 u/s) in ~0.1 s — snappy, with a touch of weight.
+pub const GROUND_ACCEL: f32 = 12.0;
+/// Ground friction coefficient: horizontal speed decays by `max(speed, STOP_SPEED) *
+/// GROUND_FRICTION * dt` each grounded step — a crisp stop (~0.1 s), no ice-slide.
+pub const GROUND_FRICTION: f32 = 10.0;
+/// Friction floor (world u/s): below this the decay rate uses `STOP_SPEED`, so the
+/// player stops cleanly instead of asymptotically creeping toward zero.
+pub const STOP_SPEED: f32 = 3.0;
+/// Air acceleration coefficient: small, so airborne you KEEP your launch momentum
+/// (there is no air friction) and can only STEER gently toward the wish direction —
+/// a committed jump arc, not free flight. Paired with the anti-bhop speed cap in the
+/// controller so air-steering can't GROW your speed (no bunny-hop exploit).
+pub const AIR_ACCEL: f32 = 2.0;
 /// Coyote-time grace (seconds): you can still jump this long after walking off a ledge.
 pub const COYOTE_TIME: f32 = 0.12;
 /// Jump-buffer window (seconds): a jump pressed this long before landing still fires.
 pub const JUMP_BUFFER_TIME: f32 = 0.12;
-/// Max height (above the **feet**) the player will step up onto in one go. Set
-/// just above 1.0 so a single 1-unit voxel step is climbed smoothly while a
-/// 2-voxel cliff is rejected. Any rise up to this much (relative to the current
-/// feet) is climbed; a bigger jump down reads as a real ledge and the player falls.
-pub const STEP_HEIGHT: f32 = 1.1;
+/// Vertical reach (world units) of one climbable voxel step — the single
+/// "one voxel = one step" magnitude the controller's step caps derive from, so they
+/// can't silently desync. Prop steps in [`inf3d_core::PropSurfaces`] are 1 voxel = this;
+/// a later cleanup can hoist this to `inf3d_core` so foliage's `LOW_PROP_MAX_HEIGHT`
+/// derives from it too.
+pub const VOXEL_STEP: f32 = 1.0;
+/// Max height (above the **feet**) the player will step up onto in one go: one voxel
+/// plus a small tolerance, so a single voxel step is climbed smoothly while a 2-voxel
+/// cliff is rejected. Any rise up to this much (relative to the current feet) is
+/// climbed; a bigger drop reads as a real ledge and the player falls.
+pub const STEP_HEIGHT: f32 = VOXEL_STEP + 0.1;
 /// Extra reach below the feet within which the ground still "grabs" the player
 /// (keeps the feet glued to the surface on downhill steps instead of briefly
 /// going airborne). A drop larger than this leaves the player airborne.
@@ -201,13 +223,18 @@ pub const STEP_HEIGHT: f32 = 1.1;
 /// (a ≥2-voxel drop) is still beyond this and correctly goes airborne. Keeping the
 /// up cap ([`STEP_HEIGHT`]) and this down cap equal is what makes WASD walking ease
 /// smoothly over 1-voxel steps in either direction instead of hopping downhill.
-pub const GROUND_SNAP_DISTANCE: f32 = 1.1;
+pub const GROUND_SNAP_DISTANCE: f32 = STEP_HEIGHT;
 /// Distance the camera interaction ray travels before giving up.
 pub const INTERACT_RAY_LENGTH: f32 = 1000.0;
 /// How fast the feet ease onto the followed ground (per second). High = snappy
 /// but soft; lower = floatier. Smooths step-ups so climbing a voxel eases up
 /// instead of snapping in one frame (which read as a hard jolt).
-pub const GROUND_FOLLOW_RATE: f32 = 14.0;
+// Sized so the feet keep PACE with walk speed up a staircase: at ~24 the rise of one
+// voxel completes in ~the time it takes to cross one cell at walk speed (~0.12 s), so
+// the body glides up stairs instead of clipping into a step and then snapping up a
+// frame later (the "weird snap stepping up" — a too-slow follow that lagged the fast
+// horizontal move). `TransformInterpolation` smooths the per-step result for rendering.
+pub const GROUND_FOLLOW_RATE: f32 = 24.0;
 /// Collision "skin": how far the capsule's horizontal half-width is inset when
 /// testing terrain / placed-block walls. The visual + avian capsule stays a full
 /// voxel wide (`2 * PLAYER_RADIUS`); only the analytic wall test uses the inset.
@@ -388,21 +415,41 @@ fn player_controller(
         // stops counting as one and you can move over it. ---
         let prop_filter =
             SpatialQueryFilter::from_mask([GameLayer::Solid]).with_excluded_entities([entity]);
-        // Ramp the horizontal velocity toward the input target instead of snapping to it:
-        // snappy accel + a quick decel on the ground (weight without floatiness), gentle
-        // in the air (a jump keeps its momentum and lands where aimed). This
+        // Source/Quake-style horizontal model for weighty, momentum-y movement:
+        //  • GROUND: apply FRICTION (a crisp decay toward zero), THEN ACCELERATE toward
+        //    the WASD wish-velocity — a snappy start (~0.1 s) and an equally snappy stop,
+        //    no ice-slide.
+        //  • AIR: NO friction (you keep your launch momentum) + a gentle capped
+        //    air-accel, so you can only STEER a little — a committed jump arc, not free
+        //    flight (this is the fix for "I jump and keep walking").
         // `cc.horizontal_velocity` is what `move_and_slide` integrates below.
-        let target_h = Vec3::new(desired.velocity.x, 0.0, desired.velocity.z);
-        let accel = if cc.grounded {
-            if target_h.length_squared() > 1e-6 {
-                GROUND_ACCEL
-            } else {
-                GROUND_DECEL
-            }
+        let wish = Vec3::new(desired.velocity.x, 0.0, desired.velocity.z);
+        let wish_speed = wish.length();
+        let wish_dir = if wish_speed > 1e-6 {
+            wish / wish_speed
         } else {
-            AIR_ACCEL
+            Vec3::ZERO
         };
-        cc.horizontal_velocity = move_toward(cc.horizontal_velocity, target_h, accel * dt_s);
+        let mut h = cc.horizontal_velocity;
+        if cc.grounded {
+            h = apply_friction(h, GROUND_FRICTION, dt_s);
+            if wish_speed > 1e-6 {
+                h = accelerate(h, wish_dir, wish_speed, GROUND_ACCEL, dt_s);
+            }
+        } else if wish_speed > 1e-6 {
+            // Air steering can REDIRECT momentum but not GROW total speed past what you
+            // already had (or your wish speed). This kills the bunny-hop / air-strafe
+            // speed-gain exploit — perma-jumping + walking, or turning while falling, used
+            // to accumulate speed without bound. A sprint-jump still keeps its launch
+            // speed in the air; landing friction sheds it back to walk.
+            let prev_speed = h.length();
+            h = accelerate(h, wish_dir, wish_speed, AIR_ACCEL, dt_s);
+            let cap = prev_speed.max(wish_speed);
+            if h.length() > cap {
+                h = h.normalize_or_zero() * cap;
+            }
+        }
+        cc.horizontal_velocity = h;
         let h_velocity = cc.horizontal_velocity;
         let old_xz = transform.translation;
         let mut new_pos = old_xz;
@@ -488,11 +535,26 @@ fn player_controller(
         // Arm the buffer only on the PRESS edge (down this step, up last step), so
         // holding the key doesn't auto-rejump on every landing.
         let jump_edge = desired.jump && !cc.prev_jump;
+        let release_edge = !desired.jump && cc.prev_jump;
         cc.prev_jump = desired.jump;
         if jump_edge {
             cc.jump_buffer = JUMP_BUFFER_TIME;
         } else {
             cc.jump_buffer = (cc.jump_buffer - dt_s).max(0.0);
+        }
+
+        // Variable jump height: cut the climb ONCE, on the release EDGE (not every frame
+        // the key is up), so a tap is a consistent short hop and rapid jump-spamming
+        // stays predictable instead of erratically chopping the velocity each frame.
+        if release_edge && cc.vertical_velocity > 0.0 {
+            cc.vertical_velocity *= JUMP_CUT;
+        }
+        // Fast-fall: while descending, add gravity beyond `resolve_ground`'s base
+        // `GRAVITY` (its ballistic branch subtracts `GRAVITY`; this tops the step up to
+        // `FALL_GRAVITY`), clamped to terminal velocity — a snappy, non-floaty descent.
+        if cc.vertical_velocity < 0.0 {
+            cc.vertical_velocity =
+                (cc.vertical_velocity - (FALL_GRAVITY - GRAVITY) * dt_s).max(-TERMINAL_VELOCITY);
         }
 
         if cc.jump_buffer > 0.0 && cc.coyote > 0.0 {
@@ -512,22 +574,35 @@ fn player_controller(
             );
             transform.translation.y = new_y;
             cc.grounded = grounded;
-            cc.vertical_velocity = new_vv;
+            cc.vertical_velocity = new_vv.max(-TERMINAL_VELOCITY);
         }
     }
 }
 
-/// Move `current` toward `target` by at most `max_delta` (never overshooting). The
-/// vector "move toward" ramp used to accelerate/decelerate the horizontal velocity for
-/// weighty-but-responsive movement.
-fn move_toward(current: Vec3, target: Vec3, max_delta: f32) -> Vec3 {
-    let delta = target - current;
-    let dist = delta.length();
-    if dist <= max_delta || dist < 1e-6 {
-        target
-    } else {
-        current + delta / dist * max_delta
+/// Source/Quake-style acceleration: nudge `vel` toward `wish_dir` up to `wish_speed`,
+/// adding at most `accel * wish_speed * dt`. Only the component still MISSING along
+/// `wish_dir` is added, so you can never exceed `wish_speed` in that direction but CAN
+/// redirect existing momentum (air-strafe) — and with no friction (air) that momentum
+/// persists. `wish_dir` must be unit (or zero); a zero dir adds nothing.
+fn accelerate(vel: Vec3, wish_dir: Vec3, wish_speed: f32, accel: f32, dt: f32) -> Vec3 {
+    let current = vel.dot(wish_dir);
+    let add = wish_speed - current;
+    if add <= 0.0 {
+        return vel;
     }
+    vel + wish_dir * (accel * wish_speed * dt).min(add)
+}
+
+/// Ground friction: decay horizontal speed toward zero each step. Below [`STOP_SPEED`]
+/// the decay uses `STOP_SPEED` as the rate so the player comes to a crisp, complete
+/// stop instead of asymptotically creeping.
+fn apply_friction(vel: Vec3, friction: f32, dt: f32) -> Vec3 {
+    let speed = vel.length();
+    if speed < 1e-4 {
+        return Vec3::ZERO;
+    }
+    let drop = speed.max(STOP_SPEED) * friction * dt;
+    vel * ((speed - drop).max(0.0) / speed)
 }
 
 /// Inclusive integer cell range `[lo, hi]` an axis-aligned span of half-width
@@ -664,10 +739,15 @@ fn resolve_ground(
     let within_snap = support_surface_y >= feet_y - GROUND_SNAP_DISTANCE;
     let min_y = support_surface_y + foot_offset;
 
-    // Only ease-follow when stationary/rising against an in-band surface; a body
-    // already carrying downward momentum is mid-fall and must integrate + land
-    // (so it clamps exactly onto the surface rather than easing toward it).
-    if vertical_velocity >= 0.0 && within_step_up && within_snap {
+    // Only ease-follow when STATIONARY against an in-band surface. A grounded body
+    // always carries `vertical_velocity == 0` (the grounded returns below set it to
+    // exactly 0), including while easing up a step or down a snap — so `== 0.0`
+    // captures every grounded case. A body with ANY vertical momentum is either
+    // JUMPING (vv > 0) or FALLING (vv < 0) and must integrate ballistically: using
+    // `>= 0.0` here let an in-band surface absorb the start of a jump (the feet are
+    // still within the snap band one tick after takeoff), easing the player straight
+    // back to the ground every time — they could never leave the floor.
+    if vertical_velocity == 0.0 && within_step_up && within_snap {
         // Rest the capsule on the surface; ease (don't hard-set) so step-ups
         // are a smooth rise, not a jolt.
         let k = 1.0 - (-GROUND_FOLLOW_RATE * dt_s).exp();
@@ -740,19 +820,43 @@ mod tests {
     /// A representative fixed-step delta (avian's default 64 Hz).
     const DT: f32 = 1.0 / 64.0;
 
-    // The movement ramp: steps toward the target by `max_delta`, snapping exactly when
-    // within one step (no overshoot/jitter) and decelerating cleanly to zero.
+    // Ground friction must bring the player to a CLEAN, complete stop (the crisp,
+    // non-floaty decel), not asymptotically creep.
     #[test]
-    fn move_toward_ramps_and_clamps() {
-        let v = move_toward(Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0), 3.0);
-        assert!((v - Vec3::new(3.0, 0.0, 0.0)).length() < 1e-5, "steps by max_delta");
-        let v = move_toward(Vec3::new(9.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0), 5.0);
-        assert_eq!(v, Vec3::new(10.0, 0.0, 0.0), "within one step snaps to target");
-        assert_eq!(
-            move_toward(Vec3::new(2.0, 0.0, 0.0), Vec3::ZERO, 5.0),
-            Vec3::ZERO,
-            "decelerates to zero"
+    fn friction_brings_speed_to_a_clean_stop() {
+        let mut v = Vec3::new(8.0, 0.0, 0.0);
+        for _ in 0..64 {
+            // ~1 s at 64 Hz
+            v = apply_friction(v, GROUND_FRICTION, DT);
+        }
+        assert!(
+            v.length() < 1e-3,
+            "friction must fully stop the player, got {}",
+            v.length()
         );
+    }
+
+    // Acceleration reaches the wish speed (~0.1 s) and never overshoots past it.
+    #[test]
+    fn accelerate_reaches_but_never_exceeds_wish_speed() {
+        let dir = Vec3::new(1.0, 0.0, 0.0);
+        let mut v = Vec3::ZERO;
+        for _ in 0..64 {
+            v = accelerate(v, dir, 8.0, GROUND_ACCEL, DT);
+        }
+        assert!((v.x - 8.0).abs() < 1e-2, "should reach wish speed, got {}", v.x);
+        let v2 = accelerate(v, dir, 8.0, GROUND_ACCEL, DT);
+        assert!(v2.x <= 8.0 + 1e-4, "must not exceed wish speed, got {}", v2.x);
+    }
+
+    // Air steering keeps existing perpendicular momentum (no air friction) while adding
+    // velocity toward the new direction — momentum-y air control, not free flight.
+    #[test]
+    fn air_accel_preserves_perpendicular_momentum() {
+        let v0 = Vec3::new(8.0, 0.0, 0.0);
+        let v = accelerate(v0, Vec3::new(0.0, 0.0, 1.0), 8.0, AIR_ACCEL, DT);
+        assert_eq!(v.x, 8.0, "perpendicular air-steer keeps existing momentum");
+        assert!(v.z > 0.0, "air-steer adds velocity toward the new direction");
     }
 
     /// Build a centre/feet pair resting exactly on `surface` (feet on the top
@@ -965,6 +1069,25 @@ mod tests {
         );
         assert!(vv < 0.0, "gravity pulls the velocity negative off the ledge");
         assert!(new_y < center, "the player starts descending");
+    }
+
+    // (f3) REGRESSION (the "can't jump" bug): a body with UPWARD velocity (a jump)
+    // sitting in the snap band one tick after takeoff must integrate ballistically
+    // and RISE — not get eased back onto the ground. The ease-follow branch keys on
+    // `vertical_velocity == 0.0` (grounded), so a positive velocity escapes it. With
+    // the old `>= 0.0` gate the in-band surface absorbed the jump and the player
+    // could never leave the floor.
+    #[test]
+    fn rising_jump_in_snap_band_stays_airborne() {
+        // Feet just above an in-band surface (within STEP_HEIGHT up / GROUND_SNAP
+        // down), carrying a fresh jump's upward velocity.
+        let (feet, center) = resting_on(5.0);
+        let surface = 5.0; // same surface the player just launched from (in-band)
+        let vv0 = JUMP_SPEED - GRAVITY * DT; // velocity right after takeoff
+        let (new_y, grounded, vv) = resolve_ground(feet, center, surface, FOOT_OFFSET, vv0, DT);
+        assert!(!grounded, "a rising jump must not be re-grounded by the snap band");
+        assert!(new_y > center, "the jump must carry the player upward");
+        assert!(vv > 0.0, "upward velocity persists (minus one gravity step)");
     }
 
     // --- footprint_surface: multi-cell support sampling ---

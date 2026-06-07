@@ -301,9 +301,12 @@ fn animate_player(
         return;
     };
     let dt = time.delta_secs();
-    // Drive the walk anim off the ACTUAL (ramped) horizontal speed, not the raw input, so
-    // the feet keep stepping through the brief decel slide after a key release.
-    let moving = cc.horizontal_velocity.length_squared() > 0.04;
+    // Walk cycle only while actually walking ON THE GROUND. Off the ground the legs
+    // used to keep "stepping" mid-air (the jump preserves horizontal momentum), which
+    // read as walking through the air — gate it on `grounded` so airborne / idle eases
+    // to the rest pose instead. Driven off the ACTUAL (ramped) speed so the feet keep
+    // stepping through the brief decel slide after a key release.
+    let moving = cc.grounded && cc.horizontal_velocity.length_squared() > 0.04;
     let feet = p_tf.translation - Vec3::Y * VISUAL_ROOT_OFFSET;
 
     // Face travel direction (yaw only, no tilt).

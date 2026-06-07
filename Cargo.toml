@@ -13,6 +13,7 @@ members = [
     "crates/inf3d_monitor",
     "crates/inf3d_audio",
     "crates/inf3d_app",
+    "crates/inf3d_editor",
 ]
 
 [workspace.package]
