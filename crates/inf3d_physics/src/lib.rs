@@ -30,7 +30,7 @@ use avian3d::math::Vector;
 use avian3d::prelude::*;
 use bevy::prelude::*;
 
-use inf3d_camera::IsoCamera;
+use inf3d_camera::OrbitCamera;
 use inf3d_core::{AppState, GameSet, Pause};
 use inf3d_worldgen::Terrain;
 
@@ -63,9 +63,10 @@ pub enum SolidPropCollider {
 }
 
 /// Per-player desired **horizontal** velocity this frame, written by gameplay's
-/// `follow_path` and consumed by [`player_controller`]. Routing intent through a
-/// component (rather than mutating `Transform`) lets the controller resolve
-/// collisions while keeping the click-to-move feel.
+/// `apply_move` (from the orbit camera's WASD intent) and consumed by
+/// [`player_controller`]. Routing intent through a component (rather than mutating
+/// `Transform`) lets the controller resolve collisions while gameplay only states
+/// intent.
 #[derive(Component, Default, Clone, Copy, Debug)]
 pub struct DesiredMove {
     /// Desired horizontal (XZ) velocity in world units per second.
@@ -83,6 +84,20 @@ pub struct CharacterController {
     pub vertical_velocity: f32,
     /// Whether the controller found ground last frame.
     pub grounded: bool,
+    /// Smoothed horizontal velocity (world u/s). Ramps toward the input target
+    /// ([`DesiredMove::velocity`]) at [`GROUND_ACCEL`]/[`GROUND_DECEL`]/[`AIR_ACCEL`] so
+    /// movement has weight instead of snapping on/off — this is what `move_and_slide`
+    /// actually integrates each step.
+    pub horizontal_velocity: Vec3,
+    /// Seconds of grace left to still count as grounded for a jump after walking off a
+    /// ledge (coyote time). Refilled to [`COYOTE_TIME`] while grounded, counts down airborne.
+    pub coyote: f32,
+    /// Seconds left on a buffered jump press, so a jump input just before landing still
+    /// fires (jump buffering). Refilled to [`JUMP_BUFFER_TIME`] on press, counts down.
+    pub jump_buffer: f32,
+    /// Jump button state last step, so the buffer arms only on the PRESS edge — holding
+    /// the key doesn't auto-rejump on every landing.
+    pub prev_jump: bool,
 }
 
 impl Default for CharacterController {
@@ -92,6 +107,10 @@ impl Default for CharacterController {
             half_height: PLAYER_DIMS.half_height,
             vertical_velocity: 0.0,
             grounded: false,
+            horizontal_velocity: Vec3::ZERO,
+            coyote: 0.0,
+            jump_buffer: 0.0,
+            prev_jump: false,
         }
     }
 }
@@ -148,29 +167,40 @@ pub const PLAYER_RADIUS: f32 = PLAYER_DIMS.radius;
 pub const PLAYER_HALF_HEIGHT: f32 = PLAYER_DIMS.half_height;
 /// Gravity acceleration (world units / s²), applied only while airborne.
 pub const GRAVITY: f32 = 24.0;
-/// Initial upward velocity for FPS/manual jumps.
+/// Initial upward velocity for a Space-key jump.
 pub const JUMP_SPEED: f32 = 9.0;
+/// Ground acceleration (world u/s²): how fast horizontal velocity ramps toward the input
+/// target. Sized so the player reaches walk speed (~8 u/s) in ~0.1 s — snappy but with a
+/// touch of weight, per game-feel norms (50–200 ms to top speed).
+pub const GROUND_ACCEL: f32 = 90.0;
+/// Ground deceleration (world u/s²) with no input — a quick, non-floaty stop.
+pub const GROUND_DECEL: f32 = 120.0;
+/// Air acceleration / deceleration (world u/s²): gentle, so a jump keeps its horizontal
+/// momentum and you land roughly where you aimed (limited mid-air steering).
+pub const AIR_ACCEL: f32 = 35.0;
+/// Coyote-time grace (seconds): you can still jump this long after walking off a ledge.
+pub const COYOTE_TIME: f32 = 0.12;
+/// Jump-buffer window (seconds): a jump pressed this long before landing still fires.
+pub const JUMP_BUFFER_TIME: f32 = 0.12;
 /// Max height (above the **feet**) the player will step up onto in one go. Set
 /// just above 1.0 so a single 1-unit voxel step is climbed smoothly while a
-/// 2-voxel cliff is rejected — this mirrors pathfinding's `MAX_STEP = 1` voxel
-/// (a path only routes over ≤1-voxel rises, so the controller must climb the
-/// same). Any rise up to this much (relative to the current feet) is climbed; a
-/// bigger jump down reads as a real ledge and the player falls.
+/// 2-voxel cliff is rejected. Any rise up to this much (relative to the current
+/// feet) is climbed; a bigger jump down reads as a real ledge and the player falls.
 pub const STEP_HEIGHT: f32 = 1.1;
 /// Extra reach below the feet within which the ground still "grabs" the player
 /// (keeps the feet glued to the surface on downhill steps instead of briefly
 /// going airborne). A drop larger than this leaves the player airborne.
 ///
 /// Sized to **mirror the climb cap on the way DOWN**: it is just above one voxel
-/// (matching [`STEP_HEIGHT`] / pathfinding's `MAX_STEP = 1`) so a single 1-voxel
-/// step down — the most common descent, and every tread of a built staircase —
+/// (matching [`STEP_HEIGHT`]) so a single 1-voxel step down — the most common
+/// descent, and every tread of a built staircase —
 /// stays grounded and *eases* down instead of flinging the player airborne for a
 /// frame. At `0.5` (the old value) a 1.0-voxel step sat OUTSIDE the snap band, so
 /// the controller went ballistic on every downward step: walking downhill or down
 /// stairs read as a constant series of little "jumps off ledges". A genuine ledge
 /// (a ≥2-voxel drop) is still beyond this and correctly goes airborne. Keeping the
-/// up cap ([`STEP_HEIGHT`]) and this down cap equal is what makes the locomotion
-/// able to execute, smoothly, exactly the ≤1-step routes the planner produces.
+/// up cap ([`STEP_HEIGHT`]) and this down cap equal is what makes WASD walking ease
+/// smoothly over 1-voxel steps in either direction instead of hopping downhill.
 pub const GROUND_SNAP_DISTANCE: f32 = 1.1;
 /// Distance the camera interaction ray travels before giving up.
 pub const INTERACT_RAY_LENGTH: f32 = 1000.0;
@@ -184,8 +214,8 @@ pub const GROUND_FOLLOW_RATE: f32 = 14.0;
 ///
 /// Both the "phase through a wall's side" and the "can't walk a 2×1 corridor"
 /// bugs trace to using the exact `PLAYER_RADIUS` (0.5) here. A capsule centred in
-/// a cell (which the pathfinder always aims for — waypoints are cell centres) has
-/// its edge land *exactly* on the neighbour cell boundary, and `floor()` then:
+/// a cell has its edge land *exactly* on the neighbour cell boundary, and
+/// `floor()` then:
 /// (a) reports the body as spanning TWO cells, so a 1-wide gap reads as blocked
 /// even though a 1-wide body fits; and (b) places the leading edge already inside
 /// the wall cell at the *start* of a step, so the `new_edge != old_edge` crossing
@@ -217,12 +247,13 @@ impl Plugin for PhysicsGamePlugin {
         // into a smooth per-frame `Transform` right after `FixedMain`. Using the
         // fixed delta + interpolation removes the variable-timestep jitter the
         // old `PostUpdate` controller fought. It still consumes the latest
-        // `DesiredMove` written by gameplay's per-frame `follow_path` (Update).
+        // `DesiredMove` written by gameplay's `apply_move` (also `FixedUpdate`).
         // Gated to un-paused play: the controller runs in `FixedPostUpdate` (not a
         // `GameSet`), so the core gating lever does NOT cover it. Without this it
         // would keep integrating the player (gravity, ground-follow, the last
-        // `DesiredMove`) while the menu/pause is up. The menu also pauses
-        // `Time<Physics>` so avian's own solver freezes; this stops OUR integrator.
+        // `DesiredMove` written by gameplay's `apply_move` in `FixedUpdate`) while
+        // the menu/pause is up. The menu also pauses `Time<Physics>` so avian's own
+        // solver freezes; this stops OUR integrator.
         app.add_systems(
             FixedPostUpdate,
             player_controller
@@ -268,7 +299,7 @@ fn build_prop_colliders(
 /// `Writeback` so our `Transform` write is the final word for the step; avian's
 /// `TransformInterpolation` then eases it smoothly between steps.
 ///
-/// Horizontal: the desired (pathfinding) velocity is run through `move_and_slide`
+/// Horizontal: the desired (WASD) velocity is run through `move_and_slide`
 /// against **solid props only**, so trees/rocks block and the player slides
 /// along them — terrain is deliberately not a horizontal wall, so the player is
 /// never stopped dead by a 1-voxel step.
@@ -357,7 +388,22 @@ fn player_controller(
         // stops counting as one and you can move over it. ---
         let prop_filter =
             SpatialQueryFilter::from_mask([GameLayer::Solid]).with_excluded_entities([entity]);
-        let h_velocity = Vec3::new(desired.velocity.x, 0.0, desired.velocity.z);
+        // Ramp the horizontal velocity toward the input target instead of snapping to it:
+        // snappy accel + a quick decel on the ground (weight without floatiness), gentle
+        // in the air (a jump keeps its momentum and lands where aimed). This
+        // `cc.horizontal_velocity` is what `move_and_slide` integrates below.
+        let target_h = Vec3::new(desired.velocity.x, 0.0, desired.velocity.z);
+        let accel = if cc.grounded {
+            if target_h.length_squared() > 1e-6 {
+                GROUND_ACCEL
+            } else {
+                GROUND_DECEL
+            }
+        } else {
+            AIR_ACCEL
+        };
+        cc.horizontal_velocity = move_toward(cc.horizontal_velocity, target_h, accel * dt_s);
+        let h_velocity = cc.horizontal_velocity;
         let old_xz = transform.translation;
         let mut new_pos = old_xz;
         if h_velocity.length_squared() > 1e-6 {
@@ -372,6 +418,12 @@ fn player_controller(
                 |_hit| MoveAndSlideHitResponse::Accept,
             );
             new_pos = out.position;
+            // Keep this phase strictly HORIZONTAL: `move_and_slide`'s depenetration
+            // pass and slide projection against a prop's contact plane can nudge Y,
+            // but the controller is the sole authority on the player's vertical
+            // position (the analytic-ground pass below recomputes it). Discard any
+            // leaked Y here so the two can't fight.
+            new_pos.y = old_xz.y;
         }
         // Block each axis when the capsule's LEADING EDGE crosses into a wall cell
         // that wasn't a wall at the old edge — so the body stops at the wall FACE
@@ -423,7 +475,29 @@ fn player_controller(
             |cx, cz| terrain.is_land(cx, cz),
         );
 
-        if desired.jump && cc.grounded {
+        // Coyote time + jump buffering for a forgiving, AAA-feel jump. Refill the coyote
+        // grace while grounded (count down airborne), and (re)arm the buffer on a press
+        // (count down otherwise). A jump fires when a buffered press meets remaining
+        // grace — so a press slightly before landing OR slightly after leaving a ledge
+        // still works.
+        if cc.grounded {
+            cc.coyote = COYOTE_TIME;
+        } else {
+            cc.coyote = (cc.coyote - dt_s).max(0.0);
+        }
+        // Arm the buffer only on the PRESS edge (down this step, up last step), so
+        // holding the key doesn't auto-rejump on every landing.
+        let jump_edge = desired.jump && !cc.prev_jump;
+        cc.prev_jump = desired.jump;
+        if jump_edge {
+            cc.jump_buffer = JUMP_BUFFER_TIME;
+        } else {
+            cc.jump_buffer = (cc.jump_buffer - dt_s).max(0.0);
+        }
+
+        if cc.jump_buffer > 0.0 && cc.coyote > 0.0 {
+            cc.jump_buffer = 0.0;
+            cc.coyote = 0.0;
             cc.grounded = false;
             cc.vertical_velocity = JUMP_SPEED - GRAVITY * dt_s;
             transform.translation.y += JUMP_SPEED * dt_s;
@@ -440,6 +514,19 @@ fn player_controller(
             cc.grounded = grounded;
             cc.vertical_velocity = new_vv;
         }
+    }
+}
+
+/// Move `current` toward `target` by at most `max_delta` (never overshooting). The
+/// vector "move toward" ramp used to accelerate/decelerate the horizontal velocity for
+/// weighty-but-responsive movement.
+fn move_toward(current: Vec3, target: Vec3, max_delta: f32) -> Vec3 {
+    let delta = target - current;
+    let dist = delta.length();
+    if dist <= max_delta || dist < 1e-6 {
+        target
+    } else {
+        current + delta / dist * max_delta
     }
 }
 
@@ -553,7 +640,7 @@ fn footprint_surface(
 ///   isn't teleported up) and down to [`GROUND_SNAP_DISTANCE`] below the feet
 ///   (snap range on descents) — the feet ease onto it at [`GROUND_FOLLOW_RATE`],
 ///   grounded, zero vertical velocity. Gating on the feet (not the centre) keeps
-///   the climb cap at ~1 voxel, matching pathfinding's `MAX_STEP = 1`.
+///   the climb cap at ~1 voxel (one voxel step).
 /// * **Ballistic (airborne / out of band):** otherwise apply [`GRAVITY`] and
 ///   integrate, then LAND (clamp onto the surface, re-ground) the moment the
 ///   step reaches the support's rest height (`new_y <= min_y`). The caller only
@@ -604,26 +691,24 @@ fn resolve_ground(
     }
 }
 
-/// Refresh [`InteractionTarget`] by raycasting from the camera through the
-/// cursor (falls back to camera-forward) against the solid-prop layer only.
+/// Refresh [`InteractionTarget`] by raycasting from the camera along its forward
+/// axis — the **screen-center crosshair** for a centered viewport — against the
+/// solid-prop layer only.
 fn update_interaction_target(
     spatial: SpatialQuery,
-    windows: Query<&Window>,
-    cam_q: Query<(&Camera, &GlobalTransform), With<IsoCamera>>,
+    cam_q: Query<&GlobalTransform, With<OrbitCamera>>,
     mut target: ResMut<InteractionTarget>,
 ) {
-    let Ok((camera, cam_tf)) = cam_q.single() else {
+    let Ok(cam_tf) = cam_q.single() else {
         return;
     };
 
-    let ray = windows
-        .iter()
-        .find_map(|w| w.cursor_position())
-        .and_then(|cursor| camera.viewport_to_world(cam_tf, cursor).ok())
-        .unwrap_or_else(|| Ray3d {
-            origin: cam_tf.translation(),
-            direction: Dir3::new(cam_tf.forward().as_vec3()).unwrap_or(Dir3::NEG_Z),
-        });
+    // Camera-forward is the screen center for a centered viewport, so the
+    // interaction pick lines up with the crosshair drawn by `inf3d_ui`.
+    let ray = Ray3d {
+        origin: cam_tf.translation(),
+        direction: Dir3::new(cam_tf.forward().as_vec3()).unwrap_or(Dir3::NEG_Z),
+    };
 
     let filter = SpatialQueryFilter::from_mask([GameLayer::Solid]);
     let hit = spatial.cast_ray(
@@ -654,6 +739,21 @@ mod tests {
     const FOOT_OFFSET: f32 = PLAYER_HALF_HEIGHT + PLAYER_RADIUS;
     /// A representative fixed-step delta (avian's default 64 Hz).
     const DT: f32 = 1.0 / 64.0;
+
+    // The movement ramp: steps toward the target by `max_delta`, snapping exactly when
+    // within one step (no overshoot/jitter) and decelerating cleanly to zero.
+    #[test]
+    fn move_toward_ramps_and_clamps() {
+        let v = move_toward(Vec3::ZERO, Vec3::new(10.0, 0.0, 0.0), 3.0);
+        assert!((v - Vec3::new(3.0, 0.0, 0.0)).length() < 1e-5, "steps by max_delta");
+        let v = move_toward(Vec3::new(9.0, 0.0, 0.0), Vec3::new(10.0, 0.0, 0.0), 5.0);
+        assert_eq!(v, Vec3::new(10.0, 0.0, 0.0), "within one step snaps to target");
+        assert_eq!(
+            move_toward(Vec3::new(2.0, 0.0, 0.0), Vec3::ZERO, 5.0),
+            Vec3::ZERO,
+            "decelerates to zero"
+        );
+    }
 
     /// Build a centre/feet pair resting exactly on `surface` (feet on the top
     /// face), the steady state the controller converges to.

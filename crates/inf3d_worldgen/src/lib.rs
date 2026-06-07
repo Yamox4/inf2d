@@ -1,5 +1,5 @@
 //! Procedural terrain generation and the shared height oracle used by both
-//! meshing (on worker threads) and gameplay (pathfinding/standing).
+//! meshing (on worker threads) and gameplay (physics ground / standing).
 
 use bevy::prelude::*;
 use noise::{HybridMulti, NoiseFn, Perlin};
@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 /// terrain tier (the seafloor, material 3) stands at `y = 1`; land tiers stand
 /// at `y >= 2`. Water at 1.6 therefore submerges only the seafloor flats and
 /// leaves land dry. A column is "water" (unwalkable) when its standing height
-/// is below this. Single source of truth shared with `water.rs` + pathfinding.
+/// is below this. Single source of truth shared with `water.rs` + the physics ground.
 pub const WATER_HEIGHT: f32 = 1.6;
 
 /// Canonical octave count at full (LOD 0) detail.
@@ -101,7 +101,7 @@ pub fn build_noise() -> HybridMulti<Perlin> {
 /// cheapens generation on the worker threads and avoids encoding
 /// high-frequency surface detail that a downsampled (coarse) chunk mesh can't
 /// represent anyway. The gameplay oracle ([`Terrain`]) always uses LOD 0 so
-/// pathfinding/standing stay consistent with the finest visible geometry.
+/// physics ground / standing stay consistent with the finest visible geometry.
 ///
 /// At least two octaves are always kept so the broad landmass shape survives.
 pub fn build_noise_lod(lod: u8) -> HybridMulti<Perlin> {
@@ -135,7 +135,7 @@ pub fn sample_height(noise: &HybridMulti<Perlin>, x: i32, z: i32) -> f64 {
 /// truth for the land/water/seafloor *classification*: both the [`Terrain`]
 /// gameplay oracle and `inf3d_world::get_voxel_fn` (the meshing delegate on
 /// worker threads) derive their land/water answer from [`column_kind`], so the
-/// surface a player stands/pathfinds on agrees with the material picked for a
+/// surface a player stands on agrees with the material picked for a
 /// voxel — given the same sampled height. The height itself is not identical
 /// everywhere: meshing may sample LOD-reduced noise for far chunks (shifting
 /// their visual coastline), whereas the oracle always samples LOD-0; see
@@ -184,6 +184,126 @@ impl ColumnKind {
 /// haven't already sampled the height.
 pub fn column_kind(noise: &HybridMulti<Perlin>, x: i32, z: i32) -> ColumnKind {
     ColumnKind::from_height(sample_height(noise, x, z))
+}
+
+// ---------------------------------------------------------------------------
+// Biomes (appearance only — surface material + foliage; never geometry)
+// ---------------------------------------------------------------------------
+
+/// Biome classification of a land column — drives the SURFACE material the mesher
+/// picks (`inf3d_world::get_voxel_fn`) and the foliage the streamer scatters
+/// (`inf3d_render::foliage`).
+///
+/// **Appearance only.** A biome NEVER changes `surface_y` / `is_water` /
+/// [`column_kind`], so physics ground and the meshed surface are provably
+/// unaffected — per-biome terrain *height* is a deliberate future step, not this
+/// one. The classification is a Whittaker-style temperature×moisture split (two
+/// low-frequency noises) with a coastal [`Beach`](Biome::Beach) override.
+///
+/// It is **LOD-independent**: the biome noises are low frequency and always
+/// sampled at full detail (unlike the height field, which drops octaves on far
+/// chunks), so the mesher (worker threads, any LOD) and the gameplay oracle
+/// ([`Terrain::biome_at`]) classify a column the same way — no coastline-style
+/// drift between the surface a player walks and the material it's textured with.
+///
+/// Discriminants are stable (consumers may map them to materials / foliage sets);
+/// append new biomes at the end.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[repr(u8)]
+pub enum Biome {
+    /// Temperate grassland — green grass, sparse trees.
+    Plains = 0,
+    /// Wet/warm woodland — dense trees, grass.
+    Forest = 1,
+    /// Hot + dry — sand ground, cacti, no grass.
+    Desert = 2,
+    /// Cold — snow ground, sparse conifers, no grass.
+    Snow = 3,
+    /// Coastal sand just above the waterline (a height override, applied before
+    /// the temperature×moisture split) — palms, no grass.
+    Beach = 4,
+}
+
+/// Perlin seed for the temperature field. Distinct from the terrain height seed
+/// (`1234`) and the moisture seed so the three fields are independent.
+const TEMPERATURE_SEED: u32 = 70_001;
+/// Perlin seed for the moisture field.
+const MOISTURE_SEED: u32 = 70_002;
+/// Horizontal scale (world voxels per noise unit) of the biome fields. Larger =
+/// bigger, smoother biome regions. ~600 gives patches a few hundred voxels across,
+/// so a walk crosses a biome boundary every so often rather than constantly.
+const BIOME_NOISE_SCALE: f64 = 600.0;
+
+/// Land columns whose standing height (`surface_y + 1`) is at or below this read
+/// as coastal [`Beach`](Biome::Beach) — the lowest dry tiers hugging the shore.
+/// Seafloor (water) stands at `y <= 1` (see [`WATER_HEIGHT`]); the first dry tiers
+/// (stand `2..=3`) are the sandy beach, above which the temperature×moisture biome
+/// takes over.
+const BEACH_MAX_STAND_Y: i32 = 3;
+
+// Temperature×moisture thresholds (Perlin output sits roughly in [-1, 1], mostly
+// within ±0.7). Tuned for a balanced spread; these are the knobs to retune the mix.
+const COLD_THRESHOLD: f64 = -0.25;
+const HOT_THRESHOLD: f64 = 0.15;
+const DRY_THRESHOLD: f64 = -0.05;
+const WET_THRESHOLD: f64 = 0.15;
+
+/// Build the temperature noise — the same parameters used by the mesher (per
+/// worker) and the [`Terrain`] biome oracle, so both classify a column identically.
+pub fn build_temperature_noise() -> Perlin {
+    Perlin::new(TEMPERATURE_SEED)
+}
+
+/// Build the moisture noise (companion to [`build_temperature_noise`]).
+pub fn build_moisture_noise() -> Perlin {
+    Perlin::new(MOISTURE_SEED)
+}
+
+/// Sample the temperature field at a world column (Perlin, ~[-1, 1]).
+pub fn sample_temperature(noise: &Perlin, x: i32, z: i32) -> f64 {
+    noise.get([x as f64 / BIOME_NOISE_SCALE, z as f64 / BIOME_NOISE_SCALE])
+}
+
+/// Sample the moisture field at a world column. The lattice is offset from the
+/// temperature sample so the two axes aren't spatially correlated (otherwise hot
+/// regions would always be wet and the Whittaker split would collapse).
+pub fn sample_moisture(noise: &Perlin, x: i32, z: i32) -> f64 {
+    noise.get([
+        (x as f64 + 1000.0) / BIOME_NOISE_SCALE,
+        (z as f64 - 1000.0) / BIOME_NOISE_SCALE,
+    ])
+}
+
+/// Classify a column from already-sampled temperature/moisture plus its standing
+/// height and water flag — the pure core of the biome split, factored out so the
+/// meshing closure can reuse its per-column cached height/classification instead
+/// of re-sampling. Both [`Terrain::biome_at`] and `inf3d_world::get_voxel_fn` run
+/// the *exact* same logic here, so the biome a column is textured with matches the
+/// biome its foliage is scattered for.
+///
+/// Order matters: the coastal [`Beach`](Biome::Beach) override (a height rule)
+/// wins over the temperature×moisture split. Water columns aren't a biome (the
+/// mesher emits seafloor directly); a neutral [`Plains`](Biome::Plains) is returned
+/// for them so the function is total.
+pub fn classify_biome(temperature: f64, moisture: f64, stand_y: i32, is_water: bool) -> Biome {
+    if is_water {
+        // Not a biome — the mesher textures water as seafloor regardless. Total-fn default.
+        return Biome::Plains;
+    }
+    // Coastal override: the lowest dry tiers just above the waterline are sandy beach.
+    if stand_y <= BEACH_MAX_STAND_Y {
+        return Biome::Beach;
+    }
+    if temperature < COLD_THRESHOLD {
+        return Biome::Snow;
+    }
+    if temperature > HOT_THRESHOLD && moisture < DRY_THRESHOLD {
+        return Biome::Desert;
+    }
+    if moisture > WET_THRESHOLD {
+        return Biome::Forest;
+    }
+    Biome::Plains
 }
 
 // ---------------------------------------------------------------------------
@@ -247,9 +367,9 @@ struct VoxelOverrideData {
 /// * the **mesher** ([`crate`] consumer `inf3d_world::get_voxel_fn`) snapshots it
 ///   so an edited block is meshed (visible) exactly as placed/removed;
 /// * the [`Terrain`] oracle consults it so `surface_y` / `is_land` / `stand_pos`
-///   reflect edits — and because the **physics controller's analytic ground** and
-///   the **pathfinder** both read through `Terrain`, they inherit edits for free
-///   (walkable + route-blocking) with no extra wiring.
+///   reflect edits — and because the **physics controller's analytic ground**
+///   reads through `Terrain`, it inherits edits for free (walkable surfaces +
+///   wall blocking) with no extra wiring.
 ///
 /// Cloning is cheap (an `Arc` bump) and every clone shares the one store, so the
 /// resource handed to the block module, the copy inside `Terrain`, and the copy
@@ -477,12 +597,19 @@ pub struct Terrain {
     noise: HybridMulti<Perlin>,
     /// Player edits layered over the procedural surface (see [`VoxelOverrides`]).
     /// Shared (an `Arc`) with the mesher and the block module, so the surface the
-    /// oracle reports — and therefore physics ground + pathfinding, which read
+    /// oracle reports — and therefore physics ground, which reads
     /// through this oracle — always matches the edited, meshed geometry.
     overrides: VoxelOverrides,
     /// Shared flat-vs-procedural selector (see [`WorldGen`]). Shared with the
     /// mesher so the oracle's surface and the meshed surface agree in both worlds.
     world_gen: WorldGen,
+    /// Temperature + moisture fields backing [`biome_at`](Self::biome_at). Built
+    /// with the same canonical seeds the mesher uses (see
+    /// [`build_temperature_noise`] / [`build_moisture_noise`]) so the oracle and
+    /// the meshing closure classify a column's biome identically. Cheap to clone
+    /// (just `Perlin` parameters), so workers snapshot the oracle freely.
+    temp_noise: Perlin,
+    moist_noise: Perlin,
 }
 
 impl Terrain {
@@ -494,6 +621,8 @@ impl Terrain {
             noise: build_noise(),
             overrides: VoxelOverrides::default(),
             world_gen: WorldGen::default(),
+            temp_noise: build_temperature_noise(),
+            moist_noise: build_moisture_noise(),
         }
     }
 
@@ -506,6 +635,8 @@ impl Terrain {
             noise: build_noise(),
             overrides,
             world_gen: WorldGen::default(),
+            temp_noise: build_temperature_noise(),
+            moist_noise: build_moisture_noise(),
         }
     }
 
@@ -518,6 +649,8 @@ impl Terrain {
             noise: build_noise(),
             overrides,
             world_gen,
+            temp_noise: build_temperature_noise(),
+            moist_noise: build_moisture_noise(),
         }
     }
 
@@ -526,22 +659,22 @@ impl Terrain {
     /// helper that all the public accessors below delegate to, so the oracle
     /// applies the *same* land/water classification as the meshing closure
     /// (which calls [`column_kind`] directly) AND the same edits the mesher sees.
-    /// The oracle always samples LOD-0, so it is the authority navigation trusts
-    /// where an LOD-reduced far chunk's visual coastline would differ.
+    /// The oracle always samples LOD-0, so it is the authority physics ground
+    /// trusts where an LOD-reduced far chunk's visual coastline would differ.
     ///
     /// Unedited columns (the overwhelming majority) hit the [`VoxelOverrides`]
     /// fast path and cost exactly what they did before edits existed.
     /// The flat-or-procedural classification of a column BEFORE player edits — the
     /// SINGLE flat-aware base that BOTH [`Terrain::column`] and
     /// [`Terrain::surface_y_near`] build on, so the oracle's reported surface (and
-    /// therefore physics ground + pathfinding) can never disagree with the meshed
+    /// therefore physics ground) can never disagree with the meshed
     /// world in either the flat test world or procedural terrain.
     ///
     /// Flat test world: every column is the same constant surface (no noise),
     /// classified through the exact same helper as procedural so edits, water, and
     /// standing heights behave identically. (Regression guard: `surface_y_near`
     /// once sampled the procedural noise directly here, so under a flat-meshed
-    /// world the player walked/pathfound on invisible procedural hills.)
+    /// world the player walked on invisible procedural hills.)
     fn base_kind(&self, x: i32, z: i32) -> ColumnKind {
         match self.world_gen.kind() {
             WorldKind::Normal => column_kind(&self.noise, x, z),
@@ -608,6 +741,25 @@ impl Terrain {
     /// line). Seafloor flats sit under the water and are not walkable.
     pub fn is_land(&self, x: i32, z: i32) -> bool {
         !self.column(x, z).is_water
+    }
+
+    /// The [`Biome`] of column `(x, z)`. Appearance only — drives the surface
+    /// material (`inf3d_world`) and foliage (`inf3d_render`), never the geometry.
+    ///
+    /// Classified from the EDITED column (so building a column up out of the
+    /// coastal band re-classifies it off [`Biome::Beach`], consistent with the
+    /// meshed material) through the SAME [`classify_biome`] the mesher calls, so
+    /// the biome a column is textured with matches the biome its foliage scatters
+    /// for. The biome noises are LOD-independent, so this LOD-0 oracle agrees with
+    /// a far chunk meshed at a reduced LOD.
+    pub fn biome_at(&self, x: i32, z: i32) -> Biome {
+        let col = self.column(x, z);
+        classify_biome(
+            sample_temperature(&self.temp_noise, x, z),
+            sample_moisture(&self.moist_noise, x, z),
+            col.stand_y(),
+            col.is_water,
+        )
     }
 
     /// Nearest land column to `start` (spiral ring search), so entities never
@@ -781,8 +933,8 @@ mod tests {
     }
 
     // REGRESSION (the flat-world "invisible hills"): in flat mode EVERY oracle
-    // accessor — including `surface_y_near`, which the physics controller and
-    // pathfinder use for the WALKING surface — must report the constant flat
+    // accessor — including `surface_y_near`, which the physics controller
+    // uses for the WALKING surface — must report the constant flat
     // surface, NOT the procedural noise. The bug was `surface_y_near` sampling the
     // noise directly while `surface_y`/`column` honored the flat flag, so the
     // player walked on invisible procedural hills under a flat-meshed world.
@@ -808,6 +960,81 @@ mod tests {
                 t.is_land(x, z),
                 "flat world stands above the water line at ({x},{z})"
             );
+        }
+    }
+
+    // --- Biomes (appearance-only) ---
+
+    #[test]
+    fn classify_biome_rules() {
+        // Coastal override wins regardless of temp/moisture (low standing tier).
+        assert_eq!(
+            classify_biome(0.9, -0.9, BEACH_MAX_STAND_Y, false),
+            Biome::Beach
+        );
+        assert_eq!(classify_biome(-0.9, 0.9, 2, false), Biome::Beach);
+        // Above the beach band, the temperature×moisture split applies.
+        let dry_y = BEACH_MAX_STAND_Y + 5;
+        assert_eq!(
+            classify_biome(-0.5, 0.0, dry_y, false),
+            Biome::Snow,
+            "cold => snow"
+        );
+        assert_eq!(
+            classify_biome(0.5, -0.5, dry_y, false),
+            Biome::Desert,
+            "hot + dry => desert"
+        );
+        assert_eq!(
+            classify_biome(0.0, 0.5, dry_y, false),
+            Biome::Forest,
+            "wet (temperate) => forest"
+        );
+        assert_eq!(
+            classify_biome(0.0, 0.0, dry_y, false),
+            Biome::Plains,
+            "neutral => plains"
+        );
+        // Hot but WET is not desert (moisture gate) — falls through to forest.
+        assert_eq!(classify_biome(0.5, 0.5, dry_y, false), Biome::Forest);
+    }
+
+    #[test]
+    fn classify_biome_water_is_total_not_a_biome() {
+        // Water columns aren't a biome; the function stays total with a neutral default.
+        assert_eq!(classify_biome(0.0, 0.0, 1, true), Biome::Plains);
+    }
+
+    #[test]
+    fn biome_at_is_deterministic_and_varies() {
+        let t = Terrain::new();
+        let mut seen = std::collections::HashSet::new();
+        for x in (-1500..1500).step_by(120) {
+            for z in (-1500..1500).step_by(120) {
+                let a = t.biome_at(x, z);
+                let b = t.biome_at(x, z);
+                assert_eq!(a, b, "biome_at not stable at ({x},{z})");
+                seen.insert(a);
+            }
+        }
+        // The temperature×moisture fields must actually produce a MIX of biomes
+        // over a wide area (a single-biome world would mean a dead classifier).
+        assert!(
+            seen.len() >= 3,
+            "expected several biomes across the world, saw {seen:?}"
+        );
+    }
+
+    #[test]
+    fn biome_does_not_change_surface_or_water() {
+        // Appearance-only invariant: exposing biome_at must not perturb the
+        // navigation/standing surface — it stays exactly the raw column answer.
+        let t = Terrain::new();
+        let noise = build_noise();
+        for (x, z) in [(0, 0), (320, -210), (-640, 480), (37, 91)] {
+            let _ = t.biome_at(x, z); // available, but irrelevant to the surface
+            assert_eq!(t.surface_y(x, z), column_kind(&noise, x, z).surface_y);
+            assert_eq!(t.is_land(x, z), !column_kind(&noise, x, z).is_water);
         }
     }
 }

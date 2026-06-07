@@ -7,7 +7,7 @@
 //! `+1`). The player spawns near `(0,0)`. Two lanes run along +X:
 //! - WALK lane (z ≈ -1..1): a 1-step, a 2-high wall (must detour), a 3-step
 //!   staircase up to a plateau (its far edge is a ledge/drop), a 2-deep pit, a
-//!   1-per-cell ramp, a water well, and a roofed passage (level-aware nav).
+//!   1-per-cell ramp, a water well, and a roofed passage (level-aware standing).
 //! - BUILD lane (z ≈ 9..13): an open pad, a wall face to place onto, a mound to
 //!   dig, a tall wall to carve a niche + cap into (the wall-climb regression), and
 //!   a breakable pillar.
@@ -20,8 +20,8 @@ use inf3d_worldgen::{VoxelOverrides, FLAT_SURFACE_Y};
 const TOP: i32 = FLAT_SURFACE_Y;
 
 /// Structures are stamped as `Built*` (player-build) materials, never natural terrain
-/// ones, so the whole test layout reads as player-placed: it exercises the see-through
-/// cutout (material index >= `BUILT_MATERIAL_BASE`) and stays distinct from the flat
+/// ones, so the whole test layout reads as player-placed: every structure carries a
+/// build-vs-terrain index (>= `BUILT_MATERIAL_BASE`) and stays distinct from the flat
 /// ground. `BuiltStone`/`BuiltDirt` look like stone/dirt but are the placeable
 /// variants the picker also uses.
 fn stone() -> u8 {
@@ -66,7 +66,7 @@ fn stamp_walk_lane(o: &VoxelOverrides) {
     fill(o, 5, 6, TOP + 1, TOP + 1, -1, 1, stone());
 
     // (2) 2-high wall: above the 1-voxel step cap, so it CANNOT be climbed —
-    // pathfinding must detour around the open z-ends.
+    // you must walk around it via the open z-ends.
     fill(o, 10, 10, TOP + 1, TOP + 2, -2, 2, stone());
 
     // (3) 3-step staircase up to a plateau; each step rises 1 (climbable). The
@@ -92,8 +92,8 @@ fn stamp_walk_lane(o: &VoxelOverrides) {
     dig(o, 34, 36, 1, TOP, -1, 1);
 
     // (7) Roofed passage: 4 corner pillars + a roof leave a 2-tall covered area
-    // (>= STAND_HEADROOM), so the pathfinder/standing follows the player UNDER the
-    // roof instead of onto it — the level-aware navigation case.
+    // (>= STAND_HEADROOM), so standing resolves the player UNDER the roof instead
+    // of onto it — the level-aware standing case.
     for (px, pz) in [(40, -1), (40, 1), (43, -1), (43, 1)] {
         fill(o, px, px, TOP + 1, TOP + 3, pz, pz, stone());
     }

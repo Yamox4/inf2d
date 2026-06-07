@@ -63,7 +63,12 @@ impl Plugin for HudPlugin {
             .init_resource::<HudStats>()
             .add_systems(
                 Startup,
-                (spawn_hud, spawn_mode_buttons, spawn_material_picker),
+                (
+                    spawn_hud,
+                    spawn_mode_buttons,
+                    spawn_material_picker,
+                    spawn_crosshair,
+                ),
             )
             // The in-game HUD + mode buttons show only during `AppState::InGame`
             // (they spawn hidden — we boot into the menu). In `Fx`, which stays
@@ -147,6 +152,40 @@ fn spawn_hud(mut commands: Commands) {
         Visibility::Hidden,
         InGameUi,
         HudText,
+    ));
+}
+
+/// Diameter (px) of the centered crosshair dot.
+const CROSSHAIR_SIZE: f32 = 4.0;
+
+/// Spawn a tiny centered crosshair dot, shown only in-game (the cursor is captured
+/// in play, so the player aims with the screen center). Built in the same
+/// [`InGameUi`] family as the HUD so [`sync_hud_visibility`] toggles it on the
+/// menu<->game transition; it spawns hidden because the game boots into the menu.
+/// Positioned by anchoring its top-left at screen center and pulling it back half
+/// its size, so its center sits exactly at the viewport center regardless of
+/// resolution. A plain (non-`Button`/non-`Interaction`) node captures no clicks.
+fn spawn_crosshair(mut commands: Commands) {
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Percent(50.0),
+            top: Val::Percent(50.0),
+            width: Val::Px(CROSSHAIR_SIZE),
+            height: Val::Px(CROSSHAIR_SIZE),
+            // Pull the dot back by half its size so its CENTER lands on screen center.
+            margin: UiRect {
+                left: Val::Px(-CROSSHAIR_SIZE / 2.0),
+                top: Val::Px(-CROSSHAIR_SIZE / 2.0),
+                ..default()
+            },
+            ..default()
+        },
+        BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.6)),
+        // Hidden until the player enters a game (we boot into the main menu); the
+        // blanket `InGameUi` show-on-enter reveals it in play.
+        Visibility::Hidden,
+        InGameUi,
     ));
 }
 

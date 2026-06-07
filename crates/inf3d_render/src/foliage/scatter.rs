@@ -23,7 +23,9 @@ use rand::{Rng, SeedableRng};
 
 use inf3d_worldgen::{Terrain, WATER_HEIGHT};
 
-use super::{footprint_radius, tile_seed, ScatterCategory, ScatterItem, SolidVariantSizes, TILE};
+use super::{
+    biome_policy, footprint_radius, tile_seed, ScatterCategory, ScatterItem, SolidVariantSizes, TILE,
+};
 
 // Per-column probability of spawning each foliage category.
 const TREE_DENSITY: f32 = 0.004;
@@ -76,22 +78,46 @@ pub(super) fn scatter_solid(
             if pos.y <= WATER_HEIGHT {
                 continue;
             }
+            // Biome is a pure function of (x, z), so reading it here keeps the
+            // scatter deterministic: the same column always classifies the same
+            // way run to run. The policy gates BOTH categories' densities and the
+            // tree variant subset, and is recorded on every emitted item so
+            // `spawn` can pick the biome's tinted material.
+            let biome = terrain.biome_at(x, z);
+            let policy = biome_policy(biome);
+
             let yaw = snap_yaw(&mut rng);
             let xz = Vec2::new(pos.x, pos.z);
 
-            if !sizes.trees.is_empty() && rng.random::<f32>() < TREE_DENSITY {
-                let variant = rng.random_range(0..sizes.trees.len());
-                if try_place_solid(&mut solid_footprints, xz, sizes.trees[variant]) {
-                    items.push(ScatterItem {
-                        category: ScatterCategory::Tree,
-                        variant,
-                        pos,
-                        yaw,
-                    });
+            // Trees, gated by the biome's tree multiplier. CRUCIAL for
+            // determinism: we always advance the RNG the SAME way per column
+            // regardless of which (if any) tree variants the biome allows — the
+            // `rng.random::<f32>()` density roll and, when it fires, the
+            // `random_range` variant roll happen unconditionally. We then MAP the
+            // rolled index onto the biome's eligible subset (preserving original
+            // indices), so changing the biome's allowed set never shifts the RNG
+            // stream and thus never perturbs neighbouring columns/tiles.
+            if !sizes.trees.is_empty() && rng.random::<f32>() < TREE_DENSITY * policy.tree_mul {
+                // Roll an index across ALL trees (fixed RNG consumption), then
+                // restrict to the biome's eligible variants. If none are eligible,
+                // skip trees for this column (still consumed the same RNG).
+                let rolled = rng.random_range(0..sizes.trees.len());
+                if let Some(variant) = pick_eligible_tree(sizes, policy.tree_names, rolled) {
+                    if try_place_solid(&mut solid_footprints, xz, sizes.trees[variant]) {
+                        items.push(ScatterItem {
+                            category: ScatterCategory::Tree,
+                            variant,
+                            pos,
+                            yaw,
+                            biome,
+                        });
+                    }
                 }
                 continue;
             }
-            if !sizes.rocks.is_empty() && rng.random::<f32>() < ROCK_DENSITY {
+            // Rocks, gated by the biome's rock multiplier (no name filter — every
+            // rock is allowed in every biome).
+            if !sizes.rocks.is_empty() && rng.random::<f32>() < ROCK_DENSITY * policy.rock_mul {
                 let variant = rng.random_range(0..sizes.rocks.len());
                 if try_place_solid(&mut solid_footprints, xz, sizes.rocks[variant]) {
                     items.push(ScatterItem {
@@ -99,6 +125,7 @@ pub(super) fn scatter_solid(
                         variant,
                         pos,
                         yaw,
+                        biome,
                     });
                 }
             }
@@ -151,14 +178,26 @@ pub(super) fn scatter_grass(
             if pos.y <= WATER_HEIGHT {
                 continue;
             }
+            // Biome gates grass density: dry biomes (Desert/Snow/Beach) have a 0.0
+            // multiplier, so the probability test below can never fire there — no
+            // grass at all. Biome is a pure function of (x, z), so this stays
+            // deterministic per cell. As with the solid worker, the RNG is consumed
+            // identically regardless of biome: `random::<f32>()` and (when it
+            // fires) `random_range` run unconditionally, so a 0-multiplier biome
+            // still advances this cell's own RNG the same way (each cell seeds its
+            // own RNG anyway, so this is belt-and-braces — no cross-cell drift).
+            let biome = terrain.biome_at(x, z);
+            let grass_mul = biome_policy(biome).grass_mul;
+
             let yaw = snap_yaw(&mut rng);
-            if rng.random::<f32>() < GRASS_DENSITY {
+            if rng.random::<f32>() < GRASS_DENSITY * grass_mul {
                 let variant = rng.random_range(0..variant_count);
                 items.push(ScatterItem {
                     category: ScatterCategory::Grass,
                     variant,
                     pos,
                     yaw,
+                    biome,
                 });
             }
         }
@@ -168,6 +207,42 @@ pub(super) fn scatter_grass(
     // only the variant index matters). Spawn order only — never placement.
     items.sort_by_key(|it| it.variant);
     items
+}
+
+/// Map a tree index `rolled` (drawn uniformly over ALL tree variants) onto the
+/// subset eligible for this biome — variants whose name CONTAINS any of
+/// `allowed` — returning the ORIGINAL index into the full trees `Vec` (so `spawn`
+/// can index `assets.trees[variant]` unchanged). Returns `None` when no loaded
+/// variant matches the biome (the caller then skips trees for that column).
+///
+/// Why map rather than draw from a pre-filtered list: the RNG must be consumed
+/// IDENTICALLY regardless of the biome's allowed set, or changing a biome's tree
+/// list would shift the RNG stream and perturb every later column in the tile
+/// (breaking the "biome is appearance-only, determinism preserved" invariant).
+/// So the caller always rolls one index across all trees; we then fold that roll
+/// into the eligible subset with a stable modulo, which is a pure function of the
+/// (fixed) roll and the (fixed-per-biome) eligible set.
+fn pick_eligible_tree(
+    sizes: &SolidVariantSizes,
+    allowed: &[&str],
+    rolled: usize,
+) -> Option<usize> {
+    // Eligible ORIGINAL indices, in ascending order (stable: `tree_names` is
+    // index-parallel to `trees`, and we scan it in order).
+    let eligible: Vec<usize> = sizes
+        .tree_names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| allowed.iter().any(|sub| name.contains(sub)))
+        .map(|(i, _)| i)
+        .collect();
+    if eligible.is_empty() {
+        return None;
+    }
+    // Fold the full-range roll into the eligible subset. `rolled` is uniform over
+    // `0..trees.len()`, so `rolled % eligible.len()` is a deterministic, well-
+    // distributed pick among the eligible variants without consuming extra RNG.
+    Some(eligible[rolled % eligible.len()])
 }
 
 /// Stable ordering key for grouping spawns by category.
@@ -207,11 +282,24 @@ fn snap_yaw(rng: &mut StdRng) -> f32 {
 mod tests {
     use super::*;
 
-    /// A `SolidVariantSizes` with a couple of small footprints per category.
+    /// A `SolidVariantSizes` with a couple of small footprints per category and a
+    /// representative spread of tree NAMES across the biome families (a leafy
+    /// tree, a pine, a cactus, a palm, a stump), so the biome name-subset filter
+    /// has eligible variants for every biome — otherwise dry/cold biomes would
+    /// scatter no trees and the determinism tests would only exercise the empty
+    /// path. The sizes vec is index-parallel to `tree_names`.
     fn test_solid_sizes() -> SolidVariantSizes {
         let s = Vec3::new(0.5, 1.0, 0.5);
+        let tree_names = vec![
+            "tree_large".to_string(),
+            "pine_small".to_string(),
+            "cactus".to_string(),
+            "palm".to_string(),
+            "tree_stump".to_string(),
+        ];
         SolidVariantSizes {
-            trees: vec![s, s],
+            trees: vec![s; tree_names.len()],
+            tree_names,
             rocks: vec![s, s],
         }
     }
@@ -334,6 +422,85 @@ mod tests {
                 valid.iter().any(|v| (y - v).abs() < 1e-5),
                 "non-cardinal yaw {y}"
             );
+        }
+    }
+
+    #[test]
+    fn pick_eligible_tree_returns_only_eligible_original_indices() {
+        // With the test name spread [tree_large, pine_small, cactus, palm,
+        // tree_stump]:
+        //  * Desert (["cactus","stump"]) → eligible originals {2, 4}.
+        //  * Snow   (["pine"])           → eligible originals {1}.
+        //  * Beach  (["palm"])           → eligible originals {3}.
+        // Whatever index is rolled, the result must be one of the eligible
+        // ORIGINAL indices (never a non-matching variant), so `spawn` indexing
+        // `assets.trees[variant]` always lands on a biome-appropriate model.
+        let sizes = test_solid_sizes();
+        for rolled in 0..sizes.trees.len() {
+            let d = pick_eligible_tree(&sizes, &["cactus", "stump"], rolled).expect("desert");
+            assert!(d == 2 || d == 4, "desert picked non-cactus/stump index {d}");
+
+            let s = pick_eligible_tree(&sizes, &["pine"], rolled).expect("snow");
+            assert_eq!(s, 1, "snow must pick the pine variant");
+
+            let b = pick_eligible_tree(&sizes, &["palm"], rolled).expect("beach");
+            assert_eq!(b, 3, "beach must pick the palm variant");
+        }
+    }
+
+    #[test]
+    fn pick_eligible_tree_none_when_biome_matches_no_variant() {
+        // A biome whose substrings match no loaded variant yields `None`, so the
+        // caller skips trees for that column.
+        let sizes = test_solid_sizes();
+        for rolled in 0..sizes.trees.len() {
+            assert!(pick_eligible_tree(&sizes, &["nonexistent"], rolled).is_none());
+        }
+        // And an empty allow-set never matches anything.
+        assert!(pick_eligible_tree(&sizes, &[], 0).is_none());
+    }
+
+    #[test]
+    fn solid_scatter_trees_obey_biome_name_subset() {
+        // Every TREE the solid worker emits must be a variant eligible for that
+        // item's biome (the worker filtered by name). Scan a wide field so several
+        // biomes are hit, and check each emitted tree against its biome's policy.
+        let terrain = Terrain::new();
+        let sizes = test_solid_sizes();
+        for tx in -6..=6 {
+            for tz in -6..=6 {
+                let items = scatter_solid(&terrain, IVec2::new(tx, tz), &sizes);
+                for it in &items {
+                    if matches!(it.category, ScatterCategory::Tree) {
+                        let allowed = super::biome_policy(it.biome).tree_names;
+                        let name = &sizes.tree_names[it.variant];
+                        assert!(
+                            allowed.iter().any(|sub| name.contains(sub)),
+                            "tree '{name}' emitted in biome {:?} whose allowed set is {allowed:?}",
+                            it.biome
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grass_never_spawns_in_dry_biomes() {
+        // Desert/Snow/Beach have a 0.0 grass multiplier, so no grass item may be
+        // emitted on a column in any of those biomes — across a wide field.
+        let terrain = Terrain::new();
+        for tx in -8..=8 {
+            for tz in -8..=8 {
+                let items = scatter_grass(&terrain, IVec2::new(tx, tz), 3);
+                for it in &items {
+                    assert!(
+                        super::biome_policy(it.biome).grass_mul > 0.0,
+                        "grass emitted in biome {:?} (grass disabled there)",
+                        it.biome
+                    );
+                }
+            }
         }
     }
 }

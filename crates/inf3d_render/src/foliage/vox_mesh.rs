@@ -120,6 +120,10 @@ pub(super) fn load_category(
             continue;
         };
         handles.push(FoliageVariant {
+            // Store the file stem (already computed above for the `fit_unit`
+            // test) as the variant name, so the per-biome scatter policy can
+            // select tree variants by name substring (see `mod::biome_policy`).
+            name: stem.to_string(),
             mesh: meshes.add(mesh),
             size,
         });

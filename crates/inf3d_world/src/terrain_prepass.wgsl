@@ -1,6 +1,10 @@
 // Voxel terrain PREPASS — writes depth / normal / motion, PLUS the see-through
 // discard that the forward pass (terrain_material.wgsl) can't do alone.
 //
+// NOTE: the see-through discard is currently INERT (nothing feeds the `xray` uniform;
+// see the NOTE in `terrain_xray.wgsl`). This prepass writes depth/normal/motion exactly
+// like the stock one today; the cutout half stays dormant pending the Tier-2 cleanup.
+//
 // ## Why this exists
 // `ExtendedMaterial<StandardMaterial, _>` would otherwise delegate the prepass to
 // Bevy's stock `pbr_prepass.wgsl`. That writes wall depth for player-built voxels, so

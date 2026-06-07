@@ -3031,7 +3031,6 @@ dependencies = [
  "inf3d_gameplay",
  "inf3d_menu",
  "inf3d_monitor",
- "inf3d_pathfinding",
  "inf3d_physics",
  "inf3d_render",
  "inf3d_ui",
@@ -3054,6 +3053,7 @@ dependencies = [
 name = "inf3d_camera"
 version = "0.1.0"
 dependencies = [
+ "avian3d",
  "bevy",
  "bevy_voxel_world",
  "inf3d_core",
@@ -3107,23 +3107,9 @@ dependencies = [
  "inf3d_camera",
  "inf3d_core",
  "inf3d_gameplay",
- "inf3d_pathfinding",
  "inf3d_physics",
  "inf3d_render",
  "inf3d_world",
-]
-
-[[package]]
-name = "inf3d_pathfinding"
-version = "0.1.0"
-dependencies = [
- "bevy",
- "bevy_voxel_world",
- "inf3d_camera",
- "inf3d_core",
- "inf3d_gameplay",
- "inf3d_world",
- "inf3d_worldgen",
 ]
 
 [[package]]

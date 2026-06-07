@@ -16,8 +16,8 @@ use bevy::prelude::*;
 /// (the scheduling spine) instead.
 ///
 /// Order is `Input -> Logic -> Streaming -> Fx`:
-/// - [`Input`](GameSet::Input): raw-input reads (camera input, clicks).
-/// - [`Logic`](GameSet::Logic): pathfinding, follow-path, animation, interaction.
+/// - [`Input`](GameSet::Input): raw-input reads (camera orbit/WASD, clicks).
+/// - [`Logic`](GameSet::Logic): player animation, interaction-target pick.
 /// - [`Streaming`](GameSet::Streaming): foliage streaming, prop collider builds.
 /// - [`Fx`](GameSet::Fx): dust, highlights, quality application, diagnostics, HUD.
 #[derive(SystemSet, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -30,12 +30,13 @@ pub enum GameSet {
 
 /// Voxel columns `(x, z)` occupied by SOLID props (trees & rocks — never
 /// grass). Populated by the foliage scatter system in `inf3d_render` as props
-/// spawn, and consumed by the A* pathfinder in `inf3d_pathfinding` so routes
-/// detour around props instead of walking into their physics colliders.
+/// spawn, and consumed by the kinematic character controller in `inf3d_physics`
+/// so tall props read as walls the player can't walk into (in addition to their
+/// physics colliders).
 ///
-/// Lives in `inf3d_core` because pathfinding is *upstream* of render and so
-/// cannot depend on it — the data crosses the dependency direction through this
-/// shared resource (the same pattern as [`FollowTarget`]).
+/// Lives in `inf3d_core` because physics is *upstream* of render and so cannot
+/// depend on it — the data crosses the dependency direction through this shared
+/// resource (the same pattern as [`FollowTarget`]).
 ///
 /// **Refcounted.** The map value is the number of distinct prop discs (across
 /// any number of foliage tiles) currently claiming that cell. A cell is
@@ -44,7 +45,7 @@ pub enum GameSet {
 /// single tile AND across a tile boundary (a prop in an edge column inflates its
 /// disc by `PLAYER_RADIUS` and spills into the neighbouring tile). Without the
 /// count, the first tile to despawn would clear a cell the surviving neighbour
-/// still occupies, routing the pathfinder straight into a still-present trunk.
+/// still occupies, letting the player walk straight into a still-present trunk.
 /// Claim with [`BlockedCells::claim`], release with [`BlockedCells::release`].
 #[derive(Resource, Default)]
 pub struct BlockedCells(pub HashMap<IVec2, u32>);
@@ -91,12 +92,12 @@ impl BlockedCells {
 ///
 /// Same cross-crate flow + refcounting rationale as [`BlockedCells`]: the foliage
 /// streamer in `inf3d_render` claims/releases cells as low props stream in/out,
-/// and the *upstream* physics controller + pathfinder read [`step`](Self::step)
-/// (through this shared `inf3d_core` resource, so neither depends on render). The
-/// refcount is mandatory for the same reason — one cell can sit under two low
-/// props, within a tile and across a tile boundary, so it must stay a step until
-/// the last claimant releases. Every recorded prop currently contributes the same
-/// **1-voxel** rise ("walkable if 1 voxel high"); [`step`](Self::step) returns it.
+/// and the *upstream* physics controller reads [`step`](Self::step) (through this
+/// shared `inf3d_core` resource, so it doesn't depend on render). The refcount is
+/// mandatory for the same reason — one cell can sit under two low props, within a
+/// tile and across a tile boundary, so it must stay a step until the last claimant
+/// releases. Every recorded prop currently contributes the same **1-voxel** rise
+/// ("walkable if 1 voxel high"); [`step`](Self::step) returns it.
 #[derive(Resource, Default)]
 pub struct PropSurfaces(HashMap<IVec2, u32>);
 
@@ -128,8 +129,8 @@ impl PropSurfaces {
 
     /// The walkable step rise (in voxels) a standing/navigating entity gains on
     /// `cell`: `1` when a short prop occupies it (stand one voxel up, on the prop),
-    /// `0` otherwise. Physics + pathfinding add this on top of the terrain surface
-    /// so a short prop reads as a single climbable step.
+    /// `0` otherwise. Physics adds this on top of the terrain surface so a short
+    /// prop reads as a single climbable step.
     pub fn step(&self, cell: IVec2) -> i32 {
         if self.0.contains_key(&cell) {
             1
@@ -138,26 +139,19 @@ impl PropSurfaces {
         }
     }
 
-    /// Iterate the cells currently carrying a walkable short prop — used by the
-    /// pathfinder to snapshot the set for its off-thread A\* worker.
+    /// Iterate the cells currently carrying a walkable short prop.
     pub fn iter(&self) -> impl Iterator<Item = IVec2> + '_ {
         self.0.keys().copied()
     }
 }
 
-/// The current click-to-move destination cell `(x, z)`, or `None` when the
-/// player is idle / has arrived. Set by `inf3d_pathfinding` when a click
-/// produces a path, cleared by `inf3d_gameplay` when the player reaches it, and
-/// read by `inf3d_render` to draw a persistent destination highlight.
-#[derive(Resource, Default)]
-pub struct PathTarget(pub Option<IVec2>);
-
-/// Player movement intent produced by the FPS camera mode. Kept in `core` so the
-/// camera crate can write it and gameplay/physics-facing systems can consume it
-/// without introducing dependency cycles. `direction` is horizontal world-space
-/// input, normalized by the consumer; `jump` is an input request, not physics state.
+/// Player movement intent produced by the orbit camera's WASD reader. Kept in
+/// `core` so the camera crate can write it and gameplay/physics-facing systems can
+/// consume it without introducing dependency cycles. `direction` is horizontal
+/// world-space input, normalized by the consumer; `jump` is an input request, not
+/// physics state.
 #[derive(Resource, Default, Clone, Copy, Debug)]
-pub struct FpsMoveIntent {
+pub struct MoveIntent {
     pub active: bool,
     pub direction: Vec3,
     pub jump: bool,
@@ -188,8 +182,8 @@ pub struct Rock;
 /// user-facing quality tiers later. Until then this resource is deliberately a
 /// small, honest set of fields that are actually consumed by downstream systems.
 /// `render_distance_chunks` is read once at world-plugin build, while
-/// `terrain_lod_distance` is raised dynamically by the camera so LOD transitions
-/// stay outside the current orthographic footprint.
+/// `terrain_lod_distance` is driven dynamically by the camera so LOD transitions
+/// stay outside the visible perspective footprint.
 #[derive(Resource, Clone, Debug, serde::Serialize, serde::Deserialize)]
 // `#[serde(default)]` makes every field optional in the RON: the file overrides
 // only the knobs it lists, and any field omitted (or a future field added after
@@ -200,7 +194,7 @@ pub struct QualitySettings {
     pub render_distance_chunks: u32,
     /// World-space radius around the player within which dense grass spawns,
     /// regardless of camera zoom. Caps the zoom-out cost: sparse trees/rocks
-    /// still fill the iso view to the edges via the foliage ring, but the
+    /// still fill the orbit view to the edges via the foliage ring, but the
     /// expensive grass carpet is bounded to this circle. `0.0` disables grass.
     pub grass_radius_world: f32,
     pub foliage_enabled: bool,
@@ -261,27 +255,28 @@ pub struct FrameStats {
 }
 
 /// What the mouse does, chosen by the player via the HUD mode buttons. The
-/// block-edit system and the pathfinder both read this so exactly one of them
-/// acts on a click: editing in `Build`, click-to-move in `Walk`.
+/// block-edit system reads this so it only acts on a click in `Build`; in `Walk`
+/// the mouse is free (it orbits the camera) and clicks place/break nothing.
 #[derive(
     Resource, Default, Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize,
 )]
 pub enum EditMode {
-    /// Normal play — left-click pathfinds (click-to-move). The default.
+    /// Normal play — WASD moves, the mouse orbits the camera, clicks do nothing.
+    /// The default.
     #[default]
     Walk,
-    /// Editing — left-click places a block on the hovered face, right-click
-    /// removes the hovered voxel.
+    /// Editing — left-click places a block on the crosshair-targeted face,
+    /// right-click removes the targeted voxel.
     Build,
 }
 
 /// Default placed material — the first entry of `inf3d_world::BUILDABLE`
-/// (`TerrainMaterialId::BuiltStone`, raw index 4). It lives here, not in
+/// (`TerrainMaterialId::BuiltStone`, raw index 6). It lives here, not in
 /// `inf3d_world`, because [`SelectedMaterial`]'s `Default` needs it and `inf3d_core`
 /// must not depend on `inf3d_world` (which depends on core). The
 /// `inf3d_world::buildable_defaults_align` test asserts this stays equal to
 /// `BUILDABLE[0] as u8`, so the literal here can never silently desync.
-pub const DEFAULT_BUILD_MATERIAL: u8 = 4;
+pub const DEFAULT_BUILD_MATERIAL: u8 = 6;
 
 /// The voxel material the player places in [`EditMode::Build`], chosen via the
 /// in-game material picker (`inf3d_ui`) or the number keys. Stored as the raw
@@ -474,7 +469,7 @@ impl Plugin for CorePlugin {
         app.init_state::<AppState>()
             .add_sub_state::<Pause>()
             // Gameplay phases run only during un-paused play. Gating the three
-            // gameplay phases here — one lever — stops camera input, pathfinding,
+            // gameplay phases here — one lever — stops camera input, movement,
             // streaming, edits, and animation in the menu and when paused.
             //
             // `Fx` is deliberately LEFT UNGATED (only ordered after `Streaming`)
@@ -497,8 +492,7 @@ impl Plugin for CorePlugin {
             .init_resource::<SelectedMaterial>()
             .init_resource::<BlockedCells>()
             .init_resource::<PropSurfaces>()
-            .init_resource::<PathTarget>()
-            .init_resource::<FpsMoveIntent>();
+            .init_resource::<MoveIntent>();
     }
 }
 

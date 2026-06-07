@@ -68,11 +68,16 @@ pub(super) fn spawn_tile_entities(
             ScatterCategory::Rock => (&assets.rocks[item.variant], Some(PropKind::Rock)),
             ScatterCategory::Grass => (&assets.grass[item.variant], None),
         };
+        // Pick the biome's tinted material. `item.biome as usize` is always a
+        // valid `materials` index (the array has one entry per `Biome`, built in
+        // `setup_foliage`), so this never panics for any real biome. The tint
+        // multiplies the per-voxel vertex colors (see `FoliageAssets::materials`).
+        let material = assets.materials[item.biome as usize].clone();
         spawn_prop(
             commands,
             parent,
             variant,
-            assets.material.clone(),
+            material,
             item.pos,
             item.yaw,
             kind,
@@ -105,7 +110,7 @@ fn spawn_prop(
     // by it / can stand on it). A LOW prop (`is_low_prop`) gets NO collider — a
     // static collider would block the player horizontally and defeat the step-up;
     // instead it was claimed into `PropSurfaces` (see `stream::poll_solid_tasks`) so
-    // physics + A* read it as one climbable voxel step the player walks ONTO.
+    // the physics controller reads it as one climbable voxel step the player walks ONTO.
     //
     // GRASS gets NO collider either — it's intentionally left out of the physics
     // layers so the player walks straight through it (see `inf3d_physics::GameLayer`).

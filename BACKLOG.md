@@ -8,10 +8,50 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
 
 ---
 
+## Controls rework → third-person orbit + WASD (DONE; supersedes the pathfinding + see-through sections below)
+
+Moved from orthographic-iso **click-to-move** to a **Cube World-style perspective third-person
+orbit camera with camera-relative WASD** (mouse orbits yaw+pitch, scroll zooms the boom, cursor
+captured in play, the character faces its travel direction, `F` = free-fly). Done by a background
+worker + this follow-up; **user to build + repro**.
+- [x] **Camera** — `inf3d_camera` rewritten: `OrbitCamera`/`OrbitCameraPlugin`, perspective
+  projection, `CameraRig{yaw,pitch,distance}`, **boom collision** (raycasts `VoxelWorld` along the
+  boom and clamps the eye short of terrain/builds → caves/houses pull the camera in close, the
+  replacement for the see-through). FPS (`G`) mode + view-bob deleted; `F` free-fly kept.
+- [x] **Movement** — WASD writes `MoveIntent` (was `FpsMoveIntent`); the kinematic controller
+  consumes it via `DesiredMove` UNCHANGED (no physics rework — the architecture made it surgical).
+  Hover/interaction raycasts retarget to a **screen-center crosshair** (`inf3d_ui` crosshair dot);
+  cursor captured/hidden in play. Save format v2 (camera_zoom→distance + pitch).
+- [x] **Pathfinding removed** — the whole `inf3d_pathfinding` crate + `MovePath`/`PathTarget`/
+  destination highlight deleted (the old "Pathfinding AAA overhaul" backlog section is gone with it).
+- [x] **See-through removed (Tier 1)** — fully third-person; the boom zoom-in replaces the cutaway
+  for caves/houses. `XrayPlugin` + `inf3d_render/xray.rs` deleted and unwired and the hover ray's
+  xray-skip dropped, so the shader's cut never engages (the inert shader code is the Tier-2 item below).
+- [ ] **See-through cleanup (Tier 2).** Excise the now-inert xray code from the terrain material:
+  the `XrayParams` uniform (binding 102) + `VoxelTerrainExtension.xray` field, `voxel_cut_by_xray`,
+  the `XRAY_*` consts, the custom prepass (`terrain_prepass.wgsl`) + `terrain_xray.wgsl`, and revert
+  `prepass_*_shader()`/`specialize()` to the stock prepass — **KEEPING** `enable_prepass()=true`
+  (the "central graphics enabler"). **Do this only when buildable + GPU-verifiable** — a blind WGSL
+  bind-group/prepass edit can black-screen ALL terrain. *Files:*
+  `inf3d_world/{terrain_material.rs,terrain_prepass.wgsl,terrain_xray.wgsl,terrain_material.wgsl}`.
+- [x] **Feel overhaul (research-backed AAA pass).** Camera: removed the disorienting forward
+  focus offset (pivots on the PLAYER now), RIGID horizontal follow (no position lerp ⇒ no
+  floaty lag — only zoom + collision are smoothed), sphere-cast boom collision (a 5-ray bundle,
+  not one thin ray that threads voxel edges) with fast-IN / slow-OUT, wider pitch for build
+  aiming. Controller: acceleration/deceleration ramp (`move_toward` — snappy ~0.1 s on the
+  ground, gentle air momentum), coyote time + jump buffering (armed on the PRESS edge so holding
+  Space doesn't bunny-hop), walk anim driven off the ACTUAL ramped speed. Building: crosshair
+  aims ahead via the head-height focus, reach capped at `BUILD_RANGE`. Teleports fully reset
+  locomotion. Sources: Unreal/Godot spring-arm, the voxel-camera sphere-cast writeup, game-feel
+  accel norms (50–200 ms to top speed). *Files:* `inf3d_camera`, `inf3d_physics`, `inf3d_gameplay`,
+  `inf3d_render/highlight.rs`, `inf3d_menu`. **User to build + repro; constants are all tunable.**
+- [ ] **Biomes/props (next task).** Design + seams in `BIOMES_PLAN.md` — the biome + per-biome
+  foliage pipeline is ALREADY built; the task EXTENDS it (new `Biome` variants / materials / props).
+
 ## Phase A — Engine & graphics polish (current focus)
 
-- [x] **A1 (#10a) Camera color grading.** Add a `ColorGrading` component to the iso
-  camera (subtle contrast + saturation) for a graded "AAA" tone. *File:*
+- [x] **A1 (#10a) Camera color grading.** Add a `ColorGrading` component to the
+  gameplay camera (subtle contrast + saturation) for a graded "AAA" tone. *File:*
   `inf3d_camera/src/lib.rs`. *Risk:* none (purely tonemapping output).
 
 - [x] **A2 (#8 + #10b) Terrain texture upgrade.** Linear filtering + procedural per-texel
@@ -58,7 +98,7 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
   surface scan). ONE instance, cloned into: the mesher (`get_voxel_fn` snapshots it
   lock-free per chunk — empty fast path until first edit), the `Terrain` oracle (so
   `surface_y`/`is_land`/`stand_pos` reflect edits), and a `VoxelOverrides` resource for the
-  block module. **Physics ground + pathfinding inherit edits for free** (both read through
+  block module. **Physics ground inherits edits for free** (the controller reads through
   `Terrain`). Re-mesh on edit = mark the chunk `NeedsRemesh` (vendored `remesh_dirty_chunks`
   re-calls the delegate → re-reads the store); that kick is the block module's job. Tests
   in both crates. *Files:* `inf3d_worldgen/src/lib.rs`, `inf3d_world/src/lib.rs`.
@@ -77,18 +117,16 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
   - [x] **Edit path** — `inf3d_render::edit` (`EditPlugin`): in Build mode, left-click
     places a block on the hovered face and right-click removes the hovered voxel; writes
     `VoxelOverrides` and marks affected chunk(s) `NeedsRemesh` (vendored prelude now
-    re-exports it). In Walk mode left-click pathfinds.
-  - [x] **Targeting** — `Hover` gains the face `normal` (for placement). Pathfinder +
-    editor gated on `EditMode` and on UI hover so clicks don't double-act.
+    re-exports it). In Walk mode clicks are free (the mouse orbits the camera).
+  - [x] **Targeting** — `Hover` gains the face `normal` (for placement). The editor is
+    gated on `EditMode::Build` and on UI hover so clicks don't double-act.
   - [x] **Placeholder** — a 3-tall stone pillar near spawn (via the same store) to break/test.
-  - [x] **Level-aware navigation/standing** — `Terrain::surface_y_near(x,z,ref_y)` resolves
+  - [x] **Level-aware standing** — `Terrain::surface_y_near(x,z,ref_y)` resolves
     the standable floor (≥`STAND_HEADROOM` air above) nearest a reference height, not the
-    topmost voxel, so you can pathfind/walk INTO a dug tunnel instead of being routed onto
-    the ceiling. Pathfinder reference = the **clicked** height (`PathRequest::ref_y` from
-    the raycast hit, via a `LeveledTerrain` oracle) so it works even when you dig from
-    outside/above; controller reference = the player's feet (stay on your level as you
-    move). Unedited terrain unchanged (fast path); building UP still pops you up.
-    *Files:* `inf3d_worldgen`, `inf3d_pathfinding`, `inf3d_physics`.
+    topmost voxel, so you can walk INTO a dug tunnel instead of being seated onto the
+    ceiling. Controller reference = the player's feet (stay on your level as you move).
+    Unedited terrain unchanged (fast path); building UP still pops you up.
+    *Files:* `inf3d_worldgen`, `inf3d_physics`.
   - [x] **Place/break juice** — a tinted pop-in (place) / crumble (break) cube
     (`BlockFx`) + a dust puff reusing the footstep `DustBurst` (bigger cloud on break;
     place puff emitted under the block + flung outward so it's not hidden inside it).
@@ -97,19 +135,13 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
     (blades are per-cell entities; no tile flicker, nothing far shifts). Grass scatter is
     now per-cell-seeded and skips edited cells (`Terrain::column_edited`) so reloads don't
     re-add it. *Files:* `foliage/{scatter,spawn,stream,mod}.rs`, `BlockEdited` message.
-  - [x] **Nav robustness** — goal snaps to the **clicked level** (`near_target_level` +
-    `LEVEL_TOLERANCE`): a too-small/unenterable tunnel snaps to the entrance, not the
-    surface above. A* is now **best-effort** — if the goal is unreachable it routes to the
-    nearest reachable cell, so a click always walks you as close as possible.
-    *File:* `inf3d_pathfinding/src/lib.rs`.
   - [x] **Material picker** — 8 buildable blocks (Stone/Dirt/Grass/Concrete/Glass +
     Neon Cyan/Magenta/Yellow), each a distinct `Built*` material (index ≥
-    `BUILT_MATERIAL_BASE`) so player builds stay separable from terrain and pick up
-    the see-through cutout once that shader lands. Bottom-center hotbar (click or
-    number keys 1–8), gold-ringed selected swatch; gated to Build mode via
-    `Display::None` so it never eats Walk-mode clicks. `SelectedMaterial` (`inf3d_core`)
-    is the picked block; `BUILDABLE` (`inf3d_world`) is the single source of truth
-    for the set. *Files:* `inf3d_world`, `inf3d_core`, `inf3d_ui`, `inf3d_render/edit.rs`.
+    `BUILT_MATERIAL_BASE`) so player builds stay separable from terrain. Bottom-center
+    hotbar (click or number keys 1–8), gold-ringed selected swatch; gated to Build mode
+    via `Display::None` so it never eats Walk-mode clicks. `SelectedMaterial`
+    (`inf3d_core`) is the picked block; `BUILDABLE` (`inf3d_world`) is the single source
+    of truth for the set. *Files:* `inf3d_world`, `inf3d_core`, `inf3d_ui`, `inf3d_render/edit.rs`.
   - [x] **Edit SFX** — `inf3d_audio` plays a "thunk" on place / "crumble" on break
     (pitch+volume jitter, self-cleaning), driven by the now-public+enriched
     `inf3d_render::BlockEdited` message (`placed`/`material`). Clips are synthesized
@@ -117,79 +149,17 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done
   - [x] **Save/load persists edits** — already done in `inf3d_menu` (3-slot RON via
     `VoxelOverrides::export()/import()`, + player/camera/edit-mode); now also stores
     the picker's `selected_material` (serde-default for old saves).
-  - [x] **See-through cutout (player builds only)** — custom terrain PREPASS
-    (`terrain_prepass.wgsl`) discards the same player-built fragments the forward pass
-    dithers, so the depth prepass no longer occludes the player behind your walls.
-    Only `Built*` materials (index ≥ `BUILT_MATERIAL_BASE`) are affected — terrain /
-    city / natural blocks stay solid (cave opacity is a separate future thing). Gated
-    in `xray.rs` to presets whose prepass has a fragment (normal/motion), so depth-only
-    presets just leave walls opaque instead of punching black holes. Test-map structures
-    now stamp `BuiltStone`/`BuiltDirt` so the whole lab reads as player-placed.
-    *Files:* `inf3d_world/{terrain_material.rs,terrain_prepass.wgsl,terrain_material.wgsl}`,
-    `inf3d_render/xray.rs`, `inf3d_menu/testmap.rs`.
-  - [x] **Cutaway is now world-space + block-based** — the screen-space dither circle
-    (which caught bystander blocks and looked mushy) is gone. The shared
-    `inf3d::terrain_xray::xray_should_discard` removes WHOLE player-built voxels whose
-    CENTER sits on the camera→player line (world-space): in front of the player
-    (`dot(Δ, view) < 0`) and within `CUT_RADIUS` of the player's vertical segment. Snaps
-    to voxel center (stepping inside along the face normal) so blocks cut as a unit, and
-    only the blocks actually occluding the character open up — side/back/standing-in-front
-    walls stay solid. Forward + prepass call the same fn (deterministic, no dither). Knobs:
-    `CUT_RADIUS` (≈0.95 blocks), `PLAYER_HALF_HEIGHT` (1.1) in `xray.rs`.
-  - [x] **Cutaway v2 — roof + click-through** — added a **ceiling rule** (cut built
-    blocks above the player within `XRAY_CEILING_RADIUS`) so a whole roof opens up, not
-    just the camera-line strip; bumped `XRAY_CUT_RADIUS` to 1.4; floor guard
-    (`dc.y > -half_h`) so a built floor in front never holes. The cut math now lives in
-    `inf3d_world::voxel_cut_by_xray` (CPU mirror of `terrain_xray.wgsl`), and the click
-    raycasts in BOTH `inf3d_render::highlight` (Walk mode only) and
-    `inf3d_pathfinding::handle_click` skip the cut voxels — so you can click the interior
-    floor through a cut roof/wall and walk in. All tuning consts in
-    `inf3d_world::terrain_material` (one source for shader + raycasts).
-  - [ ] **Next:** perf in dense areas (rd=10 + foliage is the dominant cost; the prepass
-    discard also disables terrain early-z) — **deprioritized**, log shows 60fps steady, the
-    vertical-clamp structural win already shipped (`MainWorld::chunk_y_bounds`); horizontal
-    collision for placed voxels — **already done** via the controller's `is_wall` path
-    (2+ tall placed walls block; 1-tall is an intended climbable step); then harvesting
-    (Tree/Rock/`InteractionTarget` hooks exist), inventory/items, foliage wind.
-
-## Pathfinding AAA overhaul (current focus)
-The click-to-move pathfinding felt broken: jumped off ledges, perma-ran into walls, stuck
-on corners, and preferred dropping off a ledge to taking nearby stairs. Root causes were
-**planner ↔ locomotion disagreement** + a missing recovery loop. Fixes (all unit-tested;
-**user to build + repro**):
-- [~] **Smooth descents (the main "jumps off ledges" cause).** `GROUND_SNAP_DISTANCE`
-  was `0.5`, but a normal 1-voxel step DOWN drops support `1.0` below the feet → outside
-  the snap band → the controller went airborne on *every* downward step (downhill/stairs
-  read as constant hopping). Raised to `1.1` to **mirror the climb cap** (`STEP_HEIGHT` /
-  `MAX_STEP`): one voxel down now stays grounded + eases; a ≥2-voxel ledge still falls.
-  *File:* `inf3d_physics/src/lib.rs`. See [[pathfinding-traversability-invariant]].
-- [~] **Stuck-detection → re-path (the "perma-running into walls" cause).** `follow_path`
-  steered at the front waypoint forever with no recovery. Added `ActiveGoal` + the
-  `repath_when_stuck` system: no XZ progress over a `STUCK_WINDOW` while a route is pending
-  → re-path to the same goal; after `MAX_AUTO_REPATHS` give up and stop cleanly (no grind).
-  *File:* `inf3d_pathfinding/src/lib.rs`.
-- [~] **Height-aware best-effort (the "jumps down instead of stairs" cause).** Unreachable-
-  goal partial routes used XZ-only octile → ended at the cliff EDGE over the goal. Now
-  scored by `best_effort_score` (XZ + height-to-goal-level penalty) so a partial route ends
-  at the foot of the stairs. *File:* `inf3d_pathfinding/src/lib.rs`.
-- [~] **Arrival radius (corner orbit).** `follow_path` popped waypoints at `0.1`, below
-  per-step travel (`speed*dt ≈ 0.125`) → could orbit a point forever. Raised to
-  `ARRIVE_RADIUS = 0.25` + drain-all-reached loop. *File:* `inf3d_gameplay/src/lib.rs`.
-- [~] **Height-following search (stairs under an overhang).** A click on a high platform
-  resolved EVERY column at the clicked (high) level, so a landing that sits under the
-  platform's overhang snapped to the platform floor — the stair→landing step read as a huge
-  drop and the goal looked unreachable (character wandered off / stuck on a wall). The search
-  is now height-following: `astar_from` seeds the start at the player's REAL stand height
-  (`PathRequest::start_y`) and resolves each neighbour relative to the floor it steps FROM
-  (`SurfaceOracle::floor_near`), exactly mirroring how the physics controller resolves ground
-  from the player's feet. Can't regress tunnels/pits (a ≥2 drop was already Δ>MAX_STEP).
-  *Known limit:* single floor per cell on the best path, so a column reachable at two levels
-  arrives at whichever wins g-score — upgrade to `(cell, floor)` A* state if floor-precision
-  on the goal column ever matters. *File:* `inf3d_pathfinding/src/lib.rs`.
-- [ ] **Possible follow-up:** terrain-wall clearance — the planner routes on cell centres
-  while the controller uses the 0.45-radius capsule, so it can *rub* a convex wall corner
-  (re-path/give-up catches the worst case). A radius-inflated terrain-wall cost would tighten
-  it, but risks over-constraining the 1-wide corridors `WALL_SKIN` deliberately enables.
+  - Note: an earlier **see-through cutout** for player builds (a custom prepass + a
+    world-space block cutaway driven by an `XrayPlugin`) was built, then **removed in the
+    controls rework (Tier 1)** — fully third-person now, the boom zoom-in handles
+    caves/houses. The cutaway shader code still ships but is **inert**; excising it is the
+    Tier-2 item near the top of this file.
+  - [ ] **Next:** perf in dense areas (rd=10 + foliage is the dominant cost) —
+    **deprioritized**, log shows 60fps steady, and the vertical-clamp structural win
+    already shipped (`MainWorld::chunk_y_bounds`); horizontal collision for placed voxels
+    is **already done** via the controller's `is_wall` path (2+ tall placed walls block;
+    1-tall is an intended climbable step); then harvesting (Tree/Rock/`InteractionTarget`
+    hooks exist), inventory/items, foliage wind.
 
 ---
 
@@ -197,7 +167,9 @@ on corners, and preferred dropping off a ledge to taking nearby stairs. Root cau
 - [x] Footstep audio (`inf3d_audio` sink crate; gap-trimmed `.ogg`; pitch/volume variation).
 - [x] Shadow cascade fix (160u / 3 cascades / 4096 map).
 - [x] Terrain LOD activated (band sized below the render disc).
-- [x] Zoom-scaled chunk render distance (fixes zoomed-out "ocean" edge).
+- [x] Vertical chunk clamp (`MainWorld::chunk_y_bounds [-1,3]`) — stops the stock 3D
+  sphere streaming empty-air / invisible-underground chunk layers.
 - [x] `LAND_BIAS` worldgen knob (land/water balance).
 - [x] Monitor expanded to full pipeline state (CAMERA/GFX/LIGHT/QUALITY) each run.
-- [x] Quality locked / F2 preset-cycling removed (was crashing).
+- [x] Quality presets moved to the settings menu (`QualityPreset::apply`); the old
+  F2 preset-cycle hotkey is gone (it was crashing).

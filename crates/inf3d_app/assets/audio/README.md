@@ -66,7 +66,7 @@ add `_02`…`_NN` variants once the loader is extended to pick variants at rando
 loads the single `_01` today, like footsteps).
 
 ### Nice-to-have next (optional, same drill)
-- `sfx/ui/ui_click_01.ogg` — plays when you click-to-move (the destination ping).
+- `sfx/ui/ui_click_01.ogg` — a UI/button click ping (menu, mode buttons, picker).
 - `sfx/world/world_water_lap_01.ogg` — near-shore water lapping.
 - `ambient/ambient_wind_loop.ogg` — a quiet looping wind bed.
 - `music/music_explore_01.ogg` — exploration track.
@@ -74,7 +74,7 @@ loads the single `_01` today, like footsteps).
 ## How this is wired (architecture)
 The audio *code* lives in a dedicated crate **`inf3d_audio`** — a downstream
 **sink**, exactly like `inf3d_monitor` / `inf3d_ui`: it only *reads* game state and
-events (player movement, grounded/landing, click-to-move) and *plays* sounds. It
+events (player movement / footsteps, block place/break) and *plays* sounds. It
 depends on the gameplay/physics/render crates it listens to, and nothing depends on
 it (acyclic graph preserved). Its systems run in `GameSet::Fx` (presentation, end of
 frame). At startup it scans these folders and loads every matching `.ogg` into an

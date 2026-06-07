@@ -6,9 +6,9 @@
 //! `ExtendedMaterial<StandardMaterial, StandardVoxelMaterial>` (see
 //! `bevy_voxel_world::voxel_material`). Two upstream choices conspire to keep
 //! the voxel terrain out of Bevy's depth + normal prepass textures, which in
-//! turn makes every downstream prepass consumer (`DistanceFog`,
-//! `VolumetricFog`, SSAO, motion blur, water SSR, depth-of-field) treat the
-//! terrain as if it weren't there:
+//! turn makes every downstream prepass consumer (SSAO, motion blur,
+//! depth-of-field, the water depth blend) treat the terrain as if it weren't
+//! there:
 //!
 //! 1. The shipped `voxel_texture.wgsl` declares a `#ifdef PREPASS_PIPELINE`
 //!    branch that *imports* `prepass_io::{VertexOutput, FragmentOutput}` but
@@ -61,8 +61,9 @@
 //!      material. (`bevy_voxel_world` only registers a `MaterialPlugin` for
 //!      its own default material; using `with_material(..)` on its side
 //!      explicitly skips that registration.)
-//!    - Procedurally builds a 4-layer `2d_array` `Image` for the texture
-//!      array binding and returns the assembled material value.
+//!    - Procedurally builds a `2d_array` `Image` (one layer per
+//!      [`crate::PALETTE`] row) for the texture array binding and returns the
+//!      assembled material value.
 //! 2. `VoxelWorldPlugin::with_config(main_world).with_material(material)`
 //!    consumes the returned value. With `init_custom_materials() = true`
 //!    (the default), the voxel plugin adds the value to `Assets<M>`, takes
@@ -77,7 +78,8 @@
 //! `bevy_voxel_world` ships a default PNG (`shaders/default_texture.png`)
 //! that it `include_bytes!`-bakes into its own crate; the bytes are not
 //! re-exported and the asset path is private. Rather than hand-shipping a
-//! duplicate PNG in our crate, we build a 32x32x4 RGBA8 image at startup
+//! duplicate PNG in our crate, we build a 32x32xN RGBA8 image at startup
+//! (N = [`crate::PALETTE`] length, so it grows automatically with the palette)
 //! with flat tints that match the prior look (earthy palette modulated by
 //! the per-vertex AO color the mesher writes into `Mesh::ATTRIBUTE_COLOR`).
 //! This also dodges any asset-server load races that would otherwise need
@@ -108,8 +110,10 @@ const TERRAIN_MATERIAL_SHADER_HANDLE: Handle<Shader> =
 /// Stable handle to the custom terrain PREPASS shader
 /// ([`terrain_prepass.wgsl`](./terrain_prepass.wgsl)). Replaces the stock
 /// StandardMaterial prepass so the depth/normal/motion prepass can DISCARD the same
-/// player-built fragments the forward pass dithers away — the half that actually makes
-/// the see-through cutout reveal the player (see that file's header).
+/// player-built fragments the forward pass cuts — the half that made the see-through
+/// cutout reveal the player (see that file's header). **Inert today** (no system
+/// feeds `XrayParams`, so neither the forward cut nor this discard ever fires); kept
+/// pending Tier-2 cleanup.
 const TERRAIN_PREPASS_SHADER_HANDLE: Handle<Shader> =
     uuid_handle!("9f3b2a1c-7d4e-4c8a-b6f1-3e2d1c0a9b8e");
 
@@ -140,8 +144,11 @@ pub struct VoxelTerrainExtension {
     #[texture(100, dimension = "2d_array")]
     #[sampler(101)]
     pub voxels_texture: Handle<Image>,
-    /// Per-frame see-through ("x-ray") parameters at binding 102. Updated by
-    /// `inf3d_render`'s x-ray system; consumed by the shader's built-block cutout.
+    /// See-through ("x-ray") parameters at binding 102, consumed by the shader's
+    /// built-block cutout. **Currently INERT:** the `XrayPlugin` (`inf3d_render`)
+    /// that used to feed this each frame was deleted in the controls rework, so it
+    /// stays at its (disabled) `Default` — nothing drives the cutaway. Excising this
+    /// uniform + the cutout shaders is the pending Tier-2 cleanup (see `BACKLOG.md`).
     #[uniform(102)]
     pub xray: XrayParams,
 }
@@ -159,7 +166,8 @@ impl Default for VoxelTerrainExtension {
 /// `>= `[`crate::BUILT_MATERIAL_BASE`]) that sit between the camera and the player.
 /// The cutaway is computed in WORLD space and per-voxel — see
 /// [`terrain_xray.wgsl`](crate::terrain_material). Three `vec4`s keep the std140
-/// uniform layout trivially correct. Fed each frame by `inf3d_render::xray`.
+/// uniform layout trivially correct. **Currently never fed** (the `inf3d_render`
+/// x-ray system that drove it was removed), so the cutaway stays disabled.
 #[derive(Clone, Copy, Debug, ShaderType)]
 pub struct XrayParams {
     /// `xyz` = player body center (world); `w` = enabled (`> 0.5` turns the cutaway on).
@@ -183,12 +191,13 @@ impl Default for XrayParams {
     }
 }
 
-// --- See-through cutaway tuning + CPU mirror (shared by the shader & click-raycasts) ---
+// --- See-through cutaway tuning + CPU mirror (was shared by the shader & click-raycasts;
+// the cutaway is now inert — see `voxel_cut_by_xray` and the `xray` uniform) ---
 
 /// Cylinder radius (world units) of the cutaway around the camera→player line — the
-/// front-wall occluders. Fed to the shader via the xray uniform AND used by the click
-/// raycasts, so clicks pass through exactly the voxels that are visually cut. ONE
-/// source of truth for the whole effect's tuning.
+/// front-wall occluders. ONE source of truth for the whole effect's tuning when it
+/// was live. (The cutaway is currently inert — nothing feeds the xray uniform — but
+/// the consts are kept with the rest of the cutout code pending Tier-2 cleanup.)
 pub const XRAY_CUT_RADIUS: f32 = 1.4;
 /// Horizontal radius (world units) of the ceiling/roof cut: built blocks above the
 /// player within this distance are removed, so a roof over your head opens up too
@@ -202,10 +211,12 @@ pub const XRAY_PLAYER_HALF_HEIGHT: f32 = 1.1;
 
 /// CPU mirror of `terrain_xray.wgsl::xray_should_discard` (voxel-center form — `center`
 /// is the exact voxel center, so no normal is needed). Whether the built voxel at
-/// `center` is currently cut away by the see-through, given the live [`XrayParams`].
-/// The click raycasts call this so a click passes through exactly the voxels the shader
-/// removes (letting you click the interior floor through a cut roof/wall). Returns
-/// `false` when the cutaway is off (`player.w <= 0.5`) or the voxel isn't a player build.
+/// `center` would be cut away by the see-through, given the [`XrayParams`]. Was called
+/// by the click raycasts so a click passed through exactly the voxels the shader
+/// removed; **currently uncalled** (the cutaway is inert — no system feeds `XrayParams`,
+/// so `player.w` stays `0.0` and this always returns `false`). Kept with the rest of
+/// the cutout code pending Tier-2 cleanup. Returns `false` when the cutaway is off
+/// (`player.w <= 0.5`) or the voxel isn't a player build.
 pub fn voxel_cut_by_xray(center: Vec3, material: u8, xray: &XrayParams) -> bool {
     if xray.player.w <= 0.5 || (material as u32) < crate::BUILT_MATERIAL_BASE {
         return false;
@@ -256,18 +267,19 @@ impl MaterialExtension for VoxelTerrainExtension {
     /// prepass" — discoverable from the type alone. Combined with
     /// `Material for ExtendedMaterial<B, E>` delegating `enable_prepass()` to
     /// `E::enable_prepass()`, this is what makes downstream prepass consumers
-    /// (volumetric fog, SSAO, etc.) see the terrain.
+    /// (SSAO, motion blur, DoF, the water depth blend) see the terrain.
     fn enable_prepass() -> bool {
         true
     }
 
     /// Custom prepass (see [`terrain_prepass.wgsl`](./terrain_prepass.wgsl)) instead
     /// of the stock `ShaderRef::Default` chain (which would resolve to
-    /// `pbr_prepass.wgsl`). It writes the same depth/normal/motion outputs but ALSO
-    /// discards player-built fragments near the player, so the prepass doesn't claim
-    /// those pixels' depth and the see-through cutout actually reveals the player.
-    /// `specialize` adds our `tex_idx` attribute to the prepass vertex layout so this
-    /// shader can read the per-voxel material.
+    /// `pbr_prepass.wgsl`). It writes the same depth/normal/motion outputs and ALSO
+    /// contains the built-block cutout discard so the prepass wouldn't claim those
+    /// pixels' depth when the cutout was live. That discard is currently INERT (no
+    /// system feeds `XrayParams`), so the prepass behaves like the stock one today;
+    /// `specialize` still adds our `tex_idx` attribute to the prepass vertex layout so
+    /// this shader can read the per-voxel material.
     fn prepass_vertex_shader() -> ShaderRef {
         ShaderRef::Handle(TERRAIN_PREPASS_SHADER_HANDLE)
     }
@@ -316,8 +328,9 @@ impl MaterialExtension for VoxelTerrainExtension {
     }
 }
 
-/// Build a 4-layer 32x32 RGBA8 `Image` suitable for use as a
-/// `texture_2d_array` in the terrain shader.
+/// Build a 32x32 RGBA8 `texture_2d_array` `Image` — ONE layer per
+/// [`crate::PALETTE`] row — suitable for use in the terrain shader. The layer
+/// count grows automatically with the palette (no hardcoded count).
 ///
 /// The image is constructed as a vertically-stacked 2D
 /// `(LAYER_SIZE x LAYER_SIZE * LAYERS)` image, then
@@ -327,11 +340,16 @@ impl MaterialExtension for VoxelTerrainExtension {
 ///
 /// Layer order is the discriminant order of
 /// [`crate::TerrainMaterialId`] — the single source of truth that
-/// [`crate::MainWorld::texture_index_mapper`] also indexes into:
+/// [`crate::MainWorld::texture_index_mapper`] also indexes into. The first few:
 ///  - 0 → `Grass`    (top face of land voxels)
 ///  - 1 → `Dirt`     (side faces of land voxels)
 ///  - 2 → `Stone`    (bottom faces of land voxels)
 ///  - 3 → `Seafloor` (all faces of submerged columns)
+///  - 4 → `Sand`     (desert/beach surface top + sides)
+///  - 5 → `Snow`     (snowy surface cap)
+///
+/// followed by the `Built*` player-build layers; see [`crate::PALETTE`] for the
+/// full, authoritative list.
 ///
 /// Colors are flat tints rather than detail textures; the per-vertex AO
 /// color the mesher writes into `Mesh::ATTRIBUTE_COLOR` modulates them to

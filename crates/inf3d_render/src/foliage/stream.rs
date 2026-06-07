@@ -4,23 +4,24 @@
 //!
 //! ## Solid layer — [`stream_solid`]
 //!
-//! Trees + rocks, ringed by the camera's orthographic zoom. Runs every frame and
-//! orchestrates four phases, each a focused helper below:
+//! Trees + rocks, ringed to the perspective orbit camera's horizon. Runs every
+//! frame and orchestrates four phases, each a focused helper below:
 //!
 //! 1. [`clear_solid_tiles`] — bail out + unload everything when foliage is off.
 //! 2. [`poll_solid_tasks`] — spawn entities for any solid scatter task that
-//!    resolved, recording footprint-inflated [`BlockedCells`] for the pathfinder.
+//!    resolved, recording footprint-inflated [`BlockedCells`] the controller reads
+//!    as walls.
 //! 3. [`despawn_solid_out_of_band`] — unload solid tiles outside the (wider)
 //!    despawn ring, releasing their blocked cells.
 //! 4. [`start_solid_tasks`] — start up to [`MAX_SOLID_TASKS_PER_FRAME`] new
 //!    scatter tasks for the nearest missing tiles inside the spawn ring.
 //!
 //! The despawn ring is a **hysteresis band** wider than the spawn ring
-//! ([`DESPAWN_RING_MARGIN`] extra tiles), so on the wide orthographic-iso view
-//! props don't pop out the moment the camera nudges or zooms — tiles only unload
-//! well outside the visible area. The spawn ring scales with the camera's
-//! orthographic viewport ([`compute_ring`]) so zooming out fills trees/rocks to
-//! the iso-view edges, clamped to fixed settings' `foliage_ring_max`.
+//! ([`DESPAWN_RING_MARGIN`] extra tiles), so props don't pop out the moment the
+//! camera nudges or orbits — tiles only unload well outside the visible area. The
+//! spawn ring is a fixed, conservative radius sized to the perspective horizon
+//! ([`compute_ring`]) so trees/rocks fill to the screen edges, clamped to fixed
+//! settings' `foliage_ring_max`.
 //!
 //! ## Grass layer — [`stream_grass`]
 //!
@@ -45,7 +46,7 @@ use bevy::camera::{Projection, ScalingMode};
 use bevy::prelude::*;
 use bevy::tasks::{block_on, poll_once, AsyncComputeTaskPool};
 
-use inf3d_camera::IsoCamera;
+use inf3d_camera::OrbitCamera;
 use inf3d_core::{BlockedCells, FollowTarget, PropSurfaces, QualitySettings};
 use inf3d_physics::PLAYER_RADIUS;
 use inf3d_worldgen::{Terrain, WorldGen, WorldKind};
@@ -60,8 +61,15 @@ use super::{
 /// Minimum solid ring radius the streamer ever uses, regardless of zoom level.
 const RING_MIN: i32 = 2;
 /// Fallback solid ring radius used when the camera entity hasn't spawned yet (or
-/// isn't orthographic).
+/// is an unexpected projection type).
 const RING_FALLBACK: i32 = 3;
+/// Fixed solid ring radius (in tiles) for the perspective orbit camera. The orbit
+/// view reaches a roughly constant horizon (no orthographic zoom to react to), so a
+/// fixed, conservative ring sized to that horizon fills trees/rocks to the screen
+/// edges without churning. Clamped to `[RING_MIN, quality_ring_max]` like the rest;
+/// chosen a touch above `RING_FALLBACK` so the default High preset's higher cap
+/// isn't wasted.
+const RING_PERSPECTIVE: i32 = 5;
 /// Multiplier from the camera's orthographic `viewport_height` to the
 /// world-XZ radius the solid foliage ring needs to cover. Kept well above the
 /// literal half-height so the spawn ring reaches a MARGIN beyond the visible
@@ -108,7 +116,7 @@ pub(super) fn stream_solid(
     mut props: ResMut<PropSurfaces>,
     settings: Res<QualitySettings>,
     player_q: Query<&Transform, With<FollowTarget>>,
-    camera_q: Query<&Projection, With<IsoCamera>>,
+    camera_q: Query<&Projection, With<OrbitCamera>>,
 ) {
     let Some(assets) = assets else {
         return;
@@ -207,7 +215,7 @@ fn tile_of(world: Vec3) -> IVec2 {
 /// Foliage disabled: unload every solid tile and surrender its claims — both the
 /// tall props' [`BlockedCells`] and the low props' [`PropSurfaces`] (releasing
 /// each list balances the refcounts this tile took). Pending tasks simply drop
-/// (their handle abandons the future, like pathfinding's cancel).
+/// (their handle abandons the future, cancelling it).
 fn clear_solid_tiles(
     commands: &mut Commands,
     field: &mut SolidField,
@@ -269,8 +277,8 @@ pub(super) fn clear_foliage_on_world_change(
 ///
 /// * **TALL prop** → [`mark_blocked_footprint`] records into [`BlockedCells`]
 ///   every voxel cell the PLAYER CAPSULE can't occupy because the prop sits there
-///   (footprint inflated by `PLAYER_RADIUS`), so the pathfinder routes the whole
-///   capsule (not a point) around it. The cell adjacent to a fat tree would clip
+///   (footprint inflated by `PLAYER_RADIUS`), so the controller blocks the whole
+///   capsule (not a point) at it. The cell adjacent to a fat tree would clip
 ///   the trunk with the capsule's edge even though its own center is clear — the
 ///   inflation is what makes `BlockedCells` mean "cells the capsule center can't
 ///   reach".
@@ -345,7 +353,7 @@ fn poll_solid_tasks(
 /// refcount correct: a cell can be inside two props' inflated discs — both in
 /// THIS tile (so `cells` carries it twice) and in a neighbouring tile (which
 /// records its own claim independently). The shared count only drops to zero —
-/// freeing the cell for the pathfinder — once every claiming prop, in any tile,
+/// freeing the cell for the controller — once every claiming prop, in any tile,
 /// has been released.
 ///
 /// This runs only when a tile spawns (not per frame), so the small scan over the
@@ -438,7 +446,7 @@ fn mark_prop_surface_footprint(
 /// hitch that scaled with zoom; spreading it removes the spike. A recursive
 /// despawn cascades to every prop under the tile parent, and we release the tile's
 /// claims back to the shared stores — both the tall props' [`BlockedCells`] and the
-/// low props' [`PropSurfaces`] — so the pathfinder/physics see the cells freed.
+/// low props' [`PropSurfaces`] — so the physics controller sees the cells freed.
 fn despawn_solid_out_of_band(
     commands: &mut Commands,
     field: &mut SolidField,
@@ -498,9 +506,13 @@ fn start_solid_tasks(
     };
 
     // Snapshot per-variant footprint sizes once; cloned into each task started
-    // this frame (bounded to MAX_SOLID_TASKS_PER_FRAME).
+    // this frame (bounded to MAX_SOLID_TASKS_PER_FRAME). The tree NAMES travel
+    // alongside the sizes (index-parallel) so the worker can filter trees to each
+    // column's biome by name substring (see `scatter::pick_eligible_tree`); rocks
+    // need no names (every rock is allowed in every biome).
     let sizes = SolidVariantSizes {
         trees: assets.trees.iter().map(|v| v.size).collect(),
+        tree_names: assets.trees.iter().map(|v| v.name.clone()).collect(),
         rocks: assets.rocks.iter().map(|v| v.size).collect(),
     };
 
@@ -659,11 +671,18 @@ fn grass_ring_tiles(radius_world: f32) -> i32 {
     (radius_world / TILE as f32).ceil().max(0.0) as i32
 }
 
-/// World-XZ ring radius (in tiles) the SOLID streamer should cover for the
-/// camera's current orthographic zoom, clamped to `[RING_MIN, quality_ring_max]`.
+/// Solid-streamer ring radius (in tiles) for the current camera projection,
+/// clamped to `[RING_MIN, quality_ring_max]`.
+///
+/// The camera is always **perspective** now (its arm returns a fixed,
+/// conservative ring sized to the perspective horizon — there's no orthographic
+/// zoom to react to). The `Orthographic` arm is kept as a harmless generic
+/// fallback (and so the existing zoom-scaling tests still exercise this code).
 fn compute_ring(projection: Option<&Projection>, quality_ring_max: i32) -> i32 {
     let max = quality_ring_max.max(RING_MIN);
     let raw = match projection {
+        // Perspective orbit: fixed ring sized to the (roughly constant) horizon.
+        Some(Projection::Perspective(_)) => RING_PERSPECTIVE,
         Some(Projection::Orthographic(ortho)) => match ortho.scaling_mode {
             ScalingMode::FixedVertical { viewport_height } => {
                 let blocks = viewport_height * RING_ZOOM_COVERAGE;
@@ -692,6 +711,23 @@ mod tests {
             },
             ..bevy::camera::OrthographicProjection::default_3d()
         })
+    }
+
+    fn persp_proj() -> Projection {
+        Projection::Perspective(bevy::camera::PerspectiveProjection::default())
+    }
+
+    #[test]
+    fn compute_ring_perspective_is_fixed_and_clamped() {
+        // The perspective orbit returns a fixed ring sized to the horizon, clamped to
+        // `[RING_MIN, quality_ring_max]`. With a generous cap it's exactly the fixed
+        // value; with a tight cap it clamps down; it never drops below RING_MIN.
+        let proj = persp_proj();
+        assert_eq!(compute_ring(Some(&proj), 8), RING_PERSPECTIVE);
+        // Quality cap below the fixed ring clamps it.
+        assert_eq!(compute_ring(Some(&proj), 3), 3);
+        // A cap below RING_MIN is itself floored to RING_MIN by the clamp.
+        assert_eq!(compute_ring(Some(&proj), 0), RING_MIN);
     }
 
     #[test]

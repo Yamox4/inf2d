@@ -1,7 +1,14 @@
-//! Orthographic isometric follow camera (Diablo-style 3/4 view) with springy
-//! follow, scroll-wheel zoom, and Q/E orbit.
+//! Perspective third-person **orbit** camera (Cube World-style) with WASD play.
+//!
+//! The camera floats on a boom behind the player: the mouse orbits it (yaw +
+//! pitch), the scroll wheel zooms the boom distance, and the rig looks at a focus
+//! point just above the player. The OS cursor is captured/hidden in play so
+//! mouse-look has unlimited travel. WASD is always-on and **camera-relative**
+//! (W drives away from the camera, into the screen); the player faces its travel
+//! direction. `F` toggles a debug free-fly camera. The rig raycasts the voxel
+//! world along the boom so it never clips through terrain or player builds.
 
-use bevy::camera::{OrthographicProjection, PerspectiveProjection, Projection, ScalingMode};
+use bevy::camera::{PerspectiveProjection, Projection};
 use bevy::core_pipeline::prepass::{DepthPrepass, MotionVectorPrepass, NormalPrepass};
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::pbr::{ScreenSpaceAmbientOcclusion, ScreenSpaceAmbientOcclusionQualityLevel};
@@ -12,101 +19,100 @@ use bevy::prelude::*;
 use bevy::render::view::{ColorGrading, Hdr, Msaa};
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use bevy_voxel_world::prelude::*;
+// Only the read-only spatial query — used to keep the boom from clipping through prop
+// colliders (trees/rocks), which the voxel raycast can't see.
+use avian3d::prelude::{SpatialQuery, SpatialQueryFilter};
 
-use inf3d_core::{AppState, FollowTarget, FpsMoveIntent, GameSet, Pause, QualitySettings};
+use inf3d_core::{AppState, FollowTarget, GameSet, MoveIntent, Pause, QualitySettings};
 use inf3d_world::MainWorld;
 
-/// Horizontal (XZ-plane) distance from the player to the camera.
-///
-/// Keep this paired with [`ORBIT_HEIGHT`] to preserve the same ~42° iso pitch.
-/// The old rig was only ~36 units above the player, but terrain can rise far
-/// higher than that in the visible area, putting mountains between/through the
-/// camera at max zoom. A taller rig prevents high terrain from clipping through
-/// the camera while keeping the same isometric look.
-const ORBIT_RADIUS: f32 = 110.0;
-/// Camera height above the player.
-const ORBIT_HEIGHT: f32 = 100.0;
-/// Orthographic near plane. Negative on purpose: with a tall heightfield and an
-/// overhead iso camera, nearby/high terrain can sit very close to or slightly
-/// behind the eye plane during max zoom/orbit. A negative near plane prevents the
-/// camera from slicing chunks when peaks get close.
-const ORTHO_NEAR: f32 = -500.0;
-/// Orthographic far plane, large enough for the raised camera + max zoom footprint.
-const ORTHO_FAR: f32 = 1500.0;
-/// Default vertical view size (smaller = more zoomed in).
-const ZOOM_DEFAULT: f32 = 44.0;
-const ZOOM_MIN: f32 = 14.0;
-const ZOOM_MAX: f32 = 90.0;
-/// World-units of zoom change per scroll notch.
-const ZOOM_SPEED: f32 = 4.0;
-/// Orbit speed (radians/sec) for Q/E.
-const ORBIT_SPEED: f32 = 1.8;
-/// Middle-mouse drag orbit sensitivity (radians per pixel of horizontal motion).
-const DRAG_SENS: f32 = 0.008;
-/// Exponential smoothing rate for follow/zoom/orbit. Higher = snappier.
-const SMOOTH: f32 = 12.0;
+// ── Projection ───────────────────────────────────────────────────────────────
+/// Vertical field of view (radians). 60° reads as a natural third-person lens.
+const FOV: f32 = std::f32::consts::FRAC_PI_3;
+/// Near clip plane (world units). Small so the boom can pull in close without the
+/// player clipping out of view.
+const NEAR: f32 = 0.1;
+/// Far clip plane (world units). Large enough for the orbit/free-fly view to reach
+/// the horizon over the streamed terrain.
+const FAR: f32 = 1500.0;
+
+// ── Boom distance (zoom) ───────────────────────────────────────────────────────
+/// Default boom distance from the focus to the eye (world units).
+const DISTANCE_DEFAULT: f32 = 12.0;
+/// Closest the scroll wheel can pull the boom in.
+const DISTANCE_MIN: f32 = 4.0;
+/// Furthest the scroll wheel can push the boom out.
+const DISTANCE_MAX: f32 = 40.0;
+/// Boom-distance change per scroll notch (world units).
+const ZOOM_SPEED: f32 = 2.0;
+
+// ── Orbit angles ───────────────────────────────────────────────────────────────
+/// Lowest pitch (radians): dips the camera below the focus to look UP, so you can aim
+/// up at tall walls / overhead blocks when building. Not so low it flips under the world.
+const PITCH_MIN: f32 = -0.5;
+/// Highest pitch (radians): a steep near-top-down look, short of straight down so
+/// the look-at never degenerates against world up.
+const PITCH_MAX: f32 = 1.4;
+/// Default pitch (radians): a gentle 3/4 down-angle, the Cube World resting view.
+const PITCH_DEFAULT: f32 = 0.5;
+/// Mouse-look sensitivity (radians per pixel of motion).
+const LOOK_SENS: f32 = 0.005;
+
+// ── Focus + smoothing ──────────────────────────────────────────────────────────
+/// Height of the focus point above the player's transform origin (world units). A bit
+/// above the capsule centre (≈ head height) so the character frames in the lower third
+/// and the screen-centre crosshair points AHEAD of it (into the build space), not at
+/// its head. The camera pivots on the PLAYER — there is no forward pivot offset, which
+/// read as a disorienting "orbit around a point in front of you".
+const FOCUS_HEIGHT: f32 = 1.2;
+/// Exponential rate the boom DISTANCE eases toward its scroll target (zoom glide). The
+/// camera POSITION is otherwise rigid — recomputed from the (already interpolated)
+/// player every frame with NO horizontal lerp — so the follow has no lag and never
+/// feels floaty. Only zoom + collision are smoothed.
+const DISTANCE_SMOOTH: f32 = 12.0;
+/// Radius (world units) of the boom's collision "bulk": the spread of the parallel-ray
+/// bundle that approximates a sphere-cast, so the camera keeps this much clearance and a
+/// single thin ray can't slip through a voxel edge.
+const CAMERA_RADIUS: f32 = 0.3;
+/// Gap (world units) kept between the camera and a voxel the boom would otherwise clip
+/// into — the boom stops this far short of terrain/builds.
+const BOOM_PADDING: f32 = 0.3;
+/// Floor for the boom length after a collision clamp, so the camera never collapses
+/// fully onto the focus when pressed against a wall (kept just outside the body —
+/// near-first-person in a tight cave, which is the indoor "zoom in" behaviour).
+const BOOM_MIN: f32 = 1.0;
+/// Exponential rate the boom snaps IN when an obstacle appears — fast, so the camera
+/// never lingers inside a wall.
+const BOOM_IN_SMOOTH: f32 = 35.0;
+/// Exponential rate the boom eases back OUT when the obstacle clears — slow, so rounding
+/// a corner doesn't whip the camera back and reveal the world jarringly.
+const BOOM_OUT_SMOOTH: f32 = 6.0;
+
+// ── Free-fly debug camera ────────────────────────────────────────────────────
 const FREE_FLY_SPEED: f32 = 34.0;
 const FREE_FLY_FAST_MULT: f32 = 3.0;
 const FREE_FLY_LOOK_SENS: f32 = 0.003;
-const FPS_LOOK_SENS: f32 = 0.0025;
-const FPS_EYE_HEIGHT: f32 = 0.75;
-// ── First-person view bob ────────────────────────────────────────────────────
-// A subtle head-bob driven by the player's actual ground speed (measured from the
-// interpolated transform), so it stays in step with movement and fades to nothing
-// when standing. Phase advances with DISTANCE travelled (not time), so the stride
-// cadence is frame-rate independent and speeds up when you sprint. Vertical bobs at
-// twice the lateral sway (feet land twice per stride) — the classic FPS feel.
-/// Bob cycles per world-unit travelled (stride cadence). Higher = quicker steps.
-const FPS_BOB_FREQ: f32 = 0.42;
-/// Vertical bob amplitude (world units) at full speed.
-const FPS_BOB_VERTICAL: f32 = 0.055;
-/// Lateral sway amplitude (world units) at full speed.
-const FPS_BOB_LATERAL: f32 = 0.04;
-/// Speed (world u/s) at which the bob reaches full amplitude (≈ the walk speed).
-const FPS_BOB_FULL_SPEED: f32 = 8.0;
-/// Exponential rate the bob amplitude eases in/out as you start/stop moving.
-const FPS_BOB_SMOOTH: f32 = 9.0;
 
-// ── Zoom-scaled chunk render distance (the "half terrain culled" fix) ────────
-// Voxel terrain only streams within `MainWorld::render_distance_chunks` of the
-// (camera-centered) disc. When the view zooms out past it, the far water plane
-// shows through where terrain isn't loaded and reads as a hard "culled" ocean
-// edge — worse on one side because the disc is centered on the camera, which sits
-// `ORBIT_RADIUS` off the player. The vendored voxel spawner re-reads the distance
-// every frame, so `scale_voxel_render_distance` drives it from zoom: the preset
-// value stays the FLOOR (normal/zoomed-in play unchanged), and zooming out grows
-// the disc to keep the view filled, capped to bound the cost.
-/// Extra chunk rings beyond the fixed base distance. This is a safety cap, not
-/// the main max-zoom knob; with the fixed high base of 10, a cap of 5 still allows
-/// `rd_dyn=15` if the reach formula asks for it.
-const RD_ZOOM_HEADROOM: u32 = 5;
-/// Ground reach (world units) per unit of orthographic `viewport_height` along
-/// the camera's far (toward-horizon) direction, where iso foreshortening makes the
-/// view reach furthest and the disc edge shows first. Empirical. The previous 4.0
-/// pushed max zoom to `rd_dyn=15` (~3400 chunks in the monitor log). With the
-/// player-centered LOD0 footprint fix below, 3.0 still covers max zoom while
-/// keeping the loaded disc closer to `rd_dyn=12`.
-const RD_ZOOM_REACH: f32 = 3.0;
-/// Chunk edge length in world units (matches inf3d_world's 32-voxel chunks).
-const CHUNK_WORLD_SIZE: f32 = 32.0;
-/// Min zoom change (world units) before the disc is re-evaluated — hysteresis so
-/// steady / micro-easing zoom doesn't thrash chunk spawn/despawn. Keep this small:
-/// an 8-unit band could miss a one-chunk threshold near max zoom and leave the
-/// far edge unloaded until another large zoom delta happened.
-const RD_ZOOM_DEADBAND: f32 = 2.0;
-/// Conservative world-XZ reach per orthographic vertical unit for this fixed iso
-/// pitch. It intentionally overestimates the true footprint so LOD 1 begins just
-/// off-screen even on wide windows and uneven heightfields.
-const TERRAIN_LOD_VIEW_REACH: f32 = 2.0;
-/// Extra full-detail world units outside the visible footprint. This hides chunk
-/// center quantization, remesh latency, height variation, and edge scrolling.
-const TERRAIN_LOD_SCREEN_MARGIN: f32 = 64.0;
+// ── Voxel streaming / terrain LOD reach ──────────────────────────────────────
+/// Voxel edge length of a chunk's interior, matching `bevy_voxel_world` (32³). The
+/// streamed disc radius in world units is `render_distance_chunks * CHUNK_VOXELS`.
+const CHUNK_VOXELS: u32 = 32;
+/// Upper bound on the terrain-LOD band as a fraction of the streamed disc radius.
+/// LOD level `n` begins at `n * band`, so the band MUST be smaller than the disc or
+/// no chunk inside the disc ever coarsens (LOD silently dead). Capping the per-preset
+/// `terrain_lod_distance` here guarantees the LOD-0→1 ring falls inside the disc even
+/// if the render distance is set small. At the default render distance every preset
+/// value is well under this cap, so it passes through unchanged — and the low presets
+/// keep their intended earlier coarsening (the old fixed 150-unit floor overrode
+/// Potato 90 / Low 120 up to 150, defeating their perf tuning).
+const LOD_BAND_MAX_DISC_FRACTION: f32 = 0.9;
 
+/// Marker for the single gameplay camera entity (orbit / free-fly).
 #[derive(Component)]
-pub struct IsoCamera;
+pub struct OrbitCamera;
 
-/// Runtime camera mode. `F` toggles free-fly in every world; `G` toggles a
-/// player-mounted FPS camera. Menus/debug flows can also force free-fly when needed.
+/// Runtime camera mode. `F` toggles free-fly in every world. Menus/debug flows can
+/// also force free-fly off (e.g. on load) when needed.
 #[derive(Resource, Default)]
 pub struct CameraMode {
     mode: CameraViewMode,
@@ -114,68 +120,62 @@ pub struct CameraMode {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum CameraViewMode {
+    /// Third-person orbit following the player (normal play).
     #[default]
-    Iso,
+    Orbit,
+    /// Debug free-fly: the camera flies freely, the player idles.
     FreeFly,
-    Fps,
 }
 
 impl CameraMode {
-    fn is_iso(&self) -> bool {
-        self.mode == CameraViewMode::Iso
+    fn is_orbit(&self) -> bool {
+        self.mode == CameraViewMode::Orbit
     }
 
     pub fn is_free_fly(&self) -> bool {
         self.mode == CameraViewMode::FreeFly
     }
 
-    fn is_fps(&self) -> bool {
-        self.mode == CameraViewMode::Fps
-    }
-
     pub fn set_free_fly(&mut self, enabled: bool) {
         self.mode = if enabled {
             CameraViewMode::FreeFly
         } else {
-            CameraViewMode::Iso
+            CameraViewMode::Orbit
         };
     }
 
     fn toggle_free_fly(&mut self) {
         self.mode = if self.is_free_fly() {
-            CameraViewMode::Iso
+            CameraViewMode::Orbit
         } else {
             CameraViewMode::FreeFly
         };
     }
 
-    fn toggle_fps(&mut self) {
-        self.mode = if self.is_fps() {
-            CameraViewMode::Iso
-        } else {
-            CameraViewMode::Fps
-        };
-    }
-
     fn label(&self) -> &'static str {
         match self.mode {
-            CameraViewMode::Iso => "isometric",
+            CameraViewMode::Orbit => "orbit",
             CameraViewMode::FreeFly => "free-fly",
-            CameraViewMode::Fps => "FPS",
         }
     }
 }
 
-/// Smoothed camera state: orbit yaw around the player and orthographic zoom,
-/// each easing toward a target the input system sets.
+/// Orbit-rig state: the yaw/pitch the mouse drives directly, plus the boom
+/// distance that eases toward a scroll-set target.
+///
+/// `yaw`/`pitch` are written DIRECTLY from the mouse delta (no smoothing) so the
+/// view feels responsive; only the boom `distance` eases toward `distance_target`
+/// so the zoom glides instead of snapping.
 #[derive(Component)]
 pub struct CameraRig {
     yaw: f32,
-    yaw_target: f32,
-    zoom: f32,
-    zoom_target: f32,
-    fps_yaw: f32,
-    fps_pitch: f32,
+    pitch: f32,
+    /// Eased zoom distance (the user's scroll target glides into this).
+    distance: f32,
+    distance_target: f32,
+    /// The ACTUAL boom length after collision (fast-in / slow-out), distinct from the
+    /// eased zoom `distance`. Transient — not persisted; reset to `distance` on snap.
+    boom: f32,
 }
 
 impl CameraRig {
@@ -184,29 +184,34 @@ impl CameraRig {
         self.yaw
     }
 
-    /// Current orthographic zoom (vertical view height) — read by save/load.
-    pub fn zoom(&self) -> f32 {
-        self.zoom
+    /// Current orbit pitch (radians) — read by save/load to persist the view.
+    pub fn pitch(&self) -> f32 {
+        self.pitch
     }
 
-    /// Snap BOTH the live value and its easing target to `yaw`/`zoom`, so Load
-    /// restores a saved camera instantly rather than easing from the old view.
-    /// `camera_input` re-applies `zoom` to the projection on the next in-game
-    /// frame; `follow_player` (PostUpdate, ungated) repositions from `yaw`.
-    pub fn snap_to(&mut self, yaw: f32, zoom: f32) {
+    /// Current boom distance (world units) — read by save/load to persist the view.
+    pub fn distance(&self) -> f32 {
+        self.distance
+    }
+
+    /// Snap the whole rig to `yaw`/`pitch`/`distance` (and the easing target), so
+    /// Load restores a saved view instantly rather than easing from the old one.
+    /// `follow_player` repositions the eye from these on the next frame.
+    pub fn snap_to(&mut self, yaw: f32, pitch: f32, distance: f32) {
         self.yaw = yaw;
-        self.yaw_target = yaw;
-        self.zoom = zoom;
-        self.zoom_target = zoom;
+        self.pitch = pitch.clamp(PITCH_MIN, PITCH_MAX);
+        self.distance = distance.clamp(DISTANCE_MIN, DISTANCE_MAX);
+        self.distance_target = self.distance;
+        self.boom = self.distance;
     }
 }
 
-pub struct IsoCameraPlugin;
+pub struct OrbitCameraPlugin;
 
-impl Plugin for IsoCameraPlugin {
+impl Plugin for OrbitCameraPlugin {
     fn build(&self, app: &mut App) {
         // `QualitySettings` is a shared resource owned solely by `CorePlugin`; we
-        // only read it here. `camera_input` is raw-input (Input phase);
+        // only read it here. The input chain is raw-input (Input phase);
         // `apply_quality_to_camera` reconfigures post-FX (Fx phase).
         app.init_resource::<CameraMode>()
             .add_systems(Startup, spawn_camera)
@@ -215,17 +220,16 @@ impl Plugin for IsoCameraPlugin {
                 (
                     toggle_camera_mode,
                     apply_camera_mode,
-                    manage_fps_cursor,
-                    camera_input,
+                    manage_cursor_grab,
+                    orbit_input,
                     free_fly_input,
-                    fps_input,
-                    write_fps_move_intent,
+                    write_move_intent,
                 )
                     .chain()
                     .in_set(GameSet::Input),
             )
-            // Drive the voxel chunk render distance from zoom (Input phase, before
-            // streaming) so a zoomed-out view loads enough terrain to fill it.
+            // Drive the voxel chunk render distance + terrain LOD (Input phase,
+            // before streaming) so enough terrain loads to fill the view.
             .add_systems(Update, scale_voxel_render_distance.in_set(GameSet::Input))
             .add_systems(Update, apply_quality_to_camera.in_set(GameSet::Fx))
             // Follow in PostUpdate, AFTER avian's `TransformInterpolation` easing
@@ -233,7 +237,7 @@ impl Plugin for IsoCameraPlugin {
             // smoothed player `Transform`, and BEFORE Bevy's transform
             // propagation so the camera's `GlobalTransform` is up to date this
             // frame. Reading the interpolated (not mid-step) transform is what
-            // keeps the camera smooth at any zoom.
+            // keeps the camera smooth at any frame rate.
             .add_systems(
                 PostUpdate,
                 follow_player.before(TransformSystems::Propagate),
@@ -241,38 +245,106 @@ impl Plugin for IsoCameraPlugin {
     }
 }
 
-/// Camera offset from the player for a given orbit yaw.
-fn orbit_offset(yaw: f32) -> Vec3 {
-    Vec3::new(
-        yaw.sin() * ORBIT_RADIUS,
-        ORBIT_HEIGHT,
-        yaw.cos() * ORBIT_RADIUS,
-    )
+/// Unit direction from the focus toward the eye for a given `yaw`/`pitch`. The
+/// boom eye is `focus + orbit_dir(yaw, pitch) * distance`. Yaw 0 / pitch 0 places
+/// the eye on +Z behind the focus, matching the WASD basis in [`write_move_intent`]
+/// (forward = away from the camera = world -Z at yaw 0).
+fn orbit_dir(yaw: f32, pitch: f32) -> Vec3 {
+    let cp = pitch.cos();
+    Vec3::new(yaw.sin() * cp, pitch.sin(), yaw.cos() * cp)
 }
 
-fn fps_eye(player_translation: Vec3) -> Vec3 {
-    player_translation + Vec3::Y * FPS_EYE_HEIGHT
+/// The point the camera looks at (and the screen-centre crosshair aims at): just above
+/// the player (≈ head height) so the figure frames low and the reticle points ahead of
+/// it. The camera pivots on the player here — NO forward offset — so orbiting feels
+/// anchored to the character. Shared by `apply_camera_mode` (snap) and `follow_player`.
+fn focus_point(player_translation: Vec3) -> Vec3 {
+    player_translation + Vec3::Y * FOCUS_HEIGHT
 }
 
-/// Drive camera-dependent voxel streaming and terrain LOD.
+/// Nearest distance the boom may extend along `dir` from `focus` before a solid voxel
+/// OR a prop collider would clip the camera, capped at `desired`. Casts a small bundle
+/// of parallel rays (centre + four offset by [`CAMERA_RADIUS`] perpendicular to the
+/// boom) to approximate a sphere-cast — a single ray is too thin and threads through
+/// voxel edges — against both the voxel terrain/builds and the physics world (props
+/// are avian colliders, invisible to the voxel raycast), taking the nearest hit minus
+/// [`BOOM_PADDING`], floored at [`BOOM_MIN`]. `exclude` is the player entity, whose
+/// capsule sits at the focus and must not stop the boom.
+fn boom_collision_distance(
+    voxel_world: &VoxelWorld<MainWorld>,
+    spatial: &SpatialQuery,
+    exclude: Entity,
+    focus: Vec3,
+    dir: Vec3,
+    desired: f32,
+) -> f32 {
+    let Ok(axis) = Dir3::new(dir) else {
+        return desired;
+    };
+    // Two axes perpendicular to the boom to spread the bundle (the cheap sphere-cast).
+    let right = dir.cross(Vec3::Y).normalize_or_zero();
+    let up = if right == Vec3::ZERO {
+        Vec3::X
+    } else {
+        dir.cross(right).normalize_or_zero()
+    };
+    let offsets = [
+        Vec3::ZERO,
+        right * CAMERA_RADIUS,
+        -right * CAMERA_RADIUS,
+        up * CAMERA_RADIUS,
+        -up * CAMERA_RADIUS,
+    ];
+    // Props are the only colliders besides the player; excluding the player by entity
+    // gives us "props only" without referencing `inf3d_physics::GameLayer` (the camera
+    // is upstream of that crate).
+    let prop_filter = SpatialQueryFilter::default().with_excluded_entities([exclude]);
+    let mut limit = desired;
+    for off in offsets {
+        let origin = focus + off;
+        let ray = Ray3d {
+            origin,
+            direction: axis,
+        };
+        if let Some(hit) =
+            voxel_world.raycast(ray, &|(_coords, voxel)| matches!(voxel, WorldVoxel::Solid(_)))
+        {
+            limit = limit.min((hit.position - origin).length() - BOOM_PADDING);
+        }
+        if let Some(hit) = spatial.cast_ray(origin, axis, desired, true, &prop_filter) {
+            limit = limit.min(hit.distance - BOOM_PADDING);
+        }
+    }
+    limit.max(BOOM_MIN)
+}
+
+/// The perspective projection used for both orbit and free-fly.
+fn perspective_projection() -> Projection {
+    Projection::Perspective(PerspectiveProjection {
+        fov: FOV,
+        near: NEAR,
+        far: FAR,
+        ..default()
+    })
+}
+
+/// Drive camera-dependent voxel streaming and terrain LOD from fixed perspective
+/// reach values (the old orthographic zoom model is gone).
 ///
-/// Streaming still needs a camera-centered disc large enough to cover max zoom.
-/// Terrain LOD, however, is player/focus-centered and must keep LOD 0 over the
-/// whole visible orthographic footprint; otherwise the first coarse ring appears
-/// at the screen edge. Settings provide floors only — the current camera footprint
-/// is the source of truth.
+/// Terrain LOD is player/focus-centered and must keep LOD 0 over the visible
+/// footprint so the first coarse ring stays off-screen; streaming keeps the
+/// global render distance (the single `render_distance_chunks`; we never shrink it
+/// and the presets never change it). Both stay conservative for perf — the
+/// perspective view is shallower than the old iso rig.
 fn scale_voxel_render_distance(
     mode: Res<CameraMode>,
-    rig: Query<&CameraRig, With<IsoCamera>>,
-    cam_q: Query<&Transform, With<IsoCamera>>,
-    player_q: Query<&Transform, (With<FollowTarget>, Without<IsoCamera>)>,
+    cam_q: Query<&Transform, With<OrbitCamera>>,
+    player_q: Query<&Transform, (With<FollowTarget>, Without<OrbitCamera>)>,
     quality: Res<QualitySettings>,
     mut world: ResMut<MainWorld>,
-    mut last_zoom: Local<f32>,
 ) {
-    let Ok(rig) = rig.single() else {
-        return;
-    };
+    // LOD focus tracks the camera while free-flying (so the detailed band follows
+    // where you're looking), else the player.
     if mode.is_free_fly() {
         if let Ok(cam) = cam_q.single() {
             world.lod_focus_xz = Some(Vec2::new(cam.translation.x, cam.translation.z));
@@ -281,33 +353,27 @@ fn scale_voxel_render_distance(
         world.lod_focus_xz = Some(Vec2::new(player.translation.x, player.translation.z));
     }
 
-    // Use the larger of current/target zoom so scrolling out immediately requests
-    // enough coverage before the smoothed camera visually arrives there.
-    let effective_zoom = rig.zoom.max(rig.zoom_target);
-
-    let lod_band = (effective_zoom * TERRAIN_LOD_VIEW_REACH + TERRAIN_LOD_SCREEN_MARGIN)
-        .max(quality.terrain_lod_distance);
-    if (world.terrain_lod_distance - lod_band).abs() >= 1.0 {
-        world.terrain_lod_distance = lod_band;
+    // LOD band width, capped to the streamed disc so a coarse ring always exists
+    // inside it (a fixed floor could exceed a small disc → LOD never fires).
+    let band = lod_band(quality.render_distance_chunks, quality.terrain_lod_distance);
+    if (world.terrain_lod_distance - band).abs() >= 1.0 {
+        world.terrain_lod_distance = band;
     }
 
-    // Re-evaluate streaming only after a meaningful zoom change, so the zoom's
-    // asymptotic easing settling on a value doesn't churn chunk spawn/despawn every frame.
-    if (effective_zoom - *last_zoom).abs() < RD_ZOOM_DEADBAND {
-        return;
+    // Keep the streamed disc at the configured global radius — never shrink below it.
+    if world.render_distance_chunks != quality.render_distance_chunks {
+        world.render_distance_chunks = quality.render_distance_chunks;
     }
-    *last_zoom = effective_zoom;
+}
 
-    // The fixed high distance is the floor; grow only as much as the current zoom
-    // needs. Reach is the far-direction ground span plus the camera's horizontal
-    // offset from the player (the disc is camera-centered), converted to chunks.
-    let floor = quality.render_distance_chunks;
-    let ceil = floor + RD_ZOOM_HEADROOM;
-    let reach = effective_zoom * RD_ZOOM_REACH + ORBIT_RADIUS;
-    let target = ((reach / CHUNK_WORLD_SIZE).ceil() as u32).clamp(floor, ceil);
-    if target != world.render_distance_chunks {
-        world.render_distance_chunks = target;
-    }
+/// Width (world units) of each terrain-LOD band: the per-preset `terrain_lod_distance`
+/// capped so the first coarse ring always falls inside the streamed disc (see
+/// [`LOD_BAND_MAX_DISC_FRACTION`]). LOD level `n` begins at `n * band`.
+fn lod_band(render_distance_chunks: u32, terrain_lod_distance: f32) -> f32 {
+    let disc = (render_distance_chunks * CHUNK_VOXELS) as f32;
+    terrain_lod_distance
+        .min(disc * LOD_BAND_MAX_DISC_FRACTION)
+        .max(1.0)
 }
 
 /// Bloom config used everywhere it's enabled (Startup + runtime re-apply).
@@ -367,33 +433,27 @@ fn color_grading_component() -> ColorGrading {
 }
 
 fn spawn_camera(mut commands: Commands, quality: Res<QualitySettings>) {
-    let yaw = std::f32::consts::FRAC_PI_4; // classic 45° iso
+    let yaw = 0.0;
+    let pitch = PITCH_DEFAULT;
+    let distance = DISTANCE_DEFAULT;
 
-    // Orthographic projection gives the flat, parallel-line iso look. FixedVertical
-    // keeps a constant world-height slice on screen regardless of aspect ratio.
-    let projection = Projection::Orthographic(OrthographicProjection {
-        scaling_mode: ScalingMode::FixedVertical {
-            viewport_height: ZOOM_DEFAULT,
-        },
-        near: ORTHO_NEAR,
-        far: ORTHO_FAR,
-        ..OrthographicProjection::default_3d()
-    });
+    // Place the camera looking at the origin from the default boom; `follow_player`
+    // re-snaps it to the real focus on the first frame.
+    let eye = orbit_dir(yaw, pitch) * distance;
 
     let mut entity = commands.spawn((
         Camera3d::default(),
-        projection,
-        Transform::from_translation(orbit_offset(yaw)).looking_at(Vec3::ZERO, Vec3::Y),
+        perspective_projection(),
+        Transform::from_translation(eye).looking_at(Vec3::ZERO, Vec3::Y),
         // Required: bevy_voxel_world streams chunks around this marked camera.
         VoxelWorldCamera::<MainWorld>::default(),
-        IsoCamera,
+        OrbitCamera,
         CameraRig {
             yaw,
-            yaw_target: yaw,
-            zoom: ZOOM_DEFAULT,
-            zoom_target: ZOOM_DEFAULT,
-            fps_yaw: 0.0,
-            fps_pitch: 0.0,
+            pitch,
+            distance,
+            distance_target: distance,
+            boom: distance,
         },
         // HDR is the color pipeline contract regardless of post-FX quality.
         Hdr,
@@ -437,21 +497,20 @@ fn spawn_camera(mut commands: Commands, quality: Res<QualitySettings>) {
     }
 }
 
+/// `F` toggles the debug free-fly camera.
 fn toggle_camera_mode(keys: Res<ButtonInput<KeyCode>>, mut mode: ResMut<CameraMode>) {
     if keys.just_pressed(KeyCode::KeyF) {
         mode.toggle_free_fly();
         info!("inf3d_camera: {} camera", mode.label());
     }
-    if keys.just_pressed(KeyCode::KeyG) {
-        mode.toggle_fps();
-        info!("inf3d_camera: {} camera", mode.label());
-    }
 }
 
+/// React to a mode change. The projection is always perspective now; on entering
+/// Orbit we place the camera from the rig so it doesn't ease from the free-fly pose.
 fn apply_camera_mode(
     mode: Res<CameraMode>,
-    player_q: Query<&Transform, (With<FollowTarget>, Without<IsoCamera>)>,
-    mut cam_q: Query<(&mut Transform, &mut Projection, &mut CameraRig), With<IsoCamera>>,
+    player_q: Query<&Transform, (With<FollowTarget>, Without<OrbitCamera>)>,
+    mut cam_q: Query<(&mut Transform, &mut Projection, &mut CameraRig), With<OrbitCamera>>,
 ) {
     if !mode.is_changed() {
         return;
@@ -459,34 +518,20 @@ fn apply_camera_mode(
     let Ok((mut cam_t, mut projection, mut rig)) = cam_q.single_mut() else {
         return;
     };
-    if mode.is_free_fly() || mode.is_fps() {
-        *projection = Projection::Perspective(PerspectiveProjection {
-            fov: std::f32::consts::FRAC_PI_3,
-            near: 0.1,
-            far: ORTHO_FAR,
-            ..default()
-        });
-        if mode.is_fps() {
-            if let Ok(player) = player_q.single() {
-                let (yaw, _, _) = player.rotation.to_euler(EulerRot::YXZ);
-                rig.fps_yaw = yaw;
-                rig.fps_pitch = 0.0;
-                cam_t.translation = fps_eye(player.translation);
-                cam_t.rotation = Quat::from_euler(EulerRot::YXZ, rig.fps_yaw, rig.fps_pitch, 0.0);
-            }
-        }
-    } else {
-        *projection = Projection::Orthographic(OrthographicProjection {
-            scaling_mode: ScalingMode::FixedVertical {
-                viewport_height: rig.zoom,
-            },
-            near: ORTHO_NEAR,
-            far: ORTHO_FAR,
-            ..OrthographicProjection::default_3d()
-        });
+    // Keep the projection perspective in both modes (it may have been replaced).
+    if !matches!(&*projection, Projection::Perspective(_)) {
+        *projection = perspective_projection();
+    }
+    // On entering Orbit, snap the eye onto the boom so the view doesn't lerp from
+    // wherever free-fly left the camera.
+    if mode.is_orbit() {
         if let Ok(player) = player_q.single() {
-            cam_t.translation = player.translation + orbit_offset(rig.yaw);
-            *cam_t = cam_t.looking_at(player.translation, Vec3::Y);
+            // Reset the collision boom to the full zoom so it doesn't ease in from a
+            // stale (free-fly) length, then snap the eye onto it.
+            rig.boom = rig.distance;
+            let focus = focus_point(player.translation);
+            cam_t.translation = focus + orbit_dir(rig.yaw, rig.pitch) * rig.boom;
+            *cam_t = cam_t.looking_at(focus, Vec3::Y);
         }
     }
 }
@@ -511,7 +556,7 @@ fn apply_quality_to_camera(
             Has<MotionBlur>,
             Has<MotionVectorPrepass>,
         ),
-        With<IsoCamera>,
+        With<OrbitCamera>,
     >,
 ) {
     if !quality.is_changed() {
@@ -565,8 +610,8 @@ fn apply_quality_to_camera(
     // the simplest correct approach is to flip the camera's `Msaa` component to
     // match SSAO: `Off` while SSAO is on (Bevy requires it), and back to the
     // default (Sample4) when SSAO is off so we regain antialiasing. Tradeoff:
-    // toggling presets re-creates MSAA targets, but only on the F2 change, not
-    // per frame.
+    // toggling presets re-creates MSAA targets, but only on the preset change
+    // (from the settings menu), not per frame.
     if ssao_enabled {
         if !has_ssao {
             e.insert(ssao_component());
@@ -605,60 +650,60 @@ fn apply_quality_to_camera(
     }
 }
 
-/// Scroll wheel zooms; Q/E orbit the view around the player.
-fn camera_input(
+/// Orbit-mode mouse-look + scroll-zoom. Mouse motion drives yaw/pitch directly;
+/// the scroll wheel retargets the boom distance (eased in `follow_player`).
+fn orbit_input(
     mode: Res<CameraMode>,
-    time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
     mut scroll: MessageReader<MouseWheel>,
     mut motion: MessageReader<MouseMotion>,
     mut rig_q: Query<&mut CameraRig>,
 ) {
-    if !mode.is_iso() {
-        // Drain scroll for the iso zoom reader so stale wheel events do not apply
-        // when toggling back, but leave mouse motion for debug/FPS readers below.
+    if !mode.is_orbit() {
+        // Drain the scroll reader so stale wheel events don't apply when toggling
+        // back to orbit, but leave mouse motion for the free-fly reader below.
         for _ in scroll.read() {}
+        return;
+    }
+    // While the cursor is freed for UI (Alt held), suspend mouse-look + zoom and drain
+    // the buffered events so moving the pointer to a button never spins the camera.
+    if keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight) {
+        motion.clear();
+        scroll.clear();
         return;
     }
     let Ok(mut rig) = rig_q.single_mut() else {
         return;
     };
 
+    let mut delta = Vec2::ZERO;
+    for ev in motion.read() {
+        delta += ev.delta;
+    }
+    if delta.length_squared() > 0.0 {
+        rig.yaw -= delta.x * LOOK_SENS;
+        // `pitch` is the camera's ELEVATION above the focus (higher pitch = the eye
+        // rises and looks DOWN), which is geometrically opposite a first-person view
+        // pitch. So ADD `delta.y` here: mouse up (`delta.y < 0`) LOWERS the camera to
+        // look up — the standard, non-inverted feel.
+        rig.pitch = (rig.pitch + delta.y * LOOK_SENS).clamp(PITCH_MIN, PITCH_MAX);
+    }
+
     for ev in scroll.read() {
-        // Scroll up (positive y) zooms in -> smaller viewport height.
-        rig.zoom_target = (rig.zoom_target - ev.y * ZOOM_SPEED).clamp(ZOOM_MIN, ZOOM_MAX);
-    }
-
-    let dt = time.delta_secs();
-    if keys.pressed(KeyCode::KeyQ) {
-        rig.yaw_target -= ORBIT_SPEED * dt;
-    }
-    if keys.pressed(KeyCode::KeyE) {
-        rig.yaw_target += ORBIT_SPEED * dt;
-    }
-
-    // Middle-mouse drag orbits horizontally only (pitch/height stay fixed to
-    // preserve the iso view).
-    if mouse_buttons.pressed(MouseButton::Middle) {
-        let mut dx = 0.0;
-        for ev in motion.read() {
-            dx += ev.delta.x;
-        }
-        rig.yaw_target -= dx * DRAG_SENS;
-    } else {
-        // Drop buffered motion so the next drag doesn't jump.
-        motion.clear();
+        // Scroll up (positive y) zooms in -> shorter boom.
+        rig.distance_target =
+            (rig.distance_target - ev.y * ZOOM_SPEED).clamp(DISTANCE_MIN, DISTANCE_MAX);
     }
 }
 
+/// Debug free-fly: WASD + Space/Ctrl flies the camera, mouse-look applies directly
+/// (the cursor is captured in play, so no mouse-button gate is needed).
 fn free_fly_input(
     mode: Res<CameraMode>,
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
-    mouse_buttons: Res<ButtonInput<MouseButton>>,
     mut motion: MessageReader<MouseMotion>,
-    mut cam_q: Query<&mut Transform, With<IsoCamera>>,
+    mut cam_q: Query<&mut Transform, With<OrbitCamera>>,
 ) {
     if !mode.is_free_fly() {
         return;
@@ -667,19 +712,18 @@ fn free_fly_input(
         return;
     };
 
-    if mouse_buttons.pressed(MouseButton::Right) {
-        let mut delta = Vec2::ZERO;
-        for ev in motion.read() {
-            delta += ev.delta;
-        }
-        if delta.length_squared() > 0.0 {
-            let (mut yaw, mut pitch, _) = t.rotation.to_euler(EulerRot::YXZ);
-            yaw -= delta.x * FREE_FLY_LOOK_SENS;
-            pitch = (pitch - delta.y * FREE_FLY_LOOK_SENS).clamp(-1.5, 1.5);
-            t.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
-        }
-    } else {
-        motion.clear();
+    // Hold Alt to free the cursor for UI — suspend free-fly mouse-look while it's held.
+    let ui_cursor = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
+
+    let mut delta = Vec2::ZERO;
+    for ev in motion.read() {
+        delta += ev.delta;
+    }
+    if !ui_cursor && delta.length_squared() > 0.0 {
+        let (mut yaw, mut pitch, _) = t.rotation.to_euler(EulerRot::YXZ);
+        yaw -= delta.x * FREE_FLY_LOOK_SENS;
+        pitch = (pitch - delta.y * FREE_FLY_LOOK_SENS).clamp(-1.5, 1.5);
+        t.rotation = Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0);
     }
 
     let mut dir = Vec3::ZERO;
@@ -709,43 +753,26 @@ fn free_fly_input(
     t.translation += dir.normalize_or_zero() * speed * time.delta_secs();
 }
 
-fn fps_input(
-    mode: Res<CameraMode>,
-    mut motion: MessageReader<MouseMotion>,
-    mut rig_q: Query<&mut CameraRig, With<IsoCamera>>,
-) {
-    if !mode.is_fps() {
-        return;
-    }
-    let Ok(mut rig) = rig_q.single_mut() else {
-        return;
-    };
-    let mut delta = Vec2::ZERO;
-    for ev in motion.read() {
-        delta += ev.delta;
-    }
-    if delta.length_squared() > 0.0 {
-        rig.fps_yaw -= delta.x * FPS_LOOK_SENS;
-        rig.fps_pitch = (rig.fps_pitch - delta.y * FPS_LOOK_SENS).clamp(-1.5, 1.5);
-    }
-}
-
-/// Lock + hide the OS cursor while in FPS mode so mouse-look has unlimited travel
-/// and the pointer never drifts off-window or onto UI. Releases it whenever FPS is
-/// off OR the game is paused / not in play, so the menus stay clickable (otherwise
-/// pausing in FPS would trap the cursor). Runs every frame but only writes the
-/// window on an actual change, so it's effectively free.
-fn manage_fps_cursor(
-    mode: Res<CameraMode>,
+/// Lock + hide the OS cursor while in play so mouse-look (orbit AND free-fly) has
+/// unlimited travel and the pointer never drifts off-window or onto UI. Releases it
+/// whenever the game is paused / not in play, so the menus stay clickable. Runs
+/// every frame but only writes the window on an actual change, so it's effectively
+/// free.
+fn manage_cursor_grab(
     app_state: Res<State<AppState>>,
     pause: Res<State<Pause>>,
+    keys: Res<ButtonInput<KeyCode>>,
     // In Bevy 0.18 cursor state is its own component on the primary window entity,
     // not a field on `Window`.
     mut cursor: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
-    let lock = mode.is_fps()
-        && *app_state.get() == AppState::InGame
-        && *pause.get() == Pause::Running;
+    // Hold Left/Right Alt to temporarily FREE the cursor (to click the Walk/Build
+    // buttons, the material picker, etc.) without leaving play. Mouse-look + WASD are
+    // suspended while it's held (see `orbit_input` / `write_move_intent`), so moving the
+    // pointer to a button never spins the camera or walks the player.
+    let ui_cursor = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
+    let lock =
+        *app_state.get() == AppState::InGame && *pause.get() == Pause::Running && !ui_cursor;
     let Ok(mut cursor) = cursor.single_mut() else {
         return;
     };
@@ -762,27 +789,33 @@ fn manage_fps_cursor(
     }
 }
 
-fn write_fps_move_intent(
+/// Translate WASD into a camera-relative [`MoveIntent`] in Orbit mode (the player
+/// idles in free-fly).
+fn write_move_intent(
     mode: Res<CameraMode>,
     keys: Res<ButtonInput<KeyCode>>,
-    rig_q: Query<&CameraRig, With<IsoCamera>>,
-    mut intent: ResMut<FpsMoveIntent>,
+    rig_q: Query<&CameraRig, With<OrbitCamera>>,
+    mut intent: ResMut<MoveIntent>,
 ) {
-    if !mode.is_fps() {
+    // Not driving the player when free-flying, OR while the cursor is freed for UI
+    // (Alt held) so you don't walk into the scene while clicking a button.
+    if !mode.is_orbit() || keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight) {
         if intent.active {
-            *intent = FpsMoveIntent::default();
+            *intent = MoveIntent::default();
         }
         return;
     }
     let Ok(rig) = rig_q.single() else {
-        *intent = FpsMoveIntent::default();
+        *intent = MoveIntent::default();
         return;
     };
 
-    // Horizontal camera-relative movement. With Bevy cameras looking down -Z, the
-    // forward vector for yaw 0 is world -Z.
-    let forward = Vec3::new(-rig.fps_yaw.sin(), 0.0, -rig.fps_yaw.cos());
-    let right = Vec3::new(rig.fps_yaw.cos(), 0.0, -rig.fps_yaw.sin());
+    // Horizontal camera-relative basis keyed off the orbit yaw. `forward` points
+    // AWAY from the camera (into the screen): at yaw 0 the eye sits on +Z behind the
+    // focus (see `orbit_dir`), so forward is world -Z — matching Bevy's default
+    // camera-looks-down-(-Z) convention. `right` is the in-plane perpendicular.
+    let forward = Vec3::new(-rig.yaw.sin(), 0.0, -rig.yaw.cos());
+    let right = Vec3::new(rig.yaw.cos(), 0.0, -rig.yaw.sin());
     let mut direction = Vec3::ZERO;
     if keys.pressed(KeyCode::KeyW) {
         direction += forward;
@@ -803,86 +836,154 @@ fn write_fps_move_intent(
     intent.sprint = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
 }
 
-/// Smoothly chase the player at the orbit offset, applying smoothed zoom/orbit.
+/// Chase the player on the orbit boom: ease the zoom distance, sphere-cast the boom for
+/// terrain/builds (fast-in / slow-out so the camera never clips in or whips back out),
+/// then RIGIDLY place the eye from the interpolated player (no position lag) and look at
+/// the focus. Skipped entirely in free-fly (the camera is flown manually there).
 fn follow_player(
     mode: Res<CameraMode>,
     time: Res<Time>,
-    player_q: Query<&Transform, (With<FollowTarget>, Without<IsoCamera>)>,
-    mut cam_q: Query<(&mut Transform, &mut Projection, &mut CameraRig), With<IsoCamera>>,
-    // First-person view-bob state (transient; not persisted by save/load).
-    mut bob_phase: Local<f32>,
-    mut bob_weight: Local<f32>,
-    mut fps_last_xz: Local<Option<Vec2>>,
+    player_q: Query<(Entity, &Transform), (With<FollowTarget>, Without<OrbitCamera>)>,
+    mut cam_q: Query<(&mut Transform, &mut CameraRig), With<OrbitCamera>>,
+    voxel_world: VoxelWorld<MainWorld>,
+    spatial: SpatialQuery,
 ) {
     if mode.is_free_fly() {
         return;
     }
-    let Ok(player) = player_q.single() else {
+    let Ok((player_entity, player)) = player_q.single() else {
         return;
     };
-    let Ok((mut cam_t, mut proj, mut rig)) = cam_q.single_mut() else {
+    let Ok((mut cam_t, mut rig)) = cam_q.single_mut() else {
         return;
     };
 
-    if mode.is_fps() {
-        // View bob driven by ACTUAL ground speed (from the interpolated transform
-        // delta), eased so it fades in/out as you start/stop. Phase advances with
-        // distance travelled, so cadence is frame-rate independent and quickens when
-        // sprinting; vertical bobs at twice the lateral sway (two footfalls/stride).
-        let dt = time.delta_secs().max(1e-4);
-        let here = Vec2::new(player.translation.x, player.translation.z);
-        let speed = match *fps_last_xz {
-            Some(prev) => (here - prev).length() / dt,
-            None => 0.0,
-        };
-        *fps_last_xz = Some(here);
+    let dt = time.delta_secs();
 
-        let target_w = (speed / FPS_BOB_FULL_SPEED).clamp(0.0, 1.0);
-        let kw = 1.0 - (-FPS_BOB_SMOOTH * dt).exp();
-        *bob_weight = lerp(*bob_weight, target_w, kw);
-        *bob_phase = (*bob_phase + speed * dt * FPS_BOB_FREQ).rem_euclid(1.0);
+    // Zoom: ease the user's scroll target into the live distance. This is the only
+    // thing smoothed besides collision — the camera POSITION is rigid below.
+    let k_zoom = 1.0 - (-DISTANCE_SMOOTH * dt).exp();
+    rig.distance = lerp(rig.distance, rig.distance_target, k_zoom);
 
-        let tau = std::f32::consts::TAU;
-        let v = (*bob_phase * tau * 2.0).sin() * FPS_BOB_VERTICAL * *bob_weight;
-        let h = (*bob_phase * tau).sin() * FPS_BOB_LATERAL * *bob_weight;
+    let focus = focus_point(player.translation);
+    let dir = orbit_dir(rig.yaw, rig.pitch);
 
-        let rot = Quat::from_euler(EulerRot::YXZ, rig.fps_yaw, rig.fps_pitch, 0.0);
-        // Lateral sway along the camera's (horizontal) right axis; bob along world up.
-        let right = rot * Vec3::X;
-        cam_t.translation = fps_eye(player.translation) + right * h + Vec3::Y * v;
-        cam_t.rotation = rot;
-        if !matches!(&*proj, Projection::Perspective(_)) {
-            *proj = Projection::Perspective(PerspectiveProjection {
-                fov: std::f32::consts::FRAC_PI_3,
-                near: 0.1,
-                far: ORTHO_FAR,
-                ..default()
-            });
-        }
-        return;
-    }
+    // Boom collision (sphere-cast-ish): how far the camera may sit before a wall clips
+    // it, capped at the eased zoom. Fast-IN (snap toward a closer limit so the camera
+    // never sits inside geometry), slow-OUT (ease back when it clears so rounding a
+    // corner doesn't whip the view).
+    let limit =
+        boom_collision_distance(&voxel_world, &spatial, player_entity, focus, dir, rig.distance);
+    let rate = if limit < rig.boom {
+        BOOM_IN_SMOOTH
+    } else {
+        BOOM_OUT_SMOOTH
+    };
+    let k = 1.0 - (-rate * dt).exp();
+    rig.boom = lerp(rig.boom, limit, k);
 
-    // Not FPS: forget the last bob sample so re-entering FPS starts fresh (no
-    // speed spike from a stale position across the mode switch).
-    *fps_last_xz = None;
-
-    // Frame-rate-independent exponential smoothing factor.
-    let k = 1.0 - (-SMOOTH * time.delta_secs()).exp();
-    rig.yaw = lerp(rig.yaw, rig.yaw_target, k);
-    rig.zoom = lerp(rig.zoom, rig.zoom_target, k);
-
-    let target = player.translation + orbit_offset(rig.yaw);
-    cam_t.translation = cam_t.translation.lerp(target, k);
-    // Re-aim after moving: looking_at preserves translation, recomputes rotation.
-    *cam_t = cam_t.looking_at(player.translation, Vec3::Y);
-
-    if let Projection::Orthographic(ortho) = proj.as_mut() {
-        ortho.scaling_mode = ScalingMode::FixedVertical {
-            viewport_height: rig.zoom,
-        };
-    }
+    // RIGID horizontal follow: recompute the eye from the (already interpolated, smooth)
+    // player every frame — no position lerp — so the follow has zero lag.
+    cam_t.translation = focus + dir * rig.boom;
+    *cam_t = cam_t.looking_at(focus, Vec3::Y);
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Terrain LOD must actually fire: for every preset the LOD band has to be
+    /// strictly smaller than the streamed disc radius, or LOD level 1 starts beyond
+    /// the disc edge and no chunk ever coarsens. Guards the regression where a fixed
+    /// reach floor exceeded the disc (it had silently killed LOD on the low presets
+    /// if the render distance was ever lowered).
+    #[test]
+    fn lod_band_fires_inside_disc_for_every_preset() {
+        use inf3d_core::{QualityPreset, QualitySettings};
+        for preset in QualityPreset::ALL {
+            let mut q = QualitySettings::default();
+            preset.apply(&mut q);
+            let disc = (q.render_distance_chunks * CHUNK_VOXELS) as f32;
+            let band = lod_band(q.render_distance_chunks, q.terrain_lod_distance);
+            assert!(
+                band < disc,
+                "{:?}: LOD band {band} must be < disc radius {disc} so LOD fires",
+                preset,
+            );
+        }
+    }
+
+    /// `orbit_dir` is a UNIT vector for any yaw/pitch (it parameterizes a sphere),
+    /// so `eye = focus + dir * distance` is always exactly `distance` from the focus.
+    #[test]
+    fn orbit_dir_is_unit_length() {
+        for &(yaw, pitch) in &[
+            (0.0_f32, 0.0_f32),
+            (1.3, 0.5),
+            (-2.1, PITCH_MAX),
+            (3.0, PITCH_MIN),
+            (std::f32::consts::PI, PITCH_DEFAULT),
+        ] {
+            let d = orbit_dir(yaw, pitch);
+            assert!(
+                (d.length() - 1.0).abs() < 1e-5,
+                "orbit_dir({yaw},{pitch}) length {} != 1",
+                d.length()
+            );
+        }
+    }
+
+    /// At yaw 0 / pitch 0 the eye sits straight behind the focus on +Z, and the
+    /// WASD `forward` points the opposite way (into the screen, world -Z). This pins
+    /// the "W goes away from the camera / into the screen" convention.
+    #[test]
+    fn yaw_zero_eye_behind_focus_and_forward_into_screen() {
+        let dir = orbit_dir(0.0, 0.0);
+        assert!(
+            (dir - Vec3::Z).length() < 1e-5,
+            "eye should sit on +Z behind the focus at yaw 0, got {dir:?}"
+        );
+        // The WASD forward (from `write_move_intent`) at yaw 0.
+        let forward = Vec3::new(-0.0_f32.sin(), 0.0, -0.0_f32.cos());
+        assert!(
+            (forward - Vec3::NEG_Z).length() < 1e-5,
+            "W should drive into the screen (world -Z) at yaw 0, got {forward:?}"
+        );
+        // Forward is the horizontal projection of pointing FROM the eye TOWARD the
+        // focus (i.e. -dir flattened), so moving W walks away from the camera.
+        let toward_focus = Vec3::new(-dir.x, 0.0, -dir.z);
+        assert!((forward - toward_focus).length() < 1e-5);
+    }
+
+    /// The WASD basis is orthonormal in the XZ plane for any yaw, so diagonal input
+    /// has consistent magnitude and W/D never skew. (Y is always 0 — horizontal move.)
+    #[test]
+    fn wasd_basis_is_orthonormal() {
+        for &yaw in &[0.0_f32, 0.7, -1.9, 3.1, std::f32::consts::FRAC_PI_2] {
+            let forward = Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
+            let right = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
+            assert!((forward.length() - 1.0).abs() < 1e-5, "forward not unit");
+            assert!((right.length() - 1.0).abs() < 1e-5, "right not unit");
+            assert!(forward.dot(right).abs() < 1e-5, "forward·right != 0");
+            assert!(forward.y.abs() < 1e-6 && right.y.abs() < 1e-6, "basis not horizontal");
+        }
+    }
+
+    /// `right` is the camera-relative strafe axis: at yaw 0 pressing D moves +X
+    /// (screen-right for a camera looking down -Z), and forward × right points down
+    /// (consistent right-handedness) so A/D aren't mirrored.
+    #[test]
+    fn right_axis_points_screen_right_at_yaw_zero() {
+        let yaw = 0.0_f32;
+        let forward = Vec3::new(-yaw.sin(), 0.0, -yaw.cos());
+        let right = Vec3::new(yaw.cos(), 0.0, -yaw.sin());
+        assert!((right - Vec3::X).length() < 1e-5, "D should move +X at yaw 0");
+        // forward (-Z) × right (+X) = +Z×... check handedness: (-Z)×(+X) = -(Z×X)=-Y.
+        let cross = forward.cross(right);
+        assert!(cross.y < 0.0, "forward × right should point down (right-handed)");
+    }
 }

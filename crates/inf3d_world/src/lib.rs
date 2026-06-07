@@ -11,8 +11,9 @@ use bevy::{
 use bevy_voxel_world::prelude::*;
 use inf3d_core::QualitySettings;
 use inf3d_worldgen::{
-    build_noise_lod, sample_height, ColumnKind, Terrain, VoxelEdit, VoxelOverrideSnapshot,
-    VoxelOverrides, WorldGen, WorldKind, FLAT_SURFACE_HEIGHT,
+    build_moisture_noise, build_noise_lod, build_temperature_noise, classify_biome, sample_height,
+    sample_moisture, sample_temperature, Biome, ColumnKind, Terrain, VoxelEdit,
+    VoxelOverrideSnapshot, VoxelOverrides, WorldGen, WorldKind, FLAT_SURFACE_HEIGHT,
 };
 
 pub mod terrain_material;
@@ -43,34 +44,46 @@ pub enum TerrainMaterialId {
     /// Sandy seafloor for submerged columns. All faces sample this single
     /// layer; it shows through the translucent water plane.
     Seafloor = 3,
+    /// Desert/beach sandy surface. Top + sides show sand; the bottom reads as
+    /// stone (the sandy layer is a surface skin over the rock base). Picked for
+    /// [`Biome::Desert`](inf3d_worldgen::Biome::Desert) and
+    /// [`Biome::Beach`](inf3d_worldgen::Biome::Beach) land columns by
+    /// [`biome_surface_material`].
+    Sand = 4,
+    /// Snowy/tundra surface — snow cap over dirt/stone. Top shows snow; exposed
+    /// sides show dirt and the bottom shows stone (the snow is a thin cap, like
+    /// grass on [`Grass`](Self::Grass)). Picked for
+    /// [`Biome::Snow`](inf3d_worldgen::Biome::Snow) land columns by
+    /// [`biome_surface_material`].
+    Snow = 5,
     /// Player-PLACED stone. Visually identical to [`Stone`](Self::Stone) (same
-    /// tint), but a DISTINCT material/texture-array index so the terrain shader can
-    /// tell "this is a player build" and apply the see-through cutout to it (and
-    /// only it) when it occludes the player. Terrain never uses this index, so the
-    /// cutout never touches terrain. The FIRST of the contiguous `Built*` range
-    /// below; the shader treats any index `>= BuiltStone` as "built", so every
-    /// variant here is a player build the cutout can act on. The buildable set the
-    /// material picker offers is [`BUILDABLE`].
-    BuiltStone = 4,
+    /// tint), but a DISTINCT material/texture-array index so a build can always be
+    /// told apart from terrain (terrain never uses this index). This is what the
+    /// save format and the (currently inert, Tier-2-pending) see-through cutout key
+    /// off. The FIRST of the contiguous `Built*` range below; any index
+    /// `>= BuiltStone` is a "build". The buildable set the material picker offers is
+    /// [`BUILDABLE`].
+    BuiltStone = 6,
     /// Player-placed dirt (Dirt tint).
-    BuiltDirt = 5,
+    BuiltDirt = 7,
     /// Player-placed grass (Grass tint).
-    BuiltGrass = 6,
+    BuiltGrass = 8,
     /// Player-placed concrete (Concrete tint).
-    BuiltConcrete = 7,
+    BuiltConcrete = 9,
     /// Player-placed glass — a muted blue so it reads as a solid build block.
-    BuiltGlass = 8,
+    BuiltGlass = 10,
     /// Player-placed neon cyan accent.
-    BuiltNeonCyan = 9,
+    BuiltNeonCyan = 11,
     /// Player-placed neon magenta accent.
-    BuiltNeonMagenta = 10,
+    BuiltNeonMagenta = 12,
     /// Player-placed neon yellow accent.
-    BuiltNeonYellow = 11,
+    BuiltNeonYellow = 13,
 }
 
-/// The first material index that counts as a player BUILD (vs terrain). The
-/// terrain shader applies the see-through cutout only to faces whose texture-array
-/// index is `>= BUILT_MATERIAL_BASE`. Equal to the first `Built*` discriminant.
+/// The first material index that counts as a player BUILD (vs terrain). Used to
+/// separate builds from terrain (save/load, the picker, and the now-inert
+/// see-through cutout shader, which only ever targeted faces whose texture-array
+/// index is `>= BUILT_MATERIAL_BASE`). Equal to the first `Built*` discriminant.
 pub const BUILT_MATERIAL_BASE: u32 = TerrainMaterialId::BuiltStone as u32;
 
 /// The materials the Build-mode picker offers, IN PICKER ORDER (left → right /
@@ -78,10 +91,9 @@ pub const BUILT_MATERIAL_BASE: u32 = TerrainMaterialId::BuiltStone as u32;
 /// (`inf3d_ui`), so adding/reordering a buildable block is a one-line change here.
 ///
 /// Every entry MUST be a `Built*` material (index `>= `[`BUILT_MATERIAL_BASE`]) so
-/// player builds stay distinguishable from terrain and pick up the see-through
-/// cutout; `BUILDABLE[0]` MUST equal [`inf3d_core::DEFAULT_BUILD_MATERIAL`] (the
-/// resource default). Both invariants are guarded by the `buildable_defaults_align`
-/// test.
+/// player builds stay distinguishable from terrain; `BUILDABLE[0]` MUST equal
+/// [`inf3d_core::DEFAULT_BUILD_MATERIAL`] (the resource default). Both invariants
+/// are guarded by the `buildable_defaults_align` test.
 pub const BUILDABLE: [TerrainMaterialId; 8] = [
     TerrainMaterialId::BuiltStone,
     TerrainMaterialId::BuiltDirt,
@@ -159,7 +171,7 @@ pub(crate) struct MaterialDef {
 
 /// The canonical material palette. Order MUST match the [`TerrainMaterialId`]
 /// discriminants (guarded by the `palette_matches_enum` test).
-pub(crate) const PALETTE: [MaterialDef; 12] = [
+pub(crate) const PALETTE: [MaterialDef; 14] = [
     MaterialDef {
         id: TerrainMaterialId::Grass,
         label: "Grass",
@@ -191,6 +203,32 @@ pub(crate) const PALETTE: [MaterialDef; 12] = [
         faces: [TerrainMaterialId::Seafloor.layer(); 3],
     },
     MaterialDef {
+        // Desert/beach sand. Top + sides are sand (a sandy surface skin), but the
+        // bottom reads as stone — the rock base under the surface, mirroring how
+        // Grass bottoms out on stone.
+        id: TerrainMaterialId::Sand,
+        label: "Sand",
+        color: [0xd9, 0xc6, 0x8a],
+        faces: [
+            TerrainMaterialId::Sand.layer(),
+            TerrainMaterialId::Sand.layer(),
+            TerrainMaterialId::Stone.layer(),
+        ],
+    },
+    MaterialDef {
+        // Snowy/tundra surface — a thin snow cap on a dirt/stone column (same
+        // top-cap / dirt-side / stone-base layering as Grass, snow swapped for the
+        // grass cap).
+        id: TerrainMaterialId::Snow,
+        label: "Snow",
+        color: [0xea, 0xf1, 0xf7],
+        faces: [
+            TerrainMaterialId::Snow.layer(),
+            TerrainMaterialId::Dirt.layer(),
+            TerrainMaterialId::Stone.layer(),
+        ],
+    },
+    MaterialDef {
         // Player-placed stone — same tint as Stone (so a build looks like stone),
         // but its own texture-array layer so the shader can detect "built".
         id: TerrainMaterialId::BuiltStone,
@@ -200,7 +238,7 @@ pub(crate) const PALETTE: [MaterialDef; 12] = [
     },
     MaterialDef {
         // The remaining `Built*` blocks each carry their own texture-array layer so
-        // the shader can tell builds from terrain (the see-through cutout).
+        // builds stay distinguishable from terrain (for save/load + the inert cutout).
         id: TerrainMaterialId::BuiltDirt,
         label: "Built Dirt",
         color: [0x6b, 0x4a, 0x2c],
@@ -251,8 +289,8 @@ pub const DEFAULT_RENDER_DISTANCE_CHUNKS: u32 = 10;
 
 /// Default world-space distance (in world units, i.e. voxels) past which
 /// terrain chunks begin dropping to coarser LODs. Fallback for when no
-/// `QualitySettings` resource is present at build time; the camera raises this
-/// dynamically from the current orthographic footprint.
+/// `QualitySettings` resource is present at build time; the camera drives this
+/// dynamically from the visible perspective footprint.
 pub const DEFAULT_TERRAIN_LOD_DISTANCE: f32 = 165.0;
 
 /// Edge length (in voxels) of a chunk's interior. `bevy_voxel_world` fixes
@@ -331,7 +369,7 @@ impl VoxelWorldConfig for MainWorld {
         // Always-resident full-detail core radius around the camera. The rest
         // of the ring streams in/out by pure distance (see the despawn/spawn
         // strategies below), never by frustum — so detail doesn't pop at the
-        // edge of the (wide) isometric view.
+        // edge of the orbit view.
         //
         // Scale from the active spawn radius so the protected core never becomes
         // as large as the whole spawned disc. Keep a >= 1 core but always leave a
@@ -340,9 +378,9 @@ impl VoxelWorldConfig for MainWorld {
     }
 
     fn chunk_despawn_strategy(&self) -> ChunkDespawnStrategy {
-        // ISOMETRIC FIX: the default `FarAwayOrOutOfView` despawns any chunk
+        // FRUSTUM-CULL FIX: the default `FarAwayOrOutOfView` despawns any chunk
         // that leaves the camera frustum, which makes terrain visibly
-        // disappear at the screen edge when the player scrolls/zooms. Despawn
+        // disappear at the screen edge when the player orbits/zooms. Despawn
         // purely by distance instead, so chunks only vanish once they are
         // comfortably outside the visible area (at `spawning_distance`).
         ChunkDespawnStrategy::FarAway
@@ -571,7 +609,7 @@ impl Plugin for WorldPlugin {
 }
 
 fn setup_lighting(mut commands: Commands) {
-    info!("inf3d: left-click the ground to move the player (A* over the voxel surface).");
+    info!("inf3d: WASD to move, mouse to orbit, scroll to zoom; Build mode = left-click place / right-click break.");
 
     let cascade_shadow_config = CascadeShadowConfigBuilder {
         maximum_distance: 240.0,
@@ -603,10 +641,40 @@ fn setup_lighting(mut commands: Commands) {
     });
 }
 
+/// The SURFACE material a dry-land column wears given its [`Biome`]. The single
+/// source of truth for the biome→terrain-material mapping the mesher applies (the
+/// foliage streamer keys off the biome directly, so the two stay aligned through
+/// the shared [`classify_biome`]). Pure and total so it's trivially testable and
+/// can never panic on a worker thread.
+///
+/// Biomes are APPEARANCE ONLY (see [`Biome`]): this only swaps which top/side
+/// texture layers a land voxel samples — it never touches solidity, the
+/// land/water split, or `surface_y`, so physics ground is unaffected.
+/// Water columns never reach here (the mesher emits [`Seafloor`](TerrainMaterialId::Seafloor)
+/// for them before consulting the biome).
+fn biome_surface_material(b: Biome) -> TerrainMaterialId {
+    match b {
+        // Temperate grasslands + woodland wear the grass cap.
+        Biome::Plains | Biome::Forest => TerrainMaterialId::Grass,
+        // Hot desert and coastal beach wear sand.
+        Biome::Desert | Biome::Beach => TerrainMaterialId::Sand,
+        // Cold tundra wears a snow cap.
+        Biome::Snow => TerrainMaterialId::Snow,
+    }
+}
+
 /// Per-chunk voxel lookup closure (runs on worker threads). Solidity and the
 /// land/water split both derive from the shared [`inf3d_worldgen`] column
 /// helpers ([`ColumnKind`]), so the *classification* (land vs water) a player
-/// stands/pathfinds on agrees with the material picked for each meshed voxel.
+/// stands on agrees with the material picked for each meshed voxel.
+///
+/// The dry-land SURFACE material additionally depends on the column's [`Biome`]
+/// (grass / sand / snow), classified once per column through the SAME
+/// [`classify_biome`] the [`Terrain`] oracle and the foliage streamer use, so a
+/// column's texture matches the foliage scattered on it. Biomes are appearance
+/// only — they never change solidity or the land/water split — and apply ONLY in
+/// the procedural world ([`WorldKind::Normal`]); the flat test world keeps a clean
+/// uniform grass surface.
 ///
 /// Two honest caveats to that agreement:
 ///   - The meshed seafloor descends to `SEA_FLOOR_MIN`, which is below the
@@ -624,16 +692,30 @@ fn get_voxel_fn(
     kind: WorldKind,
 ) -> Box<dyn FnMut(IVec3, Option<WorldVoxel>) -> WorldVoxel + Send + Sync> {
     let noise = build_noise_lod(lod);
+    // Biome noises are built ONCE per meshing job (like the height `noise` above),
+    // not per voxel/column. They are low frequency and LOD-independent (always full
+    // detail) so a far chunk meshed at a coarse LOD still classifies a column's
+    // biome identically to the LOD-0 [`Terrain`] oracle and the foliage streamer.
+    let temp_noise = build_temperature_noise();
+    let moist_noise = build_moisture_noise();
     let mut cache = HashMap::<(i32, i32), f64>::new();
+    // Parallel per-column cache of the resolved dry-LAND surface material (grass /
+    // sand / snow) so the biome is classified ONCE per column, not once per solid
+    // voxel in the column. Mirrors the height `cache` and is evicted alongside it
+    // under the same cap, so it can't grow unbounded. Stored as the raw `u8`
+    // discriminant to keep the entry small. Only populated for land columns in the
+    // procedural world (water emits seafloor; the flat world is uniform grass), so
+    // it's free for those paths.
+    let mut land_mat_cache = HashMap::<(i32, i32), u8>::new();
     // Captured once: skip the per-voxel edit lookup entirely while there are no
     // edits (the common case), so meshing keeps its original cost.
     let has_overrides = !overrides.is_empty();
 
-    // Bound the per-worker column cache so it can't grow without limit over a
+    // Bound the per-worker column caches so they can't grow without limit over a
     // long session. A single chunk column spans 32x32 = 1024 entries; we allow
-    // a few chunk-areas' worth (~4) before wholesale-clearing. The cache is a
-    // pure memoization of `sample_height`, so dropping it only forces a
-    // recompute — correctness is unaffected.
+    // a few chunk-areas' worth (~4) before wholesale-clearing. Both caches are
+    // pure memoizations (height + the biome material derived from it), so dropping
+    // them only forces a recompute — correctness is unaffected.
     const CACHE_CAP: usize = CHUNK_INTERIOR as usize * CHUNK_INTERIOR as usize * 4;
 
     Box::new(move |pos: IVec3, _previous| {
@@ -657,8 +739,11 @@ fn get_voxel_fn(
                 Some(&h) => h,
                 None => {
                     // Evict everything before we exceed the cap (cheap, amortized).
+                    // Drop the parallel land-material cache in lockstep so the two
+                    // can't diverge and neither grows unbounded.
                     if cache.len() >= CACHE_CAP {
                         cache.clear();
+                        land_mat_cache.clear();
                     }
                     let h = sample_height(&noise, pos.x, pos.z);
                     cache.insert(key, h);
@@ -675,11 +760,43 @@ fn get_voxel_fn(
             // Classify via the same helper the `Terrain` oracle uses (off the
             // cached raw height, so no extra noise sample) — seafloor for
             // submerged columns, land otherwise — so coastlines stay consistent
-            // with pathfinding. Emit the canonical material indices.
-            let mat = if ColumnKind::from_height(surface).is_water {
+            // with the physics ground oracle. Emit the canonical material indices.
+            let column = ColumnKind::from_height(surface);
+            let mat = if column.is_water {
+                // Submerged columns texture as seafloor regardless of biome (the
+                // biome split is land-only, see `biome_surface_material`). UNCHANGED.
                 TerrainMaterialId::Seafloor
-            } else {
+            } else if kind == WorldKind::TestFlat {
+                // Flat lab/menu backdrop stays a CLEAN, UNIFORM grass surface — no
+                // biomes — so the test world reads as a neutral stage. (Matches the
+                // pre-biome behavior exactly.)
                 TerrainMaterialId::Grass
+            } else {
+                // Procedural land: the surface material follows the column's biome
+                // (grass / sand / snow). Classified ONCE PER COLUMN via the parallel
+                // `land_mat_cache` — mirroring the height cache — through the SAME
+                // `classify_biome` the oracle + foliage use, so a column's texture
+                // matches the foliage scattered on it. The biome noises are built
+                // once per job; the per-voxel cost here is a single hashmap lookup.
+                let key = (pos.x, pos.z);
+                let raw = match land_mat_cache.get(&key) {
+                    Some(&m) => m,
+                    None => {
+                        let biome = classify_biome(
+                            sample_temperature(&temp_noise, pos.x, pos.z),
+                            sample_moisture(&moist_noise, pos.x, pos.z),
+                            column.stand_y(),
+                            column.is_water,
+                        );
+                        let m = biome_surface_material(biome) as u8;
+                        land_mat_cache.insert(key, m);
+                        m
+                    }
+                };
+                // The raw value is always a discriminant we just wrote via
+                // `biome_surface_material`, so this never falls back; the
+                // unwrap_or keeps the closure panic-free regardless.
+                TerrainMaterialId::from_index(raw).unwrap_or(TerrainMaterialId::Grass)
             };
             WorldVoxel::Solid(mat as u8)
         } else {
@@ -708,6 +825,8 @@ mod tests {
             Dirt,
             Stone,
             Seafloor,
+            Sand,
+            Snow,
             BuiltStone,
             BuiltDirt,
             BuiltGrass,
@@ -745,8 +864,8 @@ mod tests {
     /// The picker's buildable set must satisfy the two invariants every consumer
     /// relies on: `BUILDABLE[0]` is the resource default the picker boots to
     /// (`inf3d_core::DEFAULT_BUILD_MATERIAL`), and EVERY buildable is a player-build
-    /// index (`>= BUILT_MATERIAL_BASE`) so the see-through cutout / build-vs-terrain
-    /// split only ever apply to player builds — never to terrain. If someone adds a
+    /// index (`>= BUILT_MATERIAL_BASE`) so the build-vs-terrain split only ever
+    /// applies to player builds — never to terrain. If someone adds a
     /// terrain material to `BUILDABLE`, or changes the default without updating the
     /// other, this fails loudly here.
     #[test]
@@ -797,5 +916,81 @@ mod tests {
             matches!(edited(low, None), WorldVoxel::Air),
             "removed block is meshed as air"
         );
+    }
+
+    /// The biome→surface-material mapping is the single source of truth the mesher
+    /// uses for land textures; guard each arm so a biome can't silently mis-texture
+    /// (and so a future biome must consciously pick a surface here).
+    #[test]
+    fn biome_surface_material_maps_each_biome() {
+        use TerrainMaterialId::*;
+        assert_eq!(biome_surface_material(Biome::Plains), Grass);
+        assert_eq!(biome_surface_material(Biome::Forest), Grass);
+        assert_eq!(biome_surface_material(Biome::Desert), Sand);
+        assert_eq!(biome_surface_material(Biome::Beach), Sand);
+        assert_eq!(biome_surface_material(Biome::Snow), Snow);
+    }
+
+    /// In the procedural world a solid DRY-LAND surface voxel must mesh to one of
+    /// the biome surface materials {Grass, Sand, Snow} — never Seafloor (that's
+    /// water-only) and never a `Built*` index (those are player edits). Asserted at
+    /// a known land column near the origin (LAND_BIAS makes the near world land).
+    #[test]
+    fn normal_land_surface_meshes_to_a_biome_material() {
+        // A column near the origin with no edits: empty snapshot exercises the
+        // fast path AND the biome branch.
+        let store = VoxelOverrides::new();
+        let mut mesh = get_voxel_fn(0, store.snapshot(), WorldKind::Normal);
+
+        // Find a land column near the origin and probe its topmost SOLID voxel.
+        // The oracle shares the same classification, so it tells us where land is
+        // and how tall the column stands; we scan down from its reported surface to
+        // the first solid voxel (robust to the measure-zero exact-integer-height
+        // case where `floor(surface)` lands one voxel above the topmost solid).
+        let oracle = Terrain::new();
+        let mut probed = false;
+        'outer: for x in 0..64 {
+            for z in 0..64 {
+                if !oracle.is_land(x, z) {
+                    continue;
+                }
+                let surface_y = oracle.surface_y(x, z);
+                for y in (2..=surface_y).rev() {
+                    let voxel = mesh(IVec3::new(x, y, z), None);
+                    let WorldVoxel::Solid(m) = voxel else {
+                        continue;
+                    };
+                    assert!(
+                        m == TerrainMaterialId::Grass as u8
+                            || m == TerrainMaterialId::Sand as u8
+                            || m == TerrainMaterialId::Snow as u8,
+                        "land surface voxel at ({x},{y},{z}) must be a biome material \
+                         (grass/sand/snow), got index {m}"
+                    );
+                    probed = true;
+                    break 'outer;
+                }
+            }
+        }
+        assert!(probed, "expected a land column near the origin to probe");
+    }
+
+    /// The flat test world must keep a CLEAN, UNIFORM grass surface — biomes are
+    /// procedural-only, so the lab/menu backdrop never shows sand/snow. Guards the
+    /// `WorldKind::TestFlat` short-circuit in the land branch.
+    #[test]
+    fn flat_world_land_surface_is_uniform_grass() {
+        let store = VoxelOverrides::new();
+        let mut mesh = get_voxel_fn(0, store.snapshot(), WorldKind::TestFlat);
+        // The flat surface stands at FLAT_SURFACE_Y; its topmost solid voxel is
+        // just below the standing height. Probe a spread of columns.
+        for (x, z) in [(0, 0), (37, -12), (-100, 250), (5, 5)] {
+            let pos = IVec3::new(x, inf3d_worldgen::FLAT_SURFACE_Y, z);
+            let voxel = mesh(pos, None);
+            assert!(
+                matches!(voxel, WorldVoxel::Solid(m) if m == TerrainMaterialId::Grass as u8),
+                "flat world surface at ({x},{z}) must be uniform grass, got {voxel:?}"
+            );
+        }
     }
 }

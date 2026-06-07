@@ -4,17 +4,19 @@
 //! a **right-click** removes the hovered voxel — both written into the shared
 //! [`VoxelOverrides`] store, which then marks the affected chunk(s) [`NeedsRemesh`]
 //! so the change becomes visible. Because the store is the single source of truth
-//! (the mesher snapshots it, the [`Terrain`] oracle consults it), physics ground +
-//! pathfinding pick the edit up for free — no extra wiring.
+//! (the mesher snapshots it, the [`Terrain`] oracle consults it), the physics
+//! ground picks the edit up for free — no extra wiring.
 //!
-//! Targeting reuses the existing [`Hover`] raycast (cursor → voxel + face normal).
-//! Click-to-move (the pathfinder) and these edits are mutually exclusive: the
-//! pathfinder runs only in [`EditMode::Walk`], the editor only in [`EditMode::Build`].
+//! Targeting reuses the [`Hover`] resource, written by `highlight::update_hover` in
+//! the same Input phase (ordered before this system) so a click acts on THIS frame's
+//! crosshair voxel. The editor only runs in [`EditMode::Build`]; [`EditMode::Walk`]
+//! clicks are free for other uses.
 
 use bevy::prelude::*;
 use bevy_voxel_world::prelude::{Chunk, NeedsRemesh};
 
-use inf3d_core::{EditMode, GameSet, SelectedMaterial};
+use inf3d_core::{EditMode, FollowTarget, GameSet, SelectedMaterial};
+use inf3d_physics::PLAYER_DIMS;
 use inf3d_world::{MainWorld, TerrainMaterialId};
 use inf3d_worldgen::VoxelOverrides;
 
@@ -53,9 +55,14 @@ impl Plugin for EditPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<BlockEdited>()
             .add_systems(Startup, init_block_fx_assets)
-            // Input phase, alongside the pathfinder's click handler; the two are
-            // gated on opposite `EditMode`s so only one ever acts on a click.
-            .add_systems(Update, block_edit.in_set(GameSet::Input))
+            // Input phase, ordered AFTER the crosshair raycast so we consume this
+            // frame's `Hover`, not last frame's (which mis-targeted while orbiting).
+            .add_systems(
+                Update,
+                block_edit
+                    .in_set(GameSet::Input)
+                    .after(crate::highlight::update_hover),
+            )
             // The transient place/break cubes animate in the Fx phase.
             .add_systems(Update, update_block_fx.in_set(GameSet::Fx));
     }
@@ -99,13 +106,14 @@ fn block_edit(
     overrides: Res<VoxelOverrides>,
     interactions: Query<&Interaction>,
     chunks: Query<(Entity, &Chunk<MainWorld>)>,
+    player_q: Query<&GlobalTransform, With<FollowTarget>>,
     fx_assets: Res<BlockFxAssets>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut dust: MessageWriter<DustBurst>,
     mut edited_events: MessageWriter<BlockEdited>,
     mut commands: Commands,
 ) {
-    // Editing only happens in Build mode; Walk-mode clicks belong to the pathfinder.
+    // Editing only happens in Build mode.
     if *mode != EditMode::Build {
         return;
     }
@@ -134,6 +142,15 @@ fn block_edit(
             return;
         };
         let target = voxel + normal;
+        // Don't let the player place a solid block inside their own body. The
+        // controller reads ground analytically from the override store, so a block
+        // dropped into the player's column would pop or wedge them. Silently ignore
+        // such a placement (like an out-of-reach click).
+        if let Ok(player) = player_q.single() {
+            if cell_overlaps_player(target, player.translation()) {
+                return;
+            }
+        }
         // The player's currently-picked build material (defaults to BuiltStone;
         // set by the picker / number keys in `inf3d_ui`).
         let mat = selected.0;
@@ -190,6 +207,27 @@ fn block_edit(
 
 /// Fallback debris color when a block's material can't be resolved (a stray index).
 const NEUTRAL_DEBRIS: [u8; 3] = [0x8a, 0x8a, 0x8a];
+
+/// Whether world voxel cell `cell` overlaps the player's capsule, so placing a solid
+/// block there would trap/clip them. `player_center` is the player entity's
+/// translation, which is the capsule CENTRE (see [`inf3d_physics::PLAYER_DIMS`]): the
+/// body spans `±(half_height + radius)` vertically and a disc of `radius` horizontally.
+fn cell_overlaps_player(cell: IVec3, player_center: Vec3) -> bool {
+    let radius = PLAYER_DIMS.radius;
+    let half_extent = PLAYER_DIMS.half_height + PLAYER_DIMS.radius; // centre → feet/head
+    // Vertical: cell box [cell.y, cell.y+1] vs body [centre.y - half, centre.y + half].
+    let cy = cell.y as f32;
+    if cy >= player_center.y + half_extent || cy + 1.0 <= player_center.y - half_extent {
+        return false;
+    }
+    // Horizontal: closest point of the cell's XZ square to the player centre, within
+    // `radius` (capsule cross-section is a disc).
+    let closest_x = player_center.x.clamp(cell.x as f32, cell.x as f32 + 1.0);
+    let closest_z = player_center.z.clamp(cell.z as f32, cell.z as f32 + 1.0);
+    let dx = player_center.x - closest_x;
+    let dz = player_center.z - closest_z;
+    dx * dx + dz * dz < radius * radius
+}
 
 /// Spawn the transient place/break effect cube, tinted to the block's color.
 fn spawn_block_fx(
@@ -285,26 +323,34 @@ fn ease_out_back(t: f32) -> f32 {
     1.0 + C3 * p * p * p + C1 * p * p
 }
 
-/// Mark the chunk holding `voxel`, plus any neighbor chunk whose padded mesh
+/// Mark the chunk holding `voxel`, plus every neighbor chunk whose padded mesh
 /// samples it, as [`NeedsRemesh`]. The library then re-runs our voxel-lookup
 /// delegate for those chunks, which re-reads the override store — so the edit
 /// (and any newly exposed/hidden face across a chunk border) is re-meshed.
+///
+/// Chunks carry a 1-voxel padding ring, and the mesher reads it for BOTH face
+/// culling and ambient occlusion (AO samples the 8 diagonal neighbours of each
+/// face corner). So an edit on a chunk edge/corner can change up to 8 chunks'
+/// meshes — not just the 6 face-neighbours. A voxel `v` is inside chunk `C`'s padded
+/// region exactly when `v ∈ [C*32 - 1, C*32 + 32]` per axis, i.e. the affected set is
+/// `chunk_of(v + d)` for `d ∈ {-1,0,1}³` (≤ 8 distinct chunks). Marking only the 6
+/// faces previously left a stale AO seam / phantom skirt face on diagonal neighbours.
 fn mark_chunks_dirty(
     commands: &mut Commands,
     chunks: &Query<(Entity, &Chunk<MainWorld>)>,
     voxel: IVec3,
 ) {
-    // The voxel's own chunk and its six face-neighbors' chunks (deduped at the
-    // comparison below — duplicates for an interior edit are harmless).
-    let dirty = [
-        chunk_of(voxel),
-        chunk_of(voxel + IVec3::X),
-        chunk_of(voxel + IVec3::NEG_X),
-        chunk_of(voxel + IVec3::Y),
-        chunk_of(voxel + IVec3::NEG_Y),
-        chunk_of(voxel + IVec3::Z),
-        chunk_of(voxel + IVec3::NEG_Z),
-    ];
+    let mut dirty: Vec<IVec3> = Vec::with_capacity(8);
+    for dx in -1..=1 {
+        for dy in -1..=1 {
+            for dz in -1..=1 {
+                let c = chunk_of(voxel + IVec3::new(dx, dy, dz));
+                if !dirty.contains(&c) {
+                    dirty.push(c);
+                }
+            }
+        }
+    }
     for (entity, chunk) in chunks.iter() {
         if dirty.contains(&chunk.position) {
             commands.entity(entity).try_insert(NeedsRemesh);

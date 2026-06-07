@@ -25,17 +25,19 @@ use bevy::prelude::*;
 use bevy::window::{PresentMode, PrimaryWindow};
 use bevy_voxel_world::prelude::{Chunk, NeedsRemesh};
 
-use inf3d_camera::{CameraMode, CameraRig, IsoCamera};
+use inf3d_camera::{CameraMode, CameraRig, OrbitCamera};
 use inf3d_core::{
-    save_quality_settings, AppState, EditMode, PathTarget, Pause, QualityPreset, QualitySettings,
+    save_quality_settings, AppState, EditMode, Pause, QualityPreset, QualitySettings,
     SelectedMaterial,
 };
-use inf3d_gameplay::{MovePath, Player};
+use inf3d_gameplay::Player;
 use inf3d_physics::{CharacterController, DesiredMove, PLAYER_DIMS};
 use inf3d_world::MainWorld;
 use inf3d_worldgen::{Terrain, VoxelOverrides, WorldGen, WorldKind};
 
-use save::{load_from_slot, save_to_slot, slot_summary, SaveGame, SLOT_COUNT};
+use save::{
+    load_from_slot, save_to_slot, slot_summary, SaveGame, CURRENT_SAVE_VERSION, SLOT_COUNT,
+};
 
 /// Spawn a styled menu button (a `Node` box with a centered `Text` child) under a
 /// child-spawner `$parent`. A macro (not a fn) so it never has to name the Bevy
@@ -310,9 +312,8 @@ fn apply_world_load(
     terrain: Res<Terrain>,
     mut edit_mode: ResMut<EditMode>,
     mut selected_mat: ResMut<SelectedMaterial>,
-    mut path_target: ResMut<PathTarget>,
     mut player_q: PlayerResetQuery,
-    mut rig_q: Query<&mut CameraRig, With<IsoCamera>>,
+    mut rig_q: Query<&mut CameraRig, With<OrbitCamera>>,
     mut camera_mode: ResMut<CameraMode>,
     chunks: Query<Entity, With<Chunk<MainWorld>>>,
     mut commands: Commands,
@@ -361,15 +362,11 @@ fn apply_world_load(
             *edit_mode = game.edit_mode;
             *selected_mat = SelectedMaterial(game.selected_material);
             if let Ok(mut rig) = rig_q.single_mut() {
-                rig.snap_to(game.camera_yaw, game.camera_zoom);
+                rig.snap_to(game.camera_yaw, game.camera_pitch, game.camera_distance);
             }
             camera_mode.set_free_fly(false);
         }
     }
-
-    // Clear any stale click destination; foliage + BlockedCells self-heal as the
-    // streamer re-runs around the (possibly teleported) player.
-    path_target.0 = None;
 
     // The world surface / edits changed under already-resident chunks — re-mesh
     // them all so the change is visible (the mesher re-reads the shared store).
@@ -379,8 +376,8 @@ fn apply_world_load(
     info!("inf3d_menu: world ready ({:?})", world_gen.kind());
 }
 
-/// Hard-reposition the single player: snap the transform, clear momentum + path,
-/// and resync the logical cell/facing. This is a legitimate menu-driven teleport
+/// Hard-reposition the single player: snap the transform, clear momentum, and
+/// resync the logical cell/facing. This is a legitimate menu-driven teleport
 /// (New/Load), distinct from the per-frame `DesiredMove` locomotion loop.
 type PlayerResetQuery<'w, 's> = Query<
     'w,
@@ -388,21 +385,25 @@ type PlayerResetQuery<'w, 's> = Query<
     (
         &'static mut Transform,
         &'static mut Player,
-        &'static mut MovePath,
         &'static mut CharacterController,
         &'static mut DesiredMove,
     ),
 >;
 
 fn reset_player(q: &mut PlayerResetQuery, center: Vec3, facing: f32, cell: IVec2) {
-    let Ok((mut transform, mut player, mut path, mut cc, mut desired)) = q.single_mut() else {
+    let Ok((mut transform, mut player, mut cc, mut desired)) = q.single_mut() else {
         return;
     };
     transform.translation = center;
     player.cell = cell;
     player.facing = facing;
-    path.waypoints.clear();
     cc.vertical_velocity = 0.0;
+    // Fully reset locomotion so a teleport (New/Load) doesn't carry stale momentum or a
+    // buffered jump into the new spot.
+    cc.horizontal_velocity = Vec3::ZERO;
+    cc.coyote = 0.0;
+    cc.jump_buffer = 0.0;
+    cc.prev_jump = false;
     desired.velocity = Vec3::ZERO;
 }
 
@@ -416,7 +417,7 @@ fn do_save(
     edit_mode: Res<EditMode>,
     selected: Res<SelectedMaterial>,
     player_q: Query<(&Transform, &Player)>,
-    rig_q: Query<&CameraRig, With<IsoCamera>>,
+    rig_q: Query<&CameraRig, With<OrbitCamera>>,
 ) {
     let Some(slot) = pending.0.take() else {
         return;
@@ -424,11 +425,12 @@ fn do_save(
     let Ok((transform, player)) = player_q.single() else {
         return;
     };
-    let (yaw, zoom) = rig_q
+    let (yaw, pitch, distance) = rig_q
         .single()
-        .map(|r| (r.yaw(), r.zoom()))
-        .unwrap_or((0.0, 44.0));
+        .map(|r| (r.yaw(), r.pitch(), r.distance()))
+        .unwrap_or((0.0, 0.5, 12.0));
     let game = SaveGame {
+        version: CURRENT_SAVE_VERSION,
         world_kind: world_gen.kind(),
         flat: world_gen.is_flat(),
         edits: overrides
@@ -441,7 +443,8 @@ fn do_save(
         edit_mode: *edit_mode,
         selected_material: selected.0,
         camera_yaw: yaw,
-        camera_zoom: zoom,
+        camera_pitch: pitch,
+        camera_distance: distance,
         saved_at: save::now_secs(),
     };
     save_to_slot(slot, &game);

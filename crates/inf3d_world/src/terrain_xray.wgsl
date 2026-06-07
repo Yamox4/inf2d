@@ -1,5 +1,11 @@
 #define_import_path inf3d::terrain_xray
 
+// NOTE: this cutaway is currently INERT. The `XrayPlugin` (inf3d_render) that fed the
+// `xray` uniform was deleted in the controls rework, so `xray.player.w` stays 0.0 and
+// `xray_should_discard` always returns false — nothing actually gets cut at runtime.
+// The module is kept (compiled + imported) pending the Tier-2 cleanup that excises it
+// (see BACKLOG.md). The description below is how it behaved when it was driven.
+//
 // See-through ("x-ray") cutaway — the single shared decision used by BOTH the terrain
 // forward shader and its custom prepass, so they cut the EXACT same voxels (the test
 // is fully deterministic per voxel — no dither — so the two passes can never disagree
@@ -28,7 +34,7 @@ var<uniform> xray: XrayParams;
 //   (2) Ceiling — a player build directly above the player within a horizontal radius,
 //       so a roof over your head opens up too.
 // Snaps to the voxel center so the whole block decides together (blocky). MUST stay in
-// sync with `inf3d_world::voxel_cut_by_xray` (the CPU copy the click raycasts use).
+// sync with `inf3d_world::voxel_cut_by_xray` (the CPU mirror; both are inert today).
 fn xray_should_discard(world_position: vec3<f32>, world_normal: vec3<f32>, material: u32) -> bool {
     // The build-material base comes from the uniform (`extra.w`), not a hard-coded
     // constant, so it can NEVER drift from `inf3d_world::BUILT_MATERIAL_BASE` the way a

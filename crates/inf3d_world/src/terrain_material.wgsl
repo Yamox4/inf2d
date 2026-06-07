@@ -6,6 +6,8 @@
 // see the voxel terrain — but ALSO removes the player-built voxels this pass cuts (the
 // see-through cutaway), so the prepass depth can't re-occlude the player. Both passes
 // call the shared `inf3d::terrain_xray::xray_should_discard`, keeping the cut identical.
+// (The cutaway is currently INERT — nothing feeds the `xray` uniform; see the NOTE in
+// `terrain_xray.wgsl`. The discard call below is a no-op until/unless it is re-driven.)
 //
 // The forward fragment logic is identical to upstream
 // `bevy_voxel_world::shaders::voxel_texture.wgsl`: pick a texture face from

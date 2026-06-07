@@ -20,7 +20,6 @@ inf3d_world = { workspace = true }
 inf3d_camera = { workspace = true }
 inf3d_render = { workspace = true }
 inf3d_gameplay = { workspace = true }
-inf3d_pathfinding = { workspace = true }
 inf3d_ui = { workspace = true }
 inf3d_menu = { workspace = true }
 inf3d_audio = { workspace = true }

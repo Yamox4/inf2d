@@ -23,12 +23,12 @@
 //! tile field, its own ring, and its own per-frame budgets:
 //!
 //! * **Solid layer** ([`SolidField`]) — trees + rocks. Streamed in a
-//!   **zoom-driven** ring ([`stream::compute_ring`] clamped by
-//!   [`QualitySettings::foliage_ring_max`](inf3d_core::QualitySettings)) so
-//!   zooming out shows props all the way to the iso-view edges. Solid props get
-//!   per-prop colliders ([`SolidPropCollider`](inf3d_physics::SolidPropCollider))
-//!   and record footprint-inflated [`BlockedCells`](inf3d_core::BlockedCells) for
-//!   the pathfinder.
+//!   ring sized to the perspective horizon ([`stream::compute_ring`] clamped by
+//!   [`QualitySettings::foliage_ring_max`](inf3d_core::QualitySettings)) so props
+//!   fill the orbit view to its edges. Solid props get per-prop colliders
+//!   ([`SolidPropCollider`](inf3d_physics::SolidPropCollider)) and record
+//!   footprint-inflated [`BlockedCells`](inf3d_core::BlockedCells) that the
+//!   character controller reads as walls.
 //! * **Grass layer** ([`GrassField`]) — grass only. Streamed in a
 //!   **player-centered, zoom-INDEPENDENT** ring whose radius is
 //!   `ceil(grass_radius_world / TILE)` tiles, so the dense grass carpet is a
@@ -51,7 +51,7 @@
 //! whenever the player crossed a tile boundary.
 //!
 //! Both layers run their scatter on a [`bevy::tasks::AsyncComputeTaskPool`]
-//! worker (mirroring `inf3d_pathfinding`): the streamer snapshots the
+//! worker: the streamer snapshots the
 //! cheap-to-clone [`Terrain`](inf3d_worldgen::Terrain) oracle into a task, the
 //! worker returns a plain `Vec<ScatterItem>` (no ECS), and the main thread only
 //! spawns entities from that list. Determinism is preserved because each tile's
@@ -75,6 +75,7 @@ use bevy::prelude::*;
 use bevy::tasks::Task;
 
 use inf3d_core::GameSet;
+use inf3d_worldgen::Biome;
 
 mod scatter;
 mod spawn;
@@ -100,11 +101,19 @@ const TREES_DIR: &str = "foliage/vox/Trees";
 const ROCKS_DIR: &str = "foliage/vox/Rocks";
 const GRASS_DIR: &str = "foliage/vox/Grass";
 
-/// A single loaded foliage variant: its mesh plus the post-scale bounding-box
-/// size (width X, height Y, depth Z) used to size physics colliders and the
-/// solid-prop overlap footprint.
+/// A single loaded foliage variant: its file-stem NAME, its mesh, plus the
+/// post-scale bounding-box size (width X, height Y, depth Z) used to size physics
+/// colliders and the solid-prop overlap footprint.
+///
+/// The `name` is the source `.vox` file stem (e.g. `"tree_large"`, `"cactus"`,
+/// `"pine_small"`). It exists so the per-biome scatter policy can SELECT a subset
+/// of tree variants by matching name substrings (see [`biome_policy`]) — the
+/// scatter worker filters trees whose `name` contains one of the biome's allowed
+/// substrings, but still emits the variant's ORIGINAL index into the full trees
+/// `Vec` so [`spawn`] can index `assets.trees[variant]` unchanged.
 #[derive(Clone)]
 struct FoliageVariant {
+    name: String,
     mesh: Handle<Mesh>,
     size: Vec3,
 }
@@ -116,9 +125,14 @@ struct FoliageAssets {
     trees: Vec<FoliageVariant>,
     rocks: Vec<FoliageVariant>,
     grass: Vec<FoliageVariant>,
-    /// One shared material — vertex colors carry the per-voxel palette, so a
-    /// white base lets every instance share the same draw call.
-    material: Handle<StandardMaterial>,
+    /// One tinted material PER biome, indexed by `biome as usize` (see
+    /// [`BIOME_COUNT`]). Vertex colors carry the per-voxel palette and the
+    /// material's `base_color` (the biome's [`tint`](BiomePolicy::tint))
+    /// MULTIPLIES it, so e.g. Snow foliage reads cool-blue and Desert foliage
+    /// warm-sand while still showing each model's own palette. A prop selects its
+    /// material by [`ScatterItem::biome`]; batching now splits per biome (an
+    /// accepted cost — five tints is five small batches per mesh, not per prop).
+    materials: [Handle<StandardMaterial>; BIOME_COUNT],
 }
 
 /// Which loaded-asset category a scattered item draws from. Carried as plain
@@ -138,25 +152,133 @@ enum ScatterCategory {
 }
 
 /// One placement the scatter worker decided on: which category+variant to use,
-/// where it sits (world space), and its yaw. Pure data — no ECS, no asset
-/// handles — so it can cross the thread boundary and be replayed deterministically.
+/// where it sits (world space), its yaw, and the [`Biome`] of its column. Pure
+/// data — no ECS, no asset handles — so it can cross the thread boundary and be
+/// replayed deterministically.
+///
+/// `biome` is what [`spawn`] uses to pick the tinted material
+/// ([`FoliageAssets::materials`]`[biome as usize]`); it's a pure function of
+/// `(x, z)` ([`Terrain::biome_at`]), so carrying it changes nothing about
+/// determinism — the same column always yields the same biome run to run.
 #[derive(Clone, Copy)]
 struct ScatterItem {
     category: ScatterCategory,
     variant: usize,
     pos: Vec3,
     yaw: f32,
+    biome: Biome,
 }
 
-/// Snapshot of the per-variant footprint *sizes* (post-scale bounding boxes)
-/// the SOLID worker needs to (a) pick a variant index and (b) run the SAME
-/// solid-prop overlap test the synchronous spawner used. Cloned into the task
-/// alongside the [`Terrain`](inf3d_worldgen::Terrain) so the worker touches no
-/// ECS / asset state. Cheap: a few `Vec3`s.
+/// Snapshot of the per-variant footprint *sizes* (post-scale bounding boxes) the
+/// SOLID worker needs to (a) pick a variant index and (b) run the SAME solid-prop
+/// overlap test the synchronous spawner used — plus the tree variant NAMES so the
+/// worker can filter trees to the column's biome by name substring (see
+/// [`biome_policy`]). Cloned into the task alongside the
+/// [`Terrain`](inf3d_worldgen::Terrain) so the worker touches no ECS / asset
+/// state. Cheap: a few `Vec3`s and short strings, snapshotted once per frame and
+/// shared across the few tasks started that frame.
+///
+/// `tree_names[i]` is the name of the tree variant at index `i` in `trees`, so
+/// the two vecs are index-parallel: the worker filters by `tree_names` but emits
+/// the original `i` so [`spawn`] indexes the full `assets.trees` Vec. Rocks need
+/// no names — every rock is allowed in every biome (only the density multiplier
+/// differs).
 #[derive(Clone)]
 struct SolidVariantSizes {
     trees: Vec<Vec3>,
+    tree_names: Vec<String>,
     rocks: Vec<Vec3>,
+}
+
+/// Number of [`Biome`] variants — the length of the per-biome material array and
+/// the valid range of `biome as usize`. Kept in lockstep with the FROZEN
+/// `Biome` enum (`Plains=0 … Beach=4`); if that enum grows, bump this and the
+/// [`BIOME_POLICIES`] table below (a missing entry would index out of bounds at
+/// startup, caught immediately).
+const BIOME_COUNT: usize = 5;
+
+/// How foliage VARIES by biome: density multipliers per category, which TREE
+/// variants are allowed (by name substring), and a material tint. This is the one
+/// table the whole biome-foliage feature keys off — the scatter worker reads the
+/// multipliers + name filter, and [`setup_foliage`] reads the tint.
+///
+/// Multipliers scale the base per-column densities in [`scatter`]
+/// (`TREE_DENSITY` / `ROCK_DENSITY` / `GRASS_DENSITY`); `grass_mul == 0.0`
+/// disables grass entirely for that biome (Desert/Snow/Beach). `tree_names` is a
+/// set of case-sensitive substrings — a tree variant is eligible in this biome if
+/// its [`FoliageVariant::name`] CONTAINS any of them (so `"tree_"` matches the
+/// leafy `tree_*` family, `"pine"` both pines, `"palm"` both palms, etc.). An
+/// empty match set, or a biome whose substrings match no loaded variant, simply
+/// scatters no trees there (the worker skips the tree branch for that column).
+#[derive(Clone, Copy)]
+struct BiomePolicy {
+    tree_mul: f32,
+    rock_mul: f32,
+    grass_mul: f32,
+    /// Substrings a tree variant's name must contain (any-of) to be eligible.
+    tree_names: &'static [&'static str],
+    /// `base_color` of this biome's foliage material; vertex colors multiply it.
+    tint: Color,
+}
+
+/// The per-biome policy table, indexed by `biome as usize` (so the order MUST
+/// match the `Biome` discriminants: `Plains=0, Forest=1, Desert=2, Snow=3,
+/// Beach=4`). Values are the tuned starting point from the feature spec:
+///
+/// * Plains — sparse leafy trees, normal rocks, full grass, neutral tint.
+/// * Forest — dense leafy trees + pines, slightly thinned grass.
+/// * Desert — sparse cacti + dead stumps, more rocks, NO grass, warm tint.
+/// * Snow   — sparse pines only, NO grass, cool tint.
+/// * Beach  — sparse palms only, fewer rocks, NO grass.
+const BIOME_POLICIES: [BiomePolicy; BIOME_COUNT] = [
+    // Plains
+    BiomePolicy {
+        tree_mul: 0.6,
+        rock_mul: 1.0,
+        grass_mul: 1.0,
+        tree_names: &["tree_"],
+        tint: Color::WHITE,
+    },
+    // Forest
+    BiomePolicy {
+        tree_mul: 2.5,
+        rock_mul: 1.0,
+        grass_mul: 0.8,
+        tree_names: &["tree_", "pine"],
+        tint: Color::WHITE,
+    },
+    // Desert
+    BiomePolicy {
+        tree_mul: 0.5,
+        rock_mul: 1.5,
+        grass_mul: 0.0,
+        tree_names: &["cactus", "stump"],
+        tint: Color::srgb(1.0, 0.93, 0.80),
+    },
+    // Snow
+    BiomePolicy {
+        tree_mul: 0.8,
+        rock_mul: 1.0,
+        grass_mul: 0.0,
+        tree_names: &["pine"],
+        tint: Color::srgb(0.85, 0.92, 1.0),
+    },
+    // Beach
+    BiomePolicy {
+        tree_mul: 0.4,
+        rock_mul: 0.5,
+        grass_mul: 0.0,
+        tree_names: &["palm"],
+        tint: Color::WHITE,
+    },
+];
+
+/// The [`BiomePolicy`] for a biome. A total lookup over the FROZEN `Biome` enum:
+/// `biome as usize` is always a valid [`BIOME_POLICIES`] index, so this never
+/// panics for any real biome (and the array length is checked against
+/// [`BIOME_COUNT`] at compile time).
+fn biome_policy(biome: Biome) -> BiomePolicy {
+    BIOME_POLICIES[biome as usize]
 }
 
 /// Per-tile seed derived purely from the tile coordinate. Shared by BOTH scatter
@@ -170,10 +292,9 @@ fn tile_seed(tile: IVec2) -> u64 {
 }
 
 /// An in-flight (or just-finished) per-tile scatter computation running on the
-/// [`AsyncComputeTaskPool`](bevy::tasks::AsyncComputeTaskPool). Mirrors
-/// `inf3d_pathfinding::ActivePathTask`: we hold the [`Task`] handle and poll it
-/// once per frame with `block_on(poll_once(..))`; when it resolves we spawn the
-/// entities. Used by both layers.
+/// [`AsyncComputeTaskPool`](bevy::tasks::AsyncComputeTaskPool). We hold the
+/// [`Task`] handle and poll it once per frame with `block_on(poll_once(..))`; when
+/// it resolves we spawn the entities. Used by both layers.
 struct TileScatterTask {
     task: Task<Vec<ScatterItem>>,
 }
@@ -292,12 +413,23 @@ fn setup_foliage(
     let rocks = vox_mesh::load_category(ROCKS_DIR, ROCK_TARGET_HEIGHT, &mut meshes);
     let grass = vox_mesh::load_category(GRASS_DIR, GRASS_TARGET_HEIGHT, &mut meshes);
 
-    let material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        perceptual_roughness: 0.95,
-        metallic: 0.0,
-        reflectance: 0.0,
-        ..default()
+    // One tinted material per biome. Same params as the old single white material
+    // (rough, non-metallic, vertex colors carry the palette), but `base_color` is
+    // the biome's tint — which MULTIPLIES the per-voxel vertex colors, so Snow
+    // reads cool, Desert warm, the rest neutral. Built by `Biome` index so
+    // `materials[item.biome as usize]` selects the right one in `spawn`.
+    //
+    // `std::array::from_fn` runs the closure once per index (0..BIOME_COUNT), so
+    // the array is fully initialised without an `unwrap` on a fallible collect —
+    // and it stays in lockstep with `BIOME_POLICIES` (both indexed by biome).
+    let biome_materials: [Handle<StandardMaterial>; BIOME_COUNT] = std::array::from_fn(|i| {
+        materials.add(StandardMaterial {
+            base_color: BIOME_POLICIES[i].tint,
+            perceptual_roughness: 0.95,
+            metallic: 0.0,
+            reflectance: 0.0,
+            ..default()
+        })
     });
 
     info!(
@@ -311,7 +443,7 @@ fn setup_foliage(
         trees,
         rocks,
         grass,
-        material,
+        materials: biome_materials,
     });
 }
 
@@ -350,5 +482,84 @@ mod tests {
         // Width/depth never flip the result; only Y does.
         assert!(is_low_prop(Vec3::new(5.0, 0.8, 5.0)));
         assert!(!is_low_prop(Vec3::new(0.2, 2.5, 0.2)));
+    }
+
+    #[test]
+    fn biome_policy_table_is_indexable_for_every_biome() {
+        // `biome as usize` must be a valid `BIOME_POLICIES` index for EVERY biome
+        // (the lookup is total — no panic), and the table length tracks the enum.
+        assert_eq!(BIOME_POLICIES.len(), BIOME_COUNT);
+        for biome in [
+            Biome::Plains,
+            Biome::Forest,
+            Biome::Desert,
+            Biome::Snow,
+            Biome::Beach,
+        ] {
+            // Must not panic; just exercise the index path.
+            let _ = biome_policy(biome);
+        }
+    }
+
+    #[test]
+    fn dry_biomes_disable_grass() {
+        // Desert / Snow / Beach must scatter NO grass: their grass multiplier is
+        // exactly 0.0, which `scatter_grass` multiplies the base density by (so the
+        // probability test can never fire). Plains/Forest keep grass.
+        assert_eq!(biome_policy(Biome::Desert).grass_mul, 0.0);
+        assert_eq!(biome_policy(Biome::Snow).grass_mul, 0.0);
+        assert_eq!(biome_policy(Biome::Beach).grass_mul, 0.0);
+        assert!(biome_policy(Biome::Plains).grass_mul > 0.0);
+        assert!(biome_policy(Biome::Forest).grass_mul > 0.0);
+    }
+
+    #[test]
+    fn biome_tree_name_substrings_select_the_intended_families() {
+        // The name filter is "variant name CONTAINS any allowed substring". Spot
+        // check a couple biomes against representative loaded-variant stems.
+        let matches = |biome: Biome, name: &str| {
+            biome_policy(biome)
+                .tree_names
+                .iter()
+                .any(|sub| name.contains(sub))
+        };
+
+        // Desert allows cacti + dead stumps, but NOT leafy trees, pines, or palms.
+        assert!(matches(Biome::Desert, "cactus"));
+        assert!(matches(Biome::Desert, "cactus_small"));
+        assert!(matches(Biome::Desert, "tree_stump"));
+        assert!(!matches(Biome::Desert, "tree_large"));
+        assert!(!matches(Biome::Desert, "pine_small"));
+        assert!(!matches(Biome::Desert, "palm"));
+
+        // Snow allows pines only.
+        assert!(matches(Biome::Snow, "pine_small"));
+        assert!(matches(Biome::Snow, "pine_large"));
+        assert!(!matches(Biome::Snow, "tree_medium"));
+        assert!(!matches(Biome::Snow, "cactus"));
+
+        // Beach allows palms only.
+        assert!(matches(Biome::Beach, "palm"));
+        assert!(matches(Biome::Beach, "palm_small"));
+        assert!(!matches(Biome::Beach, "tree_small"));
+
+        // Forest allows BOTH the leafy `tree_*` family and pines.
+        assert!(matches(Biome::Forest, "tree_XL"));
+        assert!(matches(Biome::Forest, "pine_large"));
+        assert!(!matches(Biome::Forest, "cactus"));
+
+        // Plains allows the leafy `tree_*` family but not the biome specials.
+        assert!(matches(Biome::Plains, "tree_large"));
+        assert!(!matches(Biome::Plains, "pine_small"));
+        assert!(!matches(Biome::Plains, "cactus"));
+    }
+
+    #[test]
+    fn biome_density_multipliers_match_the_spec() {
+        // Lock in the tuned starting values so an accidental edit is caught.
+        assert_eq!(biome_policy(Biome::Plains).tree_mul, 0.6);
+        assert_eq!(biome_policy(Biome::Forest).tree_mul, 2.5);
+        assert_eq!(biome_policy(Biome::Desert).rock_mul, 1.5);
+        assert_eq!(biome_policy(Biome::Beach).rock_mul, 0.5);
     }
 }

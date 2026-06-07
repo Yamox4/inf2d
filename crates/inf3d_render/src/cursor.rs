@@ -1,6 +1,7 @@
 //! A custom, procedurally-drawn mouse cursor: a glowing gold arrow with a dark
 //! outline, built in code (no asset file) and installed on the primary window at
-//! startup. The gold matches the destination tile-outline theme.
+//! startup. The gold matches the game's gold UI accent (e.g. the picker's selected
+//! swatch ring).
 //!
 //! The arrow is rasterized 4× supersampled and box-downscaled to 32×32 so its
 //! edges are smoothly anti-aliased. Winit accepts the raw RGBA8 bytes directly;

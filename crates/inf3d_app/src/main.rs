@@ -5,15 +5,13 @@ use bevy::prelude::*;
 use bevy::window::{PresentMode, Window, WindowPlugin};
 
 use inf3d_audio::AudioPlugin;
-use inf3d_camera::IsoCameraPlugin;
+use inf3d_camera::OrbitCameraPlugin;
 use inf3d_core::CorePlugin;
 use inf3d_gameplay::PlayerPlugin;
 use inf3d_menu::MenuPlugin;
-use inf3d_pathfinding::PathfindPlugin;
 use inf3d_physics::PhysicsGamePlugin;
 use inf3d_render::{
     CursorPlugin, DustPlugin, EditPlugin, FogPlugin, FoliagePlugin, HighlightPlugin, WaterPlugin,
-    XrayPlugin,
 };
 use inf3d_ui::HudPlugin;
 use inf3d_world::WorldPlugin;
@@ -57,13 +55,9 @@ fn main() {
         // Game-specific physics wiring (colliders, character controller,
         // interaction raycast). After PlayerPlugin so the player exists.
         .add_plugins(PhysicsGamePlugin)
-        .add_plugins(IsoCameraPlugin)
-        .add_plugins(PathfindPlugin)
+        .add_plugins(OrbitCameraPlugin)
         .add_plugins(HighlightPlugin)
         .add_plugins(EditPlugin)
-        // Feeds the terrain material's see-through uniform (player screen pos) so
-        // built walls between the camera and player dither away.
-        .add_plugins(XrayPlugin)
         .add_plugins(CursorPlugin)
         .add_plugins(DustPlugin)
         .add_plugins(FogPlugin)

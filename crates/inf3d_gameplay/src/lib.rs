@@ -1,35 +1,25 @@
-//! Player character: spawning, movement along a pathfound route, and a walk
+//! Player character: spawning, camera-relative WASD movement, and a walk
 //! animation. The character is a smooth multi-part figure — a teardrop head
 //! (sphere + cone tip), a rounded-cone body, two floating hand spheres at the
 //! sides and two floating foot spheres at the front-bottom. While walking it
 //! bobs in a hop arc, the feet step (swinging fore/aft and lifting), and the
 //! arms swing counter to the legs, all emitting dust.
 
-use std::collections::VecDeque;
-
 use avian3d::prelude::*;
 use bevy::prelude::*;
 
-use inf3d_core::{AppState, FollowTarget, FpsMoveIntent, GameSet, PathTarget, Pause};
+use inf3d_core::{AppState, FollowTarget, GameSet, MoveIntent, Pause};
 use inf3d_physics::{CharacterController, DesiredMove, GameLayer, PLAYER_DIMS};
 use inf3d_worldgen::Terrain;
 
 /// The controllable player. `cell` is the current voxel column `(x, z)` the
-/// player occupies — pathfinding uses it as the A* start.
+/// player occupies, resynced from the transform each step.
 #[derive(Component)]
 pub struct Player {
     pub speed: f32,
     pub cell: IVec2,
     /// Yaw (radians) of the travel direction, for facing the visual.
     pub facing: f32,
-}
-
-/// A queue of world-space waypoints (each a standing/feet point from
-/// [`Terrain::stand_pos`]). The pathfinder writes this; movement consumes it
-/// front-to-back. Empty = idle.
-#[derive(Component, Default)]
-pub struct MovePath {
-    pub waypoints: VecDeque<Vec3>,
 }
 
 /// Emitted once each time the walking character lands a hop (its feet touch the
@@ -77,51 +67,34 @@ const ANIM_EASE: f32 = 12.0; // ease-to-rest / smoothing rate
 const STEP_SWING: f32 = 0.18; // fore/aft foot swing amplitude
 const STEP_LIFT: f32 = 0.12; // foot lift on the forward swing
 const ARM_SWING: f32 = 0.14; // hand fore/aft swing amplitude
-const FPS_SPRINT_MULT: f32 = 1.75;
-/// Radius (world units, XZ) within which a waypoint counts as reached and is
-/// popped. Must exceed the distance the player covers in one fixed physics step
-/// (`speed * fixed_dt` ≈ 8 / 64 ≈ 0.125) so a waypoint is caught on approach
-/// instead of being overshot and then orbited forever — the old 0.1 threshold sat
-/// *below* per-step travel at `speed = 8`, so the player could circle a waypoint
-/// it could never land exactly within. A quarter-voxel reads as a crisp arrival.
-const ARRIVE_RADIUS: f32 = 0.25;
+/// Sprint speed multiplier applied to the player's base speed while Shift is held.
+const SPRINT_MULT: f32 = 1.75;
 
 pub struct PlayerPlugin;
 
 impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
-        // `PathTarget` is a shared resource owned solely by `CorePlugin`; we only
-        // read/clear it here. `follow_path` sets the movement intent and
-        // `animate_player` reads it — both are per-frame game logic.
         app.add_message::<Footstep>()
             .add_systems(Startup, spawn_player)
-            // `follow_path` drives the movement INTENT and must run at the FIXED
-            // rate, in lockstep with the `inf3d_physics` character controller
-            // (`FixedPostUpdate`). At low fps the fixed loop runs several steps
-            // per frame; running `follow_path` only once per frame let the
-            // controller take ALL of those steps on a single stale direction,
-            // overshooting waypoints — the path-follow jitter. In `FixedUpdate`
-            // it re-aims and pops a waypoint every physics step. It only *reads*
-            // `Transform`, so it cannot corrupt the interpolated physics state.
-            // Gated to un-paused play: `follow_path` is in `FixedUpdate` (not a
-            // `GameSet`), so the one core gating lever does NOT cover it. Without
-            // this it would keep popping waypoints and writing `DesiredMove` while
-            // the pause/main-menu is up. (The physics controller that consumes
-            // `DesiredMove` is gated identically in `inf3d_physics`.)
+            // `apply_move` translates the orbit camera's `MoveIntent` into the
+            // movement INTENT (`DesiredMove`) and must run at the FIXED rate, in
+            // lockstep with the `inf3d_physics` character controller
+            // (`FixedPostUpdate`). At low fps the fixed loop runs several steps per
+            // frame; running it once per frame would let the controller take ALL of
+            // those steps on a single stale direction. It only *reads* `Transform`,
+            // so it cannot corrupt the interpolated physics state. Gated to
+            // un-paused play: `apply_move` is in `FixedUpdate` (not a `GameSet`), so
+            // the one core gating lever does NOT cover it. Without this it would keep
+            // writing `DesiredMove` while the pause/main-menu is up. (The physics
+            // controller that consumes `DesiredMove` is gated identically in
+            // `inf3d_physics`.)
             .add_systems(
                 FixedUpdate,
-                (follow_path, apply_fps_move)
-                    .chain()
-                    .run_if(in_state(AppState::InGame).and(in_state(Pause::Running))),
+                apply_move.run_if(in_state(AppState::InGame).and(in_state(Pause::Running))),
             )
             // `animate_player` is per-frame VISUAL only (hop/feet/dust; reads the
             // interpolated transform), so it stays in the render-rate Logic set.
-            // `set_character_visibility` hides the figure in first-person so it never
-            // bobs into the FPS view; both are visual and touch disjoint components.
-            .add_systems(
-                Update,
-                (animate_player, set_character_visibility).in_set(GameSet::Logic),
-            );
+            .add_systems(Update, animate_player.in_set(GameSet::Logic));
     }
 }
 
@@ -184,7 +157,6 @@ fn spawn_player(
                 cell: spawn,
                 facing: 0.0,
             },
-            MovePath::default(),
             FollowTarget,
             // Kinematic character controller: avian moves it only via our
             // `move_and_slide` in `inf3d_physics`, never auto-integrated. The
@@ -266,81 +238,34 @@ fn spawn_player(
         });
 }
 
-/// Drive the player along its `MovePath` by writing a desired **horizontal**
-/// velocity into [`DesiredMove`]; the physics character controller in
-/// `inf3d_physics` consumes it in the SAME fixed step (`FixedPostUpdate`), runs
-/// it through `move_and_slide` against solid props, and handles gravity /
-/// ground-snap. Runs in `FixedUpdate` so it re-aims and pops waypoints once per
-/// physics step (not once per render frame), which avoids overshooting waypoints
-/// when the fixed loop runs multiple steps in a slow frame. Waypoints pop on
-/// **horizontal** arrival (the controller owns Y).
-fn follow_path(
-    mut query: Query<(&Transform, &mut Player, &mut MovePath, &mut DesiredMove)>,
-    mut target: ResMut<PathTarget>,
+/// Translate the orbit camera's [`MoveIntent`] (camera-relative WASD) into a
+/// desired **horizontal** velocity on [`DesiredMove`]; the physics character
+/// controller in `inf3d_physics` consumes it in the SAME fixed step
+/// (`FixedPostUpdate`), runs it through `move_and_slide` against solid props, and
+/// handles gravity / ground-snap. Runs in `FixedUpdate` so the velocity is fresh
+/// for every physics step (not once per render frame). The character rotates to
+/// face its travel direction. The controller owns Y — this only writes the
+/// horizontal velocity + the jump request.
+fn apply_move(
+    intent: Res<MoveIntent>,
+    mut query: Query<(&Transform, &mut Player, &mut DesiredMove)>,
 ) {
-    let Ok((transform, mut player, mut move_path, mut desired)) = query.single_mut() else {
+    let Ok((transform, mut player, mut desired)) = query.single_mut() else {
         return;
     };
-
-    player.cell = cell_of(transform.translation);
-
-    // Compare in the XZ plane only — the controller decides our height.
-    let here = Vec2::new(transform.translation.x, transform.translation.z);
-
-    // Pop every waypoint already reached this step. The arrival radius sits ABOVE
-    // the distance the player covers in one fixed step, so a waypoint is caught on
-    // approach instead of overshot and orbited (see [`ARRIVE_RADIUS`]). Draining in
-    // a loop also collapses any cluster of near-coincident waypoints in one step.
-    while move_path
-        .waypoints
-        .front()
-        .is_some_and(|wp| Vec2::new(wp.x, wp.z).distance(here) <= ARRIVE_RADIUS)
-    {
-        move_path.waypoints.pop_front();
-    }
-
-    let Some(&waypoint) = move_path.waypoints.front() else {
-        // Idle: no horizontal intent (controller keeps applying gravity/snap).
+    // No active intent (free-fly, or the cursor is freed for UI with Alt) → STOP the
+    // player by zeroing the desired horizontal velocity, instead of coasting on the
+    // last value (the controller would otherwise keep integrating that stale velocity).
+    if !intent.active {
         desired.velocity = Vec3::ZERO;
         desired.jump = false;
-        // Arrived (or never moving): clear the destination highlight. Only
-        // touches change-detection when it was actually set.
-        if target.0.is_some() {
-            target.0 = None;
-        }
-        return;
-    };
-
-    let to_target = Vec2::new(waypoint.x, waypoint.z) - here;
-    let distance = to_target.length();
-    if distance > 1e-4 {
-        player.facing = to_target.x.atan2(to_target.y);
-    }
-    // Steer at the next waypoint at full speed; the controller resolves walls
-    // (axis-separated slide) and ground. Arrival popping above ends the route.
-    let dir = to_target / distance.max(1e-4);
-    desired.velocity = Vec3::new(dir.x * player.speed, 0.0, dir.y * player.speed);
-    desired.jump = false;
-}
-
-fn apply_fps_move(
-    intent: Res<FpsMoveIntent>,
-    mut target: ResMut<PathTarget>,
-    mut query: Query<(&Transform, &mut Player, &mut MovePath, &mut DesiredMove)>,
-) {
-    if !intent.active {
         return;
     }
-    let Ok((transform, mut player, mut move_path, mut desired)) = query.single_mut() else {
-        return;
-    };
 
     player.cell = cell_of(transform.translation);
-    move_path.waypoints.clear();
-    target.0 = None;
 
     let speed = if intent.sprint {
-        player.speed * FPS_SPRINT_MULT
+        player.speed * SPRINT_MULT
     } else {
         player.speed
     };
@@ -361,7 +286,7 @@ fn animate_player(
     mut dust: MessageWriter<inf3d_render::DustBurst>,
     mut footstep: MessageWriter<Footstep>,
     state_q: Query<
-        (&Transform, &MovePath, &Player, &DesiredMove),
+        (&Transform, &Player, &CharacterController),
         (Without<CharacterRoot>, Without<Part>),
     >,
     mut root_q: Query<&mut Transform, (With<CharacterRoot>, Without<Part>, Without<Player>)>,
@@ -369,14 +294,16 @@ fn animate_player(
     mut phase: Local<f32>,
     mut walk_accum: Local<f32>,
 ) {
-    let Ok((p_tf, move_path, player, desired)) = state_q.single() else {
+    let Ok((p_tf, player, cc)) = state_q.single() else {
         return;
     };
     let Ok(mut root) = root_q.single_mut() else {
         return;
     };
     let dt = time.delta_secs();
-    let moving = !move_path.waypoints.is_empty() || desired.velocity.length_squared() > 0.01;
+    // Drive the walk anim off the ACTUAL (ramped) horizontal speed, not the raw input, so
+    // the feet keep stepping through the brief decel slide after a key release.
+    let moving = cc.horizontal_velocity.length_squared() > 0.04;
     let feet = p_tf.translation - Vec3::Y * VISUAL_ROOT_OFFSET;
 
     // Face travel direction (yaw only, no tilt).
@@ -436,30 +363,6 @@ fn animate_player(
         for (mut t, _part, rest) in &mut part_q {
             t.translation = t.translation.lerp(rest.0, ANIM_EASE * dt);
         }
-    }
-}
-
-/// Hide the third-person character figure while the first-person camera is active
-/// (toggled with `G`), so the player's own head/body never bobs into the FPS view —
-/// the reported bug. `FpsMoveIntent` is the camera's published "FPS is on" signal
-/// (set every frame in that mode, reset otherwise), so we read it rather than
-/// coupling gameplay to the camera's private mode enum. Hiding the `CharacterRoot`
-/// hides the whole figure (Bevy propagates `Visibility` to its children).
-fn set_character_visibility(
-    fps: Res<FpsMoveIntent>,
-    mut root: Query<&mut Visibility, With<CharacterRoot>>,
-) {
-    let Ok(mut vis) = root.single_mut() else {
-        return;
-    };
-    let want = if fps.active {
-        Visibility::Hidden
-    } else {
-        Visibility::Inherited
-    };
-    // Only write on a real change so we don't churn change-detection every frame.
-    if *vis != want {
-        *vis = want;
     }
 }
 

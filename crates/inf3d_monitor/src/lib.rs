@@ -42,10 +42,9 @@ use bevy::render::view::{Hdr, Msaa};
 use bevy_voxel_world::prelude::Chunk;
 use bevy_water::WaterSettings;
 
-use inf3d_camera::IsoCamera;
+use inf3d_camera::OrbitCamera;
 use inf3d_core::{QualitySettings, Rock, Tree};
-use inf3d_gameplay::{MovePath, Player};
-use inf3d_pathfinding::PathTiming;
+use inf3d_gameplay::Player;
 use inf3d_physics::{CharacterController, DesiredMove, InteractionTarget};
 use inf3d_render::FoliageTile;
 use inf3d_world::MainWorld;
@@ -206,7 +205,6 @@ fn record_frame(
     // these are read-only, so the bundled queries never conflict with each other.
     res: (
         Option<Res<WaterSettings>>,
-        Option<Res<PathTiming>>,
         Option<Res<InteractionTarget>>,
         Res<MainWorld>,
         Res<ClearColor>,
@@ -226,13 +224,7 @@ fn record_frame(
         Query<(), With<Rock>>,
         Query<(), With<FoliageTile>>,
     ),
-    q_player: Query<(
-        &Transform,
-        &Player,
-        &CharacterController,
-        &DesiredMove,
-        &MovePath,
-    )>,
+    q_player: Query<(&Transform, &Player, &CharacterController, &DesiredMove)>,
     q_cam: Query<
         (
             &Projection,
@@ -247,14 +239,14 @@ fn record_frame(
             Option<&Hdr>,
             Option<&Msaa>,
         ),
-        With<IsoCamera>,
+        With<OrbitCamera>,
     >,
     q_light: Query<(&DirectionalLight, &Transform, Option<&CascadeShadowConfig>)>,
 ) {
     if !mon.enabled || mon.writer.is_none() {
         return;
     }
-    let (water, path_timing, interaction, main_world, clear, shadow_map, ambient) = res;
+    let (water, interaction, main_world, clear, shadow_map, ambient) = res;
     let (meshes, materials, images) = assets;
     let (q_all, q_mesh, q_chunk, q_tree, q_rock, q_tiles) = count_q;
 
@@ -302,19 +294,20 @@ fn record_frame(
     let d = counts.delta(mon.prev);
 
     // --- player physics ---
-    let (ppos, pcell, pfacing, grounded, vvel, desired, waypoints) = match q_player.single().ok() {
-        Some((t, p, cc, dm, mp)) => (
+    let (ppos, pcell, pfacing, grounded, vvel, desired) = match q_player.single().ok() {
+        Some((t, p, cc, dm)) => (
             t.translation,
             p.cell,
             p.facing,
             cc.grounded,
             cc.vertical_velocity,
             dm.velocity,
-            mp.waypoints.len(),
         ),
-        None => (Vec3::ZERO, IVec2::ZERO, 0.0, false, 0.0, Vec3::ZERO, 0),
+        None => (Vec3::ZERO, IVec2::ZERO, 0.0, false, 0.0, Vec3::ZERO),
     };
-    let moving = waypoints > 0;
+    // "Moving" now derives from the desired horizontal velocity (WASD intent), since
+    // there is no path/waypoint queue anymore.
+    let moving = desired.length_squared() > 0.01;
 
     // --- camera + full graphics state ---
     let (
@@ -333,7 +326,12 @@ fn record_frame(
         msaa,
     ) = match q_cam.single() {
         Ok((proj, gt, bloom, dof, ssao, mb, dpp, npp, mpp, hdr, msaa)) => {
+            // The gameplay camera is now perspective; `zoom` is reported as the
+            // vertical FOV in degrees (the orbit boom distance lives on the rig the
+            // monitor doesn't query). The Orthographic arm is kept as a harmless
+            // fallback should a projection ever be swapped back.
             let (zoom, near, far) = match proj {
+                Projection::Perspective(p) => (p.fov.to_degrees(), p.near, p.far),
                 Projection::Orthographic(o) => {
                     let z = match o.scaling_mode {
                         ScalingMode::FixedVertical { viewport_height } => viewport_height,
@@ -408,10 +406,7 @@ fn record_frame(
         .map(|a| format!("({},bri={:.0})", rgb(a.color), a.brightness))
         .unwrap_or_else(|| "none".to_string());
 
-    // --- pathfinding / interaction / water / streaming ---
-    let (path_ms, path_exp) = path_timing
-        .map(|p| (p.last_ms, p.last_expansions))
-        .unwrap_or((0.0, 0));
+    // --- interaction / water / streaming ---
     let has_target = interaction.map(|i| i.entity.is_some()).unwrap_or(false);
     let water_amp = water.as_ref().map(|w| w.amplitude);
     let render_dist_dyn = main_world.render_distance_chunks;
@@ -448,7 +443,7 @@ fn record_frame(
                 writer,
                 "[t={elapsed:8.2} f={frame:>7}] *** SPIKE dt={dt_ms:6.1}ms (median {median:.1}, p95 {p95:.1}) fixed_ticks={fixed_ticks} *** \
                  cause={cause} | d: ent{:+} mesh{:+} chunk{:+} tile{:+} tree{:+} rock{:+} | \
-                 moving={moving} wps={waypoints} player=({:.1},{:.1},{:.1}) cell=({},{}) zoom={zoom:.0} rd={render_dist_dyn}",
+                 moving={moving} player=({:.1},{:.1},{:.1}) cell=({},{}) zoom={zoom:.0} rd={render_dist_dyn}",
                 d.entities, d.meshes, d.chunks, d.foliage_tiles, d.trees, d.rocks,
                 ppos.x, ppos.y, ppos.z, pcell.x, pcell.y,
             );
@@ -457,7 +452,7 @@ fn record_frame(
         if moving_changed {
             let _ = writeln!(
                 writer,
-                "[t={elapsed:8.2} f={frame:>7}] EVENT move={} wps={waypoints} pathfind_last={path_ms:.2}ms exp={path_exp}",
+                "[t={elapsed:8.2} f={frame:>7}] EVENT move={}",
                 if moving { "START" } else { "STOP" },
             );
         }
@@ -467,7 +462,7 @@ fn record_frame(
                 writer,
                 "[t={elapsed:8.2} f={frame:>7}] FRAME fps={fps:5.1} dt={dt_ms:5.1} p95={p95:5.1} min={interval_min:5.1} max={interval_max:6.1} spikes/intvl={interval_spikes} fixed_ticks={fixed_ticks} | \
                  chunk={}(d{:+}) mesh={}(d{:+}) ent={}(d{:+}) | tile={} tree={} rock={} | \
-                 player=({:.1},{:.1},{:.1}) cell=({},{}) grounded={grounded} vy={vvel:+.2} wps={waypoints} | zoom={zoom:.0} rd_dyn={render_dist_dyn} | path={path_ms:.2}ms exp={path_exp} target={has_target}",
+                 player=({:.1},{:.1},{:.1}) cell=({},{}) grounded={grounded} vy={vvel:+.2} | zoom={zoom:.0} rd_dyn={render_dist_dyn} | target={has_target}",
                 counts.chunks, d.chunks, counts.meshes, d.meshes, counts.entities, d.entities,
                 counts.foliage_tiles, counts.trees, counts.rocks,
                 ppos.x, ppos.y, ppos.z, pcell.x, pcell.y,
